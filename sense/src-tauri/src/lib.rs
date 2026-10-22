@@ -22,18 +22,22 @@ pub fn run() {
             // 默认菜单：给出 ⌘Q 退出与 Edit 菜单（输入框的 ⌘C/⌘V 依赖它）。
             app.set_menu(Menu::default(app.handle())?)?;
 
-            let shortcut = window::hotkey();
+            let hotkey = window::load_hotkey(app.handle());
+            window::set_active_display(hotkey.display.clone());
             match app
                 .global_shortcut()
-                .on_shortcut(shortcut, |app, _shortcut, event| {
+                .on_shortcut(hotkey.shortcut, |app, _shortcut, event| {
                     if event.state() == ShortcutState::Pressed {
                         window::toggle(app);
                     }
                 }) {
-                Ok(()) => println!("[sense] hotkey registered: {}", window::HOTKEY_LABEL),
+                Ok(()) => println!(
+                    "[sense] hotkey registered: {} （来自 {}）",
+                    hotkey.display, hotkey.source
+                ),
                 Err(err) => {
                     // 热键是唯一入口：注册失败还躲着不露脸，用户会以为应用坏了。
-                    eprintln!("[sense] hotkey register FAILED: {err}");
+                    eprintln!("[sense] hotkey register FAILED ({}): {err}", hotkey.display);
                     window::show(app.handle());
                 }
             }
