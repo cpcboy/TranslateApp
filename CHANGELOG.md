@@ -37,6 +37,14 @@
 - 全屏 App 下能否呼出依赖 `visibleOnAllWorkspaces`，需人工在全屏窗口中确认一次
 - D2 开工前需要决定：模型流式文本进入卡片后，CSP 是否还要再收紧（当前 `connect-src` 已限定）
 
+### M1 补丁 · 2026-10-23 — 装成 App 并修掉「双击没反应」
+
+**变更**
+
+- 窗口改为启动即显示（原来 `visible: false`）：双击图标却什么都不发生，会被当成应用坏了。全局快捷键只在应用运行时有效，这一点必须让用户看得见
+- 新增 `tools/install-app.sh`：构建 → 拷进 `/Applications` → 关旧进程 → 启动
+- 实测：安装后的 `/Applications/SENSE.app` 启动日志为 `hotkey registered: ⌃⌥⌘Space`，窗口获得焦点
+
 ### M1 · 2026-10-23 — 查词闭环（D2–D5）
 
 **新增**

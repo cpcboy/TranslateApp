@@ -6,11 +6,19 @@ macOS 上的 AI 翻译器桌面应用：查词给完整义项卡，长文给逐�
 
 | 想了解 | 看这里 |
 |---|---|
-| 怎么跑起来、怎么测、怎么配模型 | [`sense/README.md`](sense/README.md) |
+| 怎么装成 App、怎么跑、怎么配模型 | [`sense/README.md`](sense/README.md) |
 | 产品与工程方案 | `SENSE-v1.0/docs/SENSE-落地方案.md`（交接包本地材料，未入库） |
 | 数据契约与 prompt | [`SENSE-v1.0/spec/`](SENSE-v1.0/spec/) |
 | 变更记录 | [`CHANGELOG.md`](CHANGELOG.md) |
 | **改代码前必读** | [`MAINTENANCE_RULES.md`](MAINTENANCE_RULES.md)、[`AGENTS.md`](AGENTS.md) |
+
+## 装到本机
+
+```bash
+cd sense && ./tools/install-app.sh
+```
+
+构建 → 拷进 `/Applications` → 重启应用。之后双击图标即可，不用开终端。
 
 ## 一句话架构
 

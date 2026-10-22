@@ -7,13 +7,24 @@ macOS 上的 AI 翻译器。查一个词，给一张完整的义项卡——音�
 ## 现在能做什么
 
 - `⌃⌥⌘Space` 在任意 App 下调出 / 收起窗口（Rust 侧注册的全局快捷键）。键位可改，见下方「改快捷键」
-- 无边框、透明、置顶、居中的 680×520 窗口，启动时隐藏
+- 无边框、透明、置顶、居中的 680×520 窗口；双击启动就能看到，按 Esc 收起
 - 失焦自动隐藏（260ms 宽限期，避免「刚呼出就自己藏起来」）
 - `Esc` 隐藏
 - 查词：Enter 触发，模型流式返回，卡片边到边渲染（首个完整义项就画，不等整包）
 - 四个 provider 预设（DeepSeek / 通义千问 / OpenRouter / Ollama）+ 自定义 base_url
 - Key 只进钥匙串，设置页只回显 `sk-****abcd`
 - 查过的词落本地 SQLite，第二次查询 0 网络请求
+
+## 装成 App（推荐，日常用）
+
+```bash
+./tools/install-app.sh
+```
+
+它会构建、把 `SENSE.app` 拷进 `/Applications`、关掉旧进程再启动。之后从启动台/访达双击即可，
+不需要开终端。应用没在运行时快捷键当然不会响应——这是全局快捷键的常识，不是 bug。
+
+> 目前没有登录项，重启 Mac 后需要手动打开一次（D13 会加）。
 
 ## 开发
 
@@ -49,6 +60,7 @@ npm run tauri dev                     # 设置里选 Ollama 即可用
 npm run build          # 只构建前端（tsc + vite build），已验证
 npm run tauri build    # 出 SENSE.app（8.86 MiB，已验证可启动）
                        # DMG 暂关闭：本机 bundle_dmg.sh 的 grep 会挂，D14 再处理
+./tools/install-app.sh # 一条命令：构建 + 装到 /Applications + 重启
 ```
 
 ### 本机验证用环境变量（仅开发）
