@@ -63,7 +63,10 @@ SENSE_SHOW_ON_START=1 SENSE_NO_AUTOHIDE=1 npm run tauri dev
 
 - 修饰键：`ctrl` / `alt`（=option）/ `shift` / `cmd`（=command），用 `+` 连接，顺序随意
 - 主键：`space`、单个字母、单个数字
-- 写错（比如没有修饰键、多个主键）会回退到默认 `⌃⌥⌘Space`，终端里会打印原因
+- **必须至少含一个 `ctrl` 或 `cmd`**：只有 shift/alt 的组合（例如 `shift+space`）会抢走所有输入框的按键，会被拒绝
+- 写错（缺修饰键、多个主键、JSON 坏掉、字段缺失）会回退到默认 `⌃⌥⌘Space`，终端里打印具体原因，启动日志里会写明这次键位来自哪个文件
+
+> 目录名由 `tauri.conf.json` 的 `identifier` 决定（当前 `com.sense.app`）。改了 identifier 目录就会变，以启动日志里的「来源：…」为准。
 
 > 为什么是 `⌃⌥⌘Space`：`⌥Space` 被 Gemini / ChatGPT 占用；`⌥⌘Space` 既是 macOS 系统符号快捷键（Finder 搜索）又被 Claude 桌面端占用。带 ⌃ 的三修饰键组合不在系统符号快捷键表里。
 
