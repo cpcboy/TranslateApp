@@ -10,7 +10,7 @@
 
 - Tauri 2 + React 19 + TypeScript + Vite 8 + Tailwind 4 工程骨架
 - 主窗口：680×520、居中、无边框、透明背景、置顶、不可缩放、启动隐藏
-- `⌥Space` 全局显隐（Rust 侧 `tauri-plugin-global-shortcut` 注册，失败会打日志而不是静默）
+- `⌥Space` 全局显隐（Rust 侧 `tauri-plugin-global-shortcut` 注册，失败会打日志而不是静默）——同日因与 Gemini 冲突改为 `⌥⌘Space`，见下方「D1 补丁」
 - 失焦自动隐藏，带 260ms 宽限期，避免呼出瞬间被误判
 - `Esc` 隐藏窗口
 - 设计 token 取自 `SENSE-v1.0/sense-proposal.html` 第 3 屏（`#08080A / #0F0F12 / #F2EFE9 / #FF5230`）
@@ -42,5 +42,7 @@
 **变更**
 
 - 全局快捷键由 `⌥Space` 改为 `⌥⌘Space`。原因：Gemini 桌面端也用 `⌥Space`，两边会同时弹窗，且焦点被 Gemini 的输入框抢走——实测复现。
-- 这是对方案 §2.5（`⌥Space`）的一次**有意偏离**，已记录在此。D2 设置页做出来后改为可自定义，默认值仍用 `⌥⌘Space`。
-- 快捷键的按键与文案收敛到 `window.rs` 的 `hotkey()` / `HOTKEY_LABEL`，避免两处漂移。
+- 这是对方案 §2.5（`⌥Space`）的一次**有意偏离**，以本条为准。方案里 §1.1 第 7 条、§2.5、D1 与 D6 验收仍写 `⌥Space`（交接包只读，不改原文），照 spec 验收时以本条目为准。
+- 自定义快捷键按方案排在 **D13**（快捷键面板），不是 D2；在 D13 之前默认值固定为 `⌥⌘Space`。
+- 按键、日志文案与界面键帽收敛到 `window.rs` 的 `hotkey()` / `HOTKEY_LABEL` / `HOTKEY_DISPLAY`，前端通过 `hotkey_hint` 命令取值，界面不再硬编码。
+- 已知待验证：`⌥⌘Space` 在 **Finder 前台**是系统「搜索」快捷键（Option-Command-空格），可能与本应用同时响应。需在 Finder 里实测一次；若撞车，改用 `⇧⌥Space`。
