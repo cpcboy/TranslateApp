@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sense.app/schema/word-entry.json",
+  "title": "WordEntry",
+  "description": "SENSE 词条解析结果。中英双向共用一套结构：lang 指明查询语言，例句用 text/translation 而非 en/zh，避免方向耦合。",
+  "$comment": "本文件用于运行时校验（zod/ajv）。若直接用于 OpenAI strict structured outputs，请移除 minLength / maxLength / minItems / maxItems / minimum / maximum 等注解式约束——strict 模式不支持这些关键字，只保留 type / required / enum / additionalProperties / items / $defs。所有字段均为 required，可选语义用 null 表达。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "word", "lang", "pronunciation", "pos", "frequency", "senses", "confusables", "notes"],
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "description": "契约版本，同时参与缓存 key 计算"
+    },
+    "word": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "description": "原词，保留用户输入形态（含大小写）"
+    },
+    "lang": {
+      "enum": ["en", "zh"],
+      "description": "查询语言。en 表示输入英文、输出中文解析；zh 反之"
+    },
+    "pronunciation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ipa", "pinyin"],
+      "description": "英文给 IPA，中文给带声调拼音，另一项为 null",
+      "properties": {
+        "ipa": { "type": ["string", "null"], "maxLength": 80 },
+        "pinyin": { "type": ["string", "null"], "maxLength": 80 }
+      }
+    },
+    "pos": {
+      "type": "array",
+      "maxItems": 4,
+      "description": "该词涉及的词性，按主要程度排序",
+      "items": { "enum": ["n", "v", "adj", "adv", "prep", "conj", "pron", "num", "phr"] }
+    },
+    "frequency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["zipf", "band"],
+      "description": "词级频次，用于决定义项展示预算（不是义项级频次）",
+      "properties": {
+        "zipf": { "type": ["number", "null"], "minimum": 0, "maximum": 8 },
+        "band": { "enum": ["high", "mid", "low", null] }
+      }
+    },
+    "senses": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 6,
+      "description": "按 share 降序，rank 从 1 开始连续",
+      "items": { "$ref": "#/$defs/sense" }
+    },
+    "confusables": {
+      "type": "array",
+      "maxItems": 3,
+      "description": "易混词，只给真正容易混的，不要凑数",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["word", "difference"],
+        "properties": {
+          "word": { "type": "string", "maxLength": 40 },
+          "difference": { "type": "string", "maxLength": 120 }
+        }
+      }
+    },
+    "notes": {
+      "type": ["string", "null"],
+      "maxLength": 200,
+      "description": "不确定之处或使用限制，例如「该义项多见于英式英语」"
+    }
+  },
+  "$defs": {
+    "sense": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rank", "pos", "gloss_zh", "gloss_en", "share", "register", "domains", "collocations", "examples", "pitfall", "synonyms"],
+      "properties": {
+        "rank": { "type": "integer", "minimum": 1, "maximum": 6 },
+        "pos": { "enum": ["n", "v", "adj", "adv", "prep", "conj", "pron", "num", "phr"] },
+        "gloss_zh": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "中文释义，用「核心义；补充说明」的短句，不要循环解释原词"
+        },
+        "gloss_en": {
+          "type": "string",
+          "maxLength": 90,
+          "description": "英文释义或对应词，英文查询时用于自我校验，中文查询时是主要输出"
+        },
+        "share": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "该义项在实际使用中的占比估计，全部义项之和应在 0.95–1.05"
+        },
+        "register": {
+          "enum": ["neutral", "formal", "informal", "technical", "legal", "slang"],
+          "description": "语域。拿不准一律 neutral"
+        },
+        "domains": {
+          "type": "array",
+          "maxItems": 2,
+          "description": "使用场景域，自由词但应为常见域：法律、医疗、消费、职场、技术、体育等",
+          "items": { "type": "string", "maxLength": 12 }
+        },
+        "collocations": {
+          "type": "array",
+          "maxItems": 3,
+          "description": "典型搭配，含介词/宾语，如 charge sb for sth",
+          "items": { "type": "string", "maxLength": 60 }
+        },
+        "examples": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "items": { "$ref": "#/$defs/example" }
+        },
+        "pitfall": {
+          "type": ["string", "null"],
+          "maxLength": 120,
+          "description": "易错点：搭配、语域、中式英语。没有就 null，不要硬编"
+        },
+        "synonyms": {
+          "type": "array",
+          "maxItems": 3,
+          "items": { "type": "string", "maxLength": 40 }
+        }
+      }
+    },
+    "example": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["text", "translation", "target_span", "scene"],
+      "properties": {
+        "text": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "与查询语言一致的例句"
+        },
+        "translation": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "另一语言的译文"
+        },
+        "target_span": {
+          "type": "string",
+          "maxLength": 60,
+          "description": "例句中目标词的实际形态（含屈折变化），必须是 text 的子串"
+        },
+        "scene": {
+          "enum": ["日常", "职场", "学术", "新闻", "法律", "技术", "旅行", "消费", "医疗", "教育"],
+          "description": "场景标签，只能取枚举值"
+        }
+      }
+    }
+  }
+}

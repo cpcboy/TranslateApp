@@ -2,23 +2,18 @@
 //!
 //! 所有窗口操作都在 Rust 侧完成；前端只调 `hide_window`，不碰窗口权限。
 
-use std::fs;
-use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Manager};
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut};
 
+use crate::settings::{self, DEFAULT_HOTKEY_SPEC};
+
 /// 主窗口 label，与 tauri.conf.json 保持一致。
 pub const MAIN_WINDOW: &str = "main";
 
-/// 默认快捷键：⌃⌥⌘Space。
-///
-/// 走过的弯路：`⌥Space` 被 Gemini / ChatGPT 占用；`⌥⌘Space` 是 macOS 系统
-/// 符号快捷键（Finder 搜索），且被 Claude 桌面端占用。带 ⌃ 的三修饰键组合
-/// 不在系统符号表里，AI 客户端也不用这个模式。
-pub const DEFAULT_HOTKEY_SPEC: &str = "ctrl+alt+cmd+space";
+/// 默认键帽，与 `DEFAULT_HOTKEY_SPEC` 对应；有断言守护。
 pub const DEFAULT_HOTKEY_DISPLAY: &str = "⌃⌥⌘Space";
 
 /// 当前**已注册成功**的键帽。注册失败时保持 None，界面就不显示键帽。
@@ -162,83 +157,43 @@ pub fn default_hotkey() -> Hotkey {
     hotkey
 }
 
-/// 配置文件路径由 `tauri.conf.json` 的 `identifier` 决定：
-/// `~/Library/Application Support/<identifier>/settings.json`
-fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_config_dir()
-        .map(|dir| dir.join("settings.json"))
-        .map_err(|err| format!("取不到配置目录: {err}"))
-}
-
-/// 先写临时文件再 rename，避免写到一半被读到空文件。
-fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, contents)?;
-    fs::rename(&tmp, path)
-}
-
-/// 读配置；文件不存在就写一份带默认值的，方便用户自己改。
-///
-/// 每一种失败都带原因返回，调用方负责打印——不静默。
-fn read_spec(path: &Path) -> Result<String, String> {
-    if !path.exists() {
-        let body = format!("{{\n  \"hotkey\": \"{DEFAULT_HOTKEY_SPEC}\"\n}}\n");
-        write_atomic(path, &body)
-            .map_err(|err| format!("创建 {} 失败: {err}", path.display()))?;
-        return Ok(DEFAULT_HOTKEY_SPEC.to_string());
-    }
-
-    let text =
-        fs::read_to_string(path).map_err(|err| format!("读取 {} 失败: {err}", path.display()))?;
-    let value: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|err| format!("{} 不是合法 JSON: {err}", path.display()))?;
-
-    match value.get("hotkey") {
-        None => Err(format!("{} 里没有 hotkey 字段", path.display())),
-        Some(item) => item
-            .as_str()
-            .map(str::trim)
-            .filter(|spec| !spec.is_empty())
-            .map(|spec| spec.to_string())
-            .ok_or_else(|| format!("{} 的 hotkey 不是非空字符串", path.display())),
-    }
-}
-
 /// 加载快捷键：配置优先，任何失败都退回默认值并说清原因。
 ///
 /// 返回值第二项是给人看的来源说明，会打进日志，方便排查「为什么键不生效」。
 pub fn load_hotkey(app: &AppHandle) -> (Hotkey, String) {
-    let path = match config_path(app) {
-        Ok(path) => path,
+    let path_label = settings::path(app)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "settings.json".to_string());
+
+    let value = match settings::read_value(app) {
+        Ok(value) => value,
         Err(err) => {
             eprintln!("[sense] {err}，改用默认 {DEFAULT_HOTKEY_SPEC}");
-            return (default_hotkey(), "内置默认值（取不到配置目录）".to_string());
+            return (
+                default_hotkey(),
+                format!("{path_label}（读取失败，已回退默认）"),
+            );
         }
     };
 
-    match read_spec(&path) {
-        Ok(spec) => match parse_hotkey(&spec) {
-            Ok(hotkey) => (hotkey, path.display().to_string()),
-            Err(err) => {
-                eprintln!(
-                    "[sense] {err}（来自 {}），改用默认 {DEFAULT_HOTKEY_SPEC}",
-                    path.display()
-                );
-                (
-                    default_hotkey(),
-                    format!("{}（配置无效，已回退默认）", path.display()),
-                )
-            }
-        },
+    let spec = value
+        .get("hotkey")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|spec| !spec.is_empty());
+
+    let Some(spec) = spec else {
+        eprintln!("[sense] {path_label} 里没有 hotkey 字段，改用默认 {DEFAULT_HOTKEY_SPEC}");
+        return (default_hotkey(), format!("{path_label}（缺 hotkey 字段）"));
+    };
+
+    match parse_hotkey(spec) {
+        Ok(hotkey) => (hotkey, path_label),
         Err(err) => {
-            eprintln!("[sense] {err}，改用默认 {DEFAULT_HOTKEY_SPEC}");
+            eprintln!("[sense] {err}（来自 {path_label}），改用默认 {DEFAULT_HOTKEY_SPEC}");
             (
                 default_hotkey(),
-                format!("{}（读取失败，已回退默认）", path.display()),
+                format!("{path_label}（配置无效，已回退默认）"),
             )
         }
     }

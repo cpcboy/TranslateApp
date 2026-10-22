@@ -1,93 +1,114 @@
 import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { cn } from "./lib/cn";
+import { LookupView } from "./features/lookup/LookupView";
+import { SettingsView } from "./features/settings/SettingsView";
+import { api } from "./lib/ipc";
+import { useLookup } from "./lib/store";
 
-/** 在浏览器里直接 `npm run dev` 时没有 Tauri 注入，避免 invoke 抛错。 */
 const isTauri = "__TAURI_INTERNALS__" in window;
 
+type View = "lookup" | "settings";
+
 export default function App() {
-  const inputRef = useRef<HTMLInputElement>(null);
-  // 快捷键文案由 Rust 侧提供，界面不再硬编码，避免改键时两处漂移。
-  const [hotkeyHint, setHotkeyHint] = useState("");
+  const [view, setView] = useState<View>("lookup");
+  const [hint, setHint] = useState("");
+  const run = useLookup((state) => state.run);
 
   useEffect(() => {
     if (!isTauri) return;
-    void invoke<string>("hotkey_hint")
-      .then(setHotkeyHint)
+    void api
+      .hotkeyHint()
+      .then(setHint)
       .catch(() => {
-        /* 取不到就不显示键帽，不影响使用 */
+        /* 取不到就不显示键帽 */
       });
   }, []);
+
+  // 仅 debug 构建：自动化验证时用环境变量触发一次查询。
+  const devRunOnce = useRef(false);
+  useEffect(() => {
+    if (!isTauri || devRunOnce.current) return;
+    void api
+      .devFlags()
+      .then((flags) => {
+        if (!flags.dev_lookup || devRunOnce.current) return;
+        devRunOnce.current = true; // StrictMode 会双跑 effect，别重复发请求
+        void run(flags.dev_lookup);
+      })
+      .catch(() => {
+        /* 拿不到就正常空跑 */
+      });
+  }, [run]);
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      // 中文输入法组字时按 Esc 是取消候选词，不该把窗口关掉。
+      // 中文输入法组字时按 Esc 是取消候选词，不该关窗口。
       if (event.isComposing || event.keyCode === 229) return;
       if (event.key !== "Escape") return;
       event.preventDefault();
-      if (isTauri) void invoke("hide_window");
+      if (view === "settings") {
+        setView("lookup");
+        return;
+      }
+      if (isTauri) void api.hideWindow();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
-
-  useEffect(() => {
-    if (!isTauri) return;
-    let unlisten: (() => void) | undefined;
-    void getCurrentWindow()
-      .onFocusChanged(({ payload: focused }) => {
-        if (focused) inputRef.current?.focus();
-      })
-      .then((fn) => {
-        unlisten = fn;
-      })
-      .catch(() => {
-        /* 拿不到窗口事件不影响使用，忽略 */
-      });
-    return () => unlisten?.();
-  }, []);
+  }, [view]);
 
   return (
     <div className="h-full w-full p-3">
       <div className="flex h-full flex-col overflow-hidden rounded-2xl border border-line bg-[#0d0d10]">
-        <header className="flex items-center justify-between border-b border-line px-4 py-3">
-          <div className="flex items-baseline gap-2">
-            <span className="font-serif text-[15px] font-semibold tracking-[0.18em]">SENSE</span>
-            <span className="text-[10px] tracking-[0.14em] text-muted">D1 骨架</span>
+        <header className="flex shrink-0 items-center justify-between border-b border-line px-4 py-2.5">
+          <div className="flex items-baseline gap-3">
+            <span className="font-serif text-[15px] font-semibold tracking-[0.18em] text-paper">
+              SENSE
+            </span>
+            <nav className="flex items-center gap-1">
+              <Tab active={view === "lookup"} onClick={() => setView("lookup")}>
+                查词
+              </Tab>
+              <Tab active={view === "settings"} onClick={() => setView("settings")}>
+                设置
+              </Tab>
+            </nav>
           </div>
           <span className="font-mono text-[10px] text-muted">
-            {hotkeyHint ? `${hotkeyHint} 呼出 · Esc 隐藏` : "Esc 隐藏"}
+            {hint ? `${hint} 呼出 · Esc 隐藏` : "Esc 隐藏"}
           </span>
         </header>
 
-        <main className="flex flex-1 flex-col items-center justify-center px-6">
-          <div className="w-full max-w-[440px]">
-            <div className="flex items-center gap-3 rounded-xl border border-line-strong bg-black/25 px-4 py-3">
-              <span className="font-mono text-[11px] text-acc">›</span>
-              <input
-                ref={inputRef}
-                autoFocus
-                placeholder="查一个词，比如 charge"
-                className={cn(
-                  "w-full bg-transparent text-[15px] text-paper",
-                  "placeholder:text-muted/70 focus:outline-none",
-                )}
-              />
-            </div>
-
-            <p className="mt-3 text-center text-[11px] leading-relaxed text-muted">
-              窗口能呼出、能置顶、失焦会自己藏起来。
-              <br />
-              模型还没接，这一步只验证壳子。
-            </p>
-          </div>
+        <main className="min-h-0 flex-1 px-3 py-2.5">
+          {view === "lookup" ? (
+            <LookupView onOpenSettings={() => setView("settings")} />
+          ) : (
+            <SettingsView onBack={() => setView("lookup")} />
+          )}
         </main>
-
-        <footer className="flex items-center justify-between border-t border-line px-4 py-2 text-[10px] text-muted">
-          <span>无边框 · 置顶 · 失焦隐藏</span>
-          <span className="font-mono">v0.1.0 · D1</span>
-        </footer>
       </div>
     </div>
+  );
+}
+
+function Tab({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={
+        active
+          ? "rounded-md bg-[rgba(242,239,233,0.08)] px-2 py-[3px] text-[10.5px] text-paper"
+          : "rounded-md px-2 py-[3px] text-[10.5px] text-muted hover:text-paper"
+      }
+    >
+      {children}
+    </button>
   );
 }

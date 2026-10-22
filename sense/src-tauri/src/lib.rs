@@ -3,11 +3,35 @@
 //! D1 范围只有窗口：无边框、置顶、失焦隐藏、⌃⌥⌘Space（可配置）显隐。
 //! 模型请求、密钥、缓存都在后面的日子进来，且一律留在 Rust 侧。
 
+mod cache;
+mod commands;
+mod prompts;
+mod providers;
+mod secrets;
+mod settings;
+mod stream;
 mod window;
+
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use tauri::menu::Menu;
 use tauri::Manager;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
+
+/// 全局复用一个 HTTP 客户端：连接池、TLS 会话都能复用。
+static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+pub fn http_client() -> &'static reqwest::Client {
+    HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            // 连接要快，整条流给足时间；卡住由 openai_compat 里的分片超时兜底。
+            .connect_timeout(Duration::from_secs(8))
+            .timeout(Duration::from_secs(180))
+            .build()
+            .expect("构建 HTTP 客户端失败")
+    })
+}
 
 /// 注册一个全局快捷键。抽出来是为了注册失败时能换默认值再试一次。
 fn register_shortcut(app: &tauri::AppHandle, shortcut: Shortcut) -> Result<(), String> {
@@ -27,11 +51,36 @@ pub fn run() {
         .manage(window::WindowState::default())
         .invoke_handler(tauri::generate_handler![
             window::hide_window,
-            window::hotkey_hint
+            window::hotkey_hint,
+            commands::settings::list_providers,
+            commands::settings::save_provider,
+            commands::settings::set_active_provider,
+            commands::settings::set_api_key,
+            commands::settings::clear_api_key,
+            commands::settings::test_connection,
+            commands::settings::dev_flags,
+            commands::lookup::lookup,
+            commands::lookup::invalidate_lookup,
         ])
         .setup(|app| {
             // 默认菜单：给出 ⌘Q 退出与 Edit 菜单（输入框的 ⌘C/⌘V 依赖它）。
             app.set_menu(Menu::default(app.handle())?)?;
+
+            // 缓存：打不开就退到内存缓存，别为此让应用起不来。
+            let cache = match app.path().app_data_dir() {
+                Ok(dir) => match cache::Cache::open(&dir.join("sense.db")) {
+                    Ok(cache) => cache,
+                    Err(err) => {
+                        eprintln!("[sense] {err}，改用内存缓存");
+                        cache::Cache::in_memory().expect("内存缓存必须可用")
+                    }
+                },
+                Err(err) => {
+                    eprintln!("[sense] 取不到数据目录: {err}，改用内存缓存");
+                    cache::Cache::in_memory().expect("内存缓存必须可用")
+                }
+            };
+            app.manage(cache);
 
             // 快捷键：注册成功才对外宣称它生效，避免界面显示一个按不出来的键。
             let (hotkey, source) = window::load_hotkey(app.handle());
