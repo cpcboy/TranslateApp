@@ -6,7 +6,7 @@ macOS 上的 AI 翻译器。查一个词，给一张完整的义项卡——音�
 
 ## 现在能做什么
 
-- `⌥⌘Space` 在任意 App 下调出 / 收起窗口（Rust 侧注册的全局快捷键）。原方案是 `⌥Space`，与 Gemini 桌面端冲突后改掉
+- `⌃⌥⌘Space` 在任意 App 下调出 / 收起窗口（Rust 侧注册的全局快捷键）。键位可改，见下方「改快捷键」
 - 无边框、透明、置顶、居中的 680×520 窗口，启动时隐藏
 - 失焦自动隐藏（260ms 宽限期，避免「刚呼出就自己藏起来」）
 - `Esc` 隐藏
@@ -42,12 +42,30 @@ npm run tauri build    # 出 .app / DMG；D14 打包时才正式用
 
 | 变量 | 作用 |
 |---|---|
-| `SENSE_SHOW_ON_START=1` | 启动即显示窗口。默认是隐藏的，只能靠 `⌥⌘Space` 呼出 |
+| `SENSE_SHOW_ON_START=1` | 启动即显示窗口。默认是隐藏的，只能靠快捷键呼出 |
 | `SENSE_NO_AUTOHIDE=1` | 关闭失焦隐藏，便于截图和录屏 |
 
 ```bash
 SENSE_SHOW_ON_START=1 SENSE_NO_AUTOHIDE=1 npm run tauri dev
 ```
+
+### 改快捷键
+
+快捷键存在配置文件里，改完重启应用即可生效，不用重新编译：
+
+```
+~/Library/Application Support/com.sense.app/settings.json
+```
+
+```json
+{ "hotkey": "ctrl+alt+cmd+space" }
+```
+
+- 修饰键：`ctrl` / `alt`（=option）/ `shift` / `cmd`（=command），用 `+` 连接，顺序随意
+- 主键：`space`、单个字母、单个数字
+- 写错（比如没有修饰键、多个主键）会回退到默认 `⌃⌥⌘Space`，终端里会打印原因
+
+> 为什么是 `⌃⌥⌘Space`：`⌥Space` 被 Gemini / ChatGPT 占用；`⌥⌘Space` 既是 macOS 系统符号快捷键（Finder 搜索）又被 Claude 桌面端占用。带 ⌃ 的三修饰键组合不在系统符号快捷键表里。
 
 ## 目录
 

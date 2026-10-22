@@ -46,3 +46,13 @@
 - 自定义快捷键按方案排在 **D13**（快捷键面板），不是 D2；在 D13 之前默认值固定为 `⌥⌘Space`。
 - 按键、日志文案与界面键帽收敛到 `window.rs` 的 `hotkey()` / `HOTKEY_LABEL` / `HOTKEY_DISPLAY`，前端通过 `hotkey_hint` 命令取值，界面不再硬编码。
 - 已知待验证：`⌥⌘Space` 在 **Finder 前台**是系统「搜索」快捷键（Option-Command-空格），可能与本应用同时响应。需在 Finder 里实测一次；若撞车，改用 `⇧⌥Space`。
+
+### D1 补丁 2 · 2026-10-23 — 快捷键改为 ⌃⌥⌘Space 并支持配置
+
+**变更**
+
+- 全局快捷键由 `⌥⌘Space` 改为 `⌃⌥⌘Space`。实测撞击：`⌥⌘Space` 既是 macOS 系统符号快捷键（Finder 搜索窗会一起弹出），又被 Claude 桌面端占用（会弹出 Claude 对话窗）。
+- 规律：`⌥Space`（Gemini / ChatGPT）、`⌥⌘Space`（Claude / Finder）都落在 Space 上，AI 客户端默认挤在这一个键。改用带 `⌃` 的三修饰键组合，不在系统符号快捷键表内。
+- 快捷键改为**配置文件驱动**：`~/Library/Application Support/com.sense.app/settings.json` 的 `hotkey` 字段，改完重启生效，无需重编译。首启会自动生成该文件。
+- 解析失败（缺修饰键、多主键、不支持的主键）会打印原因并回退到默认值，不会静默失败。
+- 新增 3 个单测：默认值必须是 ⌃⌥⌘Space、字母键可解析、非法输入必须报错（Rust 单测共 7 个）。
