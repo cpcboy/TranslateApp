@@ -1,13 +1,13 @@
 //! SENSE 主进程。
 //!
-//! D1 范围只有窗口：无边框、置顶、失焦隐藏、⌥Space 显隐。
+//! D1 范围只有窗口：无边框、置顶、失焦隐藏、⌥⌘Space 显隐。
 //! 模型请求、密钥、缓存都在后面的日子进来，且一律留在 Rust 侧。
 
 mod window;
 
 use tauri::menu::Menu;
 use tauri::Manager;
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -19,7 +19,7 @@ pub fn run() {
             // 默认菜单：给出 ⌘Q 退出与 Edit 菜单（输入框的 ⌘C/⌘V 依赖它）。
             app.set_menu(Menu::default(app.handle())?)?;
 
-            let shortcut = Shortcut::new(Some(Modifiers::ALT), Code::Space);
+            let shortcut = window::hotkey();
             match app
                 .global_shortcut()
                 .on_shortcut(shortcut, |app, _shortcut, event| {

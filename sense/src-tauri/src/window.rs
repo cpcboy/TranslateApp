@@ -11,7 +11,16 @@ use tauri::{AppHandle, Manager};
 pub const MAIN_WINDOW: &str = "main";
 
 /// 给人看的快捷键文案。
-pub const HOTKEY_LABEL: &str = "Alt+Space (⌥Space)";
+///
+/// 原方案是 `⌥Space`，但与 Gemini 桌面端冲突：两边会同时弹窗，且焦点被它抢走。
+/// 2026-10-22 起改为 `⌥⌘Space`。文案与真实按键都由本文件定义，避免两处漂移。
+pub const HOTKEY_LABEL: &str = "Alt+Command+Space (⌥⌘Space)";
+
+/// 全局快捷键本身。
+pub fn hotkey() -> tauri_plugin_global_shortcut::Shortcut {
+    use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut};
+    Shortcut::new(Some(Modifiers::ALT | Modifiers::SUPER), Code::Space)
+}
 
 /// 刚显示就被判为失焦的宽限期。
 ///
@@ -110,7 +119,7 @@ pub fn hide(app: &AppHandle) {
     println!("[sense] window hidden");
 }
 
-/// ⌥Space 的行为：可见就藏，不可见就显。
+/// 快捷键的行为：可见就藏，不可见就显。
 pub fn toggle(app: &AppHandle) {
     let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
         return;

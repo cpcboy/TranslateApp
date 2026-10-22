@@ -45,7 +45,7 @@ export default function App() {
             <span className="font-serif text-[15px] font-semibold tracking-[0.18em]">SENSE</span>
             <span className="text-[10px] tracking-[0.14em] text-muted">D1 骨架</span>
           </div>
-          <span className="font-mono text-[10px] text-muted">⌥Space 呼出 · Esc 隐藏</span>
+          <span className="font-mono text-[10px] text-muted">⌥⌘Space 呼出 · Esc 隐藏</span>
         </header>
 
         <main className="flex flex-1 flex-col items-center justify-center px-6">
