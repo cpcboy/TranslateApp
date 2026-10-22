@@ -37,6 +37,49 @@
 - 全屏 App 下能否呼出依赖 `visibleOnAllWorkspaces`，需人工在全屏窗口中确认一次
 - D2 开工前需要决定：模型流式文本进入卡片后，CSP 是否还要再收紧（当前 `connect-src` 已限定）
 
+### M1 补丁 3 · 2026-10-23 — 大窗口、可缩放、字号再上一档
+
+**变更**
+
+- 窗口 `720×660` → `960×900`（最小 `760×720`），并改为**可缩放**：
+  - 右下角自绘缩放把手（pointer 事件 + `setSize`，逐帧合并到 rAF）
+  - header 变成拖动区（`data-tauri-drag-region="deep"`），无边框窗口终于能挪了
+  - `maximizable: false`：双击 header 不会把窗口铺满，避免破坏置顶小窗的定位
+- 字号整体再上一档（上一轮之后仍然偏小，因为窗口同时变大了）：
+  | | 上一版 | 现在 |
+  |---|---|---|
+  | 词头 | 34px | **46px** |
+  | 义项 | 16.5px | **21px** |
+  | 例句 | 14px | **17px** |
+  | 译文 | 13px | **16px** |
+  | 正文/标签 | 11.5–12.5px | **13.5–14px** |
+  | 输入框 | 15.5px | **18px** |
+- 灰色再提亮：`muted` `#b3aea6 → #cfcac2`（11.5:1）、`subtle` `#928d86 → #b0aaa1`（8.1:1）、正文 `#f6f3ed → #f8f6f1`（17.3:1）
+- 英文例句改用 Helvetica Neue 真斜体：原来 PingFang 没有斜体字面，回退到 Times 斜体，1x 屏上又细又虚；中文例句不套斜体
+- 输入行 / 字段边框 `border-line-strong` 0.30 → 0.36（约 2:1），disabled 态 `opacity-40 → 60`
+
+**修复（review 后）**
+
+- **P0**：`startResizeDragging` 在 macOS 上是**静默 no-op**——tao 0.37 把它实现成直接返回 `NotSupported`，而 Tauri 把这个错误 `let _ =` 掉，前端 Promise 还会 resolve。照原方案上线，用户拖手柄会毫无反应且无任何日志。改为自实现 pointer 拖拽 + `setSize`
+- **P1**：`.ex-en` 会把中文例句也套上拉丁斜体（PingFang 无斜体字面 → 合成倾斜，正是要消灭的"发虚"）。改为按 `entry.lang` 只对英文例句生效
+- 权限随之调整：去掉 macOS 上无效的 `allow-start-resize-dragging`，加 `allow-set-size`
+- 自绘占位符补 `aria-hidden`；空 Key 保存时给出「Key 不能为空」而不是静默
+- **P0（安装链路）**：`tools/install-app.sh` 用 `pkill -x SENSE` 杀旧进程，但可执行文件实际叫 `sense`（Tauri 用 Cargo 包名，不是 productName）。结果旧实例一直活着占着快捷键，`open` 只是把旧窗口提到前面——**装上去的其实还是上一版**。改为 `osascript ... application id com.sense.app` + 按可执行文件路径 `pkill -f`
+  - 这个 bug 之前一直存在：上一轮「装成 App」之所以看起来生效，是因为当时旧进程恰好已经退出
+
+**验证**
+
+- 窗口实测 `960×900`（CGWindowList），最小尺寸 `760×720` 截图布局无溢出、内容区可滚动
+- `setSize` 链路实测：临时在启动时调用 `setSize(820, 760)`，窗口 bounds 变为 `820×760`，证明权限与调用都成立（验证后已删除该临时代码）
+- `npm test` 31 passed、`cargo test` 39 passed、`typecheck` / `build` 通过
+- 对比度为脚本实算：正文 17.3:1、次级 11.5:1、注释 8.1:1、强调 7.4:1
+
+**已知限制**
+
+- 物理拖拽手势无法自动模拟（无辅助功能权限），需要人工拖一次确认手感
+- 1x 显示器没有 HiDPI，只能靠字号/字重/对比度补偿，无法做到 Retina 那种锐利
+- 窗口尺寸不持久化：重启回到默认 960×900
+
 ### M1 补丁 2 · 2026-10-23 — 可读性重做（UI/VI）
 
 **变更**
