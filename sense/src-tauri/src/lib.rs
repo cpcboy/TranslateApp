@@ -14,7 +14,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(window::WindowState::default())
-        .invoke_handler(tauri::generate_handler![window::hide_window])
+        .invoke_handler(tauri::generate_handler![
+            window::hide_window,
+            window::hotkey_hint
+        ])
         .setup(|app| {
             // 默认菜单：给出 ⌘Q 退出与 Edit 菜单（输入框的 ⌘C/⌘V 依赖它）。
             app.set_menu(Menu::default(app.handle())?)?;

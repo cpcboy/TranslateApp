@@ -10,16 +10,26 @@ use tauri::{AppHandle, Manager};
 /// 主窗口 label，与 tauri.conf.json 保持一致。
 pub const MAIN_WINDOW: &str = "main";
 
-/// 给人看的快捷键文案。
+/// 给人看的快捷键文案（日志用）。
 ///
 /// 原方案是 `⌥Space`，但与 Gemini 桌面端冲突：两边会同时弹窗，且焦点被它抢走。
-/// 2026-10-22 起改为 `⌥⌘Space`。文案与真实按键都由本文件定义，避免两处漂移。
+/// 2026-10-22 起改为 `⌥⌘Space`。按键与文案都由本文件定义，前端通过
+/// `hotkey_hint` 命令取值，避免两处漂移。
 pub const HOTKEY_LABEL: &str = "Alt+Command+Space (⌥⌘Space)";
+
+/// 界面展示用（键帽样式）。
+pub const HOTKEY_DISPLAY: &str = "⌥⌘Space";
 
 /// 全局快捷键本身。
 pub fn hotkey() -> tauri_plugin_global_shortcut::Shortcut {
     use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut};
     Shortcut::new(Some(Modifiers::ALT | Modifiers::SUPER), Code::Space)
+}
+
+/// 前端取键帽文案，避免界面里再硬编码一份。
+#[tauri::command]
+pub fn hotkey_hint() -> &'static str {
+    HOTKEY_DISPLAY
 }
 
 /// 刚显示就被判为失焦的宽限期。
@@ -213,5 +223,21 @@ mod tests {
             decide_blur(None, Instant::now(), BLUR_GRACE),
             BlurAction::HideNow
         );
+    }
+
+    #[test]
+    fn hotkey_is_alt_command_space() {
+        use tauri_plugin_global_shortcut::{Code, Modifiers};
+        let hotkey = hotkey();
+        assert_eq!(hotkey.key, Code::Space);
+        assert!(hotkey.mods.contains(Modifiers::ALT), "缺少 ⌥");
+        assert!(hotkey.mods.contains(Modifiers::SUPER), "缺少 ⌘");
+    }
+
+    #[test]
+    fn display_label_matches_hotkey() {
+        assert!(HOTKEY_DISPLAY.contains('⌥'), "键帽文案缺 ⌥");
+        assert!(HOTKEY_DISPLAY.contains('⌘'), "键帽文案缺 ⌘");
+        assert!(HOTKEY_LABEL.contains(HOTKEY_DISPLAY));
     }
 }

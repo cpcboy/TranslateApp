@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { cn } from "./lib/cn";
@@ -8,7 +8,17 @@ const isTauri = "__TAURI_INTERNALS__" in window;
 
 export default function App() {
   const inputRef = useRef<HTMLInputElement>(null);
+  // 快捷键文案由 Rust 侧提供，界面不再硬编码，避免改键时两处漂移。
+  const [hotkeyHint, setHotkeyHint] = useState("");
 
+  useEffect(() => {
+    if (!isTauri) return;
+    void invoke<string>("hotkey_hint")
+      .then(setHotkeyHint)
+      .catch(() => {
+        /* 取不到就不显示键帽，不影响使用 */
+      });
+  }, []);
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       // 中文输入法组字时按 Esc 是取消候选词，不该把窗口关掉。
@@ -45,7 +55,9 @@ export default function App() {
             <span className="font-serif text-[15px] font-semibold tracking-[0.18em]">SENSE</span>
             <span className="text-[10px] tracking-[0.14em] text-muted">D1 骨架</span>
           </div>
-          <span className="font-mono text-[10px] text-muted">⌥⌘Space 呼出 · Esc 隐藏</span>
+          <span className="font-mono text-[10px] text-muted">
+            {hotkeyHint ? `${hotkeyHint} 呼出 · Esc 隐藏` : "Esc 隐藏"}
+          </span>
         </header>
 
         <main className="flex flex-1 flex-col items-center justify-center px-6">
