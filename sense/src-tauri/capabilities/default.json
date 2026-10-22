@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "主窗口能力：只开核心权限，前端不直接碰网络与文件系统",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

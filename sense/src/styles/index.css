@@ -1,0 +1,40 @@
+@import "tailwindcss";
+
+/* 设计 token 取自 sense-proposal.html 第 3 屏（:root 变量），
+   D4 的义项卡会直接复用，不再另起一套色板。 */
+@theme {
+  --color-ink: #08080a;
+  --color-panel: #0f0f12;
+  --color-paper: #f2efe9;
+  --color-muted: #93908a;
+  --color-line: rgba(242, 239, 233, 0.1);
+  --color-line-strong: rgba(242, 239, 233, 0.18);
+  --color-acc: #ff5230;
+
+  --font-sans: "PingFang SC", -apple-system, "Helvetica Neue", Arial, sans-serif;
+  --font-serif: "Songti SC", "STSong", Georgia, serif;
+  --font-mono: "SF Mono", ui-monospace, Menlo, monospace;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    /* 窗口是 transparent 的，body 必须透明，圆角由内层容器画 */
+    background: transparent;
+    color: var(--color-paper);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+  }
+
+  ::selection {
+    background: var(--color-acc);
+    color: #0a0a0b;
+  }
+}
