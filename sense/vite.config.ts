@@ -1,8 +1,9 @@
 import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
-// @ts-expect-error type error without @types/node package
-import process from "node:process";
+
+// 不引 @types/node：这里只需要一个环境变量。
+declare const process: { env: Record<string, string | undefined> };
 
 const host = process.env.TAURI_DEV_HOST;
 
@@ -31,6 +32,6 @@ export default defineConfig(() => ({
   // D1 只有纯函数单测，跑在 node 环境即可；D4 需要 DOM 时再切 jsdom。
   test: {
     environment: "node",
-    include: ["src/**/*.test.ts"],
+    include: ["src/**/*.test.{ts,tsx}"],
   },
 }));

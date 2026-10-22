@@ -1,13 +1,18 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { cn } from "./lib/cn";
 
 /** 在浏览器里直接 `npm run dev` 时没有 Tauri 注入，避免 invoke 抛错。 */
 const isTauri = "__TAURI_INTERNALS__" in window;
 
 export default function App() {
+  const inputRef = useRef<HTMLInputElement>(null);
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      // 中文输入法组字时按 Esc 是取消候选词，不该把窗口关掉。
+      if (event.isComposing || event.keyCode === 229) return;
       if (event.key !== "Escape") return;
       event.preventDefault();
       if (isTauri) void invoke("hide_window");
@@ -16,9 +21,25 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
+  useEffect(() => {
+    if (!isTauri) return;
+    let unlisten: (() => void) | undefined;
+    void getCurrentWindow()
+      .onFocusChanged(({ payload: focused }) => {
+        if (focused) inputRef.current?.focus();
+      })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => {
+        /* 拿不到窗口事件不影响使用，忽略 */
+      });
+    return () => unlisten?.();
+  }, []);
+
   return (
-    <div className="h-full w-full p-2">
-      <div className="flex h-full flex-col overflow-hidden rounded-2xl border border-line bg-[#0d0d10] shadow-[0_40px_90px_-50px_rgba(0,0,0,1)]">
+    <div className="h-full w-full p-3">
+      <div className="flex h-full flex-col overflow-hidden rounded-2xl border border-line bg-[#0d0d10]">
         <header className="flex items-center justify-between border-b border-line px-4 py-3">
           <div className="flex items-baseline gap-2">
             <span className="font-serif text-[15px] font-semibold tracking-[0.18em]">SENSE</span>
@@ -32,6 +53,7 @@ export default function App() {
             <div className="flex items-center gap-3 rounded-xl border border-line-strong bg-black/25 px-4 py-3">
               <span className="font-mono text-[11px] text-acc">›</span>
               <input
+                ref={inputRef}
                 autoFocus
                 placeholder="查一个词，比如 charge"
                 className={cn(
@@ -39,9 +61,6 @@ export default function App() {
                   "placeholder:text-muted/70 focus:outline-none",
                 )}
               />
-              <kbd className="rounded border border-line px-1.5 py-0.5 font-mono text-[9px] text-muted">
-                ↵
-              </kbd>
             </div>
 
             <p className="mt-3 text-center text-[11px] leading-relaxed text-muted">
