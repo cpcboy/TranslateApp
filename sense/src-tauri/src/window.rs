@@ -3,8 +3,8 @@
 //! 所有窗口操作都在 Rust 侧完成；前端只调 `hide_window`，不碰窗口权限。
 
 use std::fs;
-use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Manager};
@@ -21,8 +21,8 @@ pub const MAIN_WINDOW: &str = "main";
 pub const DEFAULT_HOTKEY_SPEC: &str = "ctrl+alt+cmd+space";
 pub const DEFAULT_HOTKEY_DISPLAY: &str = "⌃⌥⌘Space";
 
-/// 配置文件里没有 hotkey 字段、或文件读不出来时，界面上仍要有个说法。
-static ACTIVE_DISPLAY: OnceLock<String> = OnceLock::new();
+/// 当前**已注册成功**的键帽。注册失败时保持 None，界面就不显示键帽。
+static ACTIVE_DISPLAY: RwLock<Option<String>> = RwLock::new(None);
 
 /// 刚显示就被判为失焦的宽限期。
 ///
@@ -77,14 +77,14 @@ const DIGITS: [Code; 10] = [
 pub struct Hotkey {
     pub shortcut: Shortcut,
     pub display: String,
-    /// 这份配置从哪来（默认值 / 配置文件），只用于日志。
-    pub source: String,
 }
 
 /// 把 `ctrl+alt+cmd+space` 这样的字符串解析成快捷键。
 ///
 /// 支持的修饰键：`ctrl` / `alt`(option) / `shift` / `cmd`(command)。
-/// 支持的主键：`space`、单字母、数字。故意只支持这些，够用且好查错。
+/// 支持的主键：`space`、单字母、数字。
+/// 强制要求至少一个 `ctrl` 或 `cmd`：只有 shift/alt 的组合会抢走全局输入
+/// （例如 `shift+space` 会让所有输入框打不出不换行空格）。
 pub fn parse_hotkey(spec: &str) -> Result<Hotkey, String> {
     let mut mods = Modifiers::empty();
     let mut key: Option<(Code, String)> = None;
@@ -107,14 +107,13 @@ pub fn parse_hotkey(spec: &str) -> Result<Hotkey, String> {
     }
 
     let (code, label) = key.ok_or_else(|| format!("快捷键 `{spec}` 缺少主键，例如 space 或 k"))?;
-    if mods.is_empty() {
-        return Err(format!("快捷键 `{spec}` 至少需要一个修饰键"));
+    if !mods.contains(Modifiers::CONTROL) && !mods.contains(Modifiers::SUPER) {
+        return Err(format!("快捷键 `{spec}` 至少要有 ⌃ 或 ⌘，否则会抢走全局输入"));
     }
 
     Ok(Hotkey {
         shortcut: Shortcut::new(Some(mods), code),
         display: render(mods, &label),
-        source: String::new(),
     })
 }
 
@@ -153,67 +152,114 @@ fn render(mods: Modifiers, label: &str) -> String {
     out
 }
 
-/// 配置文件路径：`~/Library/Application Support/com.sense.app/settings.json`
-fn config_path(app: &AppHandle) -> Option<std::path::PathBuf> {
-    app.path().app_config_dir().ok().map(|dir| dir.join("settings.json"))
+/// 内置默认值，永远可解析；解析不了说明代码坏了。
+pub fn default_hotkey() -> Hotkey {
+    let hotkey = parse_hotkey(DEFAULT_HOTKEY_SPEC).expect("默认快捷键常量必须能被解析");
+    assert_eq!(
+        hotkey.display, DEFAULT_HOTKEY_DISPLAY,
+        "默认键帽常量与解析结果不一致"
+    );
+    hotkey
+}
+
+/// 配置文件路径由 `tauri.conf.json` 的 `identifier` 决定：
+/// `~/Library/Application Support/<identifier>/settings.json`
+fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|dir| dir.join("settings.json"))
+        .map_err(|err| format!("取不到配置目录: {err}"))
+}
+
+/// 先写临时文件再 rename，避免写到一半被读到空文件。
+fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, contents)?;
+    fs::rename(&tmp, path)
 }
 
 /// 读配置；文件不存在就写一份带默认值的，方便用户自己改。
-fn read_spec(app: &AppHandle) -> Option<(String, String)> {
-    let path = config_path(app)?;
+///
+/// 每一种失败都带原因返回，调用方负责打印——不静默。
+fn read_spec(path: &Path) -> Result<String, String> {
     if !path.exists() {
-        if let Some(dir) = path.parent() {
-            let _ = fs::create_dir_all(dir);
-        }
-        let _ = fs::write(&path, format!("{{\n  \"hotkey\": \"{DEFAULT_HOTKEY_SPEC}\"\n}}\n"));
-        return Some((DEFAULT_HOTKEY_SPEC.to_string(), path.display().to_string()));
+        let body = format!("{{\n  \"hotkey\": \"{DEFAULT_HOTKEY_SPEC}\"\n}}\n");
+        write_atomic(path, &body)
+            .map_err(|err| format!("创建 {} 失败: {err}", path.display()))?;
+        return Ok(DEFAULT_HOTKEY_SPEC.to_string());
     }
-    read_existing(&path).map(|spec| (spec, path.display().to_string()))
+
+    let text =
+        fs::read_to_string(path).map_err(|err| format!("读取 {} 失败: {err}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|err| format!("{} 不是合法 JSON: {err}", path.display()))?;
+
+    match value.get("hotkey") {
+        None => Err(format!("{} 里没有 hotkey 字段", path.display())),
+        Some(item) => item
+            .as_str()
+            .map(str::trim)
+            .filter(|spec| !spec.is_empty())
+            .map(|spec| spec.to_string())
+            .ok_or_else(|| format!("{} 的 hotkey 不是非空字符串", path.display())),
+    }
 }
 
-fn read_existing(path: &Path) -> Option<String> {
-    let text = fs::read_to_string(path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    value
-        .get("hotkey")
-        .and_then(|item| item.as_str())
-        .map(|item| item.trim().to_string())
-        .filter(|item| !item.is_empty())
-}
-
-/// 加载快捷键：配置优先，解析失败退回默认值并说清原因。
-pub fn load_hotkey(app: &AppHandle) -> Hotkey {
-    let (spec, source) = match read_spec(app) {
-        Some((spec, path)) => (spec, path),
-        None => (DEFAULT_HOTKEY_SPEC.to_string(), "内置默认值".to_string()),
+/// 加载快捷键：配置优先，任何失败都退回默认值并说清原因。
+///
+/// 返回值第二项是给人看的来源说明，会打进日志，方便排查「为什么键不生效」。
+pub fn load_hotkey(app: &AppHandle) -> (Hotkey, String) {
+    let path = match config_path(app) {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("[sense] {err}，改用默认 {DEFAULT_HOTKEY_SPEC}");
+            return (default_hotkey(), "内置默认值（取不到配置目录）".to_string());
+        }
     };
 
-    match parse_hotkey(&spec) {
-        Ok(mut hotkey) => {
-            hotkey.source = source;
-            hotkey
-        }
+    match read_spec(&path) {
+        Ok(spec) => match parse_hotkey(&spec) {
+            Ok(hotkey) => (hotkey, path.display().to_string()),
+            Err(err) => {
+                eprintln!(
+                    "[sense] {err}（来自 {}），改用默认 {DEFAULT_HOTKEY_SPEC}",
+                    path.display()
+                );
+                (
+                    default_hotkey(),
+                    format!("{}（配置无效，已回退默认）", path.display()),
+                )
+            }
+        },
         Err(err) => {
-            eprintln!("[sense] {err}；改用默认 {DEFAULT_HOTKEY_SPEC}");
-            let mut fallback = parse_hotkey(DEFAULT_HOTKEY_SPEC)
-                .expect("默认快捷键常量必须能被解析");
-            fallback.source = format!("{source}（解析失败后回退）");
-            fallback
+            eprintln!("[sense] {err}，改用默认 {DEFAULT_HOTKEY_SPEC}");
+            (
+                default_hotkey(),
+                format!("{}（读取失败，已回退默认）", path.display()),
+            )
         }
     }
 }
 
-pub fn set_active_display(display: String) {
-    let _ = ACTIVE_DISPLAY.set(display);
+/// 记录「当前实际生效的键帽」。注册成功才调用；传 None 表示没有可用快捷键。
+pub fn set_active_display(display: Option<String>) {
+    let mut guard = ACTIVE_DISPLAY
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = display;
 }
 
-/// 前端取键帽文案，避免界面里再硬编码一份。
+/// 前端取键帽文案。没有可用快捷键时返回空串，界面会退化成只显示 Esc。
 #[tauri::command]
 pub fn hotkey_hint() -> String {
     ACTIVE_DISPLAY
-        .get()
-        .cloned()
-        .unwrap_or_else(|| DEFAULT_HOTKEY_DISPLAY.to_string())
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .unwrap_or_default()
 }
 
 /// 记录窗口最近一次被显示的时刻，用于失焦宽限。
@@ -413,17 +459,30 @@ mod tests {
     }
 
     #[test]
-    fn parse_accepts_letter_keys() {
-        let hotkey = parse_hotkey("ctrl+shift+k").expect("应能解析");
-        assert_eq!(hotkey.shortcut.key, Code::KeyK);
-        assert_eq!(hotkey.display, "⌃⇧K");
+    fn parse_normalizes_case_spacing_and_order() {
+        let hotkey = parse_hotkey(" CTRL + Alt + Cmd + SPACE ").expect("应能解析");
+        assert_eq!(hotkey.display, DEFAULT_HOTKEY_DISPLAY);
+
+        let reordered = parse_hotkey("cmd+shift+k").expect("应能解析");
+        assert_eq!(reordered.display, "⇧⌘K", "修饰键顺序应归一为 ⌃⌥⇧⌘");
     }
 
     #[test]
     fn parse_rejects_bad_input() {
-        assert!(parse_hotkey("space").is_err(), "没有修饰键应报错");
-        assert!(parse_hotkey("ctrl+").is_err(), "空片段应报错");
-        assert!(parse_hotkey("ctrl+alt+ff").is_err(), "多字符主键应报错");
-        assert!(parse_hotkey("ctrl+alt").is_err(), "缺主键应报错");
+        for bad in [
+            "",
+            "+",
+            "ctrl++k",
+            "ctrl+",
+            "ctrl+alt",
+            "k+k",
+            "ctrl+alt+ff",
+            "ctrl+alt+中",
+            // 只有 shift/alt 会抢走全局输入，必须拒绝
+            "shift+space",
+            "alt+a",
+        ] {
+            assert!(parse_hotkey(bad).is_err(), "`{bad}` 应当被拒绝");
+        }
     }
 }

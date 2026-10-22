@@ -1,13 +1,24 @@
 //! SENSE 主进程。
 //!
-//! D1 范围只有窗口：无边框、置顶、失焦隐藏、⌥⌘Space 显隐。
+//! D1 范围只有窗口：无边框、置顶、失焦隐藏、⌃⌥⌘Space（可配置）显隐。
 //! 模型请求、密钥、缓存都在后面的日子进来，且一律留在 Rust 侧。
 
 mod window;
 
 use tauri::menu::Menu;
 use tauri::Manager;
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
+
+/// 注册一个全局快捷键。抽出来是为了注册失败时能换默认值再试一次。
+fn register_shortcut(app: &tauri::AppHandle, shortcut: Shortcut) -> Result<(), String> {
+    app.global_shortcut()
+        .on_shortcut(shortcut, |app, _shortcut, event| {
+            if event.state() == ShortcutState::Pressed {
+                window::toggle(app);
+            }
+        })
+        .map_err(|err| err.to_string())
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -22,22 +33,30 @@ pub fn run() {
             // 默认菜单：给出 ⌘Q 退出与 Edit 菜单（输入框的 ⌘C/⌘V 依赖它）。
             app.set_menu(Menu::default(app.handle())?)?;
 
-            let hotkey = window::load_hotkey(app.handle());
-            window::set_active_display(hotkey.display.clone());
-            match app
-                .global_shortcut()
-                .on_shortcut(hotkey.shortcut, |app, _shortcut, event| {
-                    if event.state() == ShortcutState::Pressed {
-                        window::toggle(app);
-                    }
-                }) {
-                Ok(()) => println!(
-                    "[sense] hotkey registered: {} （来自 {}）",
-                    hotkey.display, hotkey.source
-                ),
+            // 快捷键：注册成功才对外宣称它生效，避免界面显示一个按不出来的键。
+            let (hotkey, source) = window::load_hotkey(app.handle());
+            match register_shortcut(app.handle(), hotkey.shortcut) {
+                Ok(()) => {
+                    println!(
+                        "[sense] hotkey registered: {}；来源：{}",
+                        hotkey.display, source
+                    );
+                    window::set_active_display(Some(hotkey.display));
+                }
                 Err(err) => {
-                    // 热键是唯一入口：注册失败还躲着不露脸，用户会以为应用坏了。
                     eprintln!("[sense] hotkey register FAILED ({}): {err}", hotkey.display);
+                    let fallback = window::default_hotkey();
+                    match register_shortcut(app.handle(), fallback.shortcut) {
+                        Ok(()) => {
+                            eprintln!("[sense] 已回退到默认 {}", fallback.display);
+                            window::set_active_display(Some(fallback.display));
+                        }
+                        Err(second) => {
+                            eprintln!("[sense] 默认键也无法注册: {second}");
+                            window::set_active_display(None);
+                        }
+                    }
+                    // 热键是唯一入口：注册不上还躲着不露脸，用户会以为应用坏了。
                     window::show(app.handle());
                 }
             }
