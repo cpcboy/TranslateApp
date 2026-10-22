@@ -79,11 +79,12 @@
 
 | 项目 | 内容 | 状态 |
 |---|---|---|
-| **测试命令** | **暂无，工程尚未初始化**（D1 才建目录）。D1 结束后在此填入实测可用的命令。候选方案：前端 `pnpm test`、Rust `cargo test`；D3 另加一个 zod ↔ JSON Schema 对拍脚本（脚本名待定）。**框架与脚本名以 D1 落地实测为准，本行不预设** | 待 D1 确定 |
-| **构建命令** | **暂无。** 计划：开发 `pnpm tauri dev`；打包 `pnpm tauri build`。D1 首次跑通后回填真实输出 | 待 D1 验证 |
+| **测试命令** | 在 `sense/` 下：`npm test`（Vitest 5，匹配 `src/**/*.test.{ts,tsx}`）、`npm run typecheck`（`tsc --noEmit`）、`cd src-tauri && cargo test`（Rust 单测）。D1 实测：前端 3 个用例、Rust 4 个用例，全部通过 | ✅ D1 已验证 |
+| **构建命令** | 在 `sense/` 下：`npm run build`（`tsc && vite build`，D1 实测 2.96s 通过）；`npm run tauri build`（出 .app / DMG，D14 才正式用，**尚未验证**） | 前端已验证 / 打包待 D14 |
 | **部署命令** | **当前不存在部署动作。** v0.1 是本地 macOS 应用，没有服务端。D14 起分发形态才是"签名 + 公证的 DMG → GitHub Releases"，命令与证书届时确认。<br>六步里的第 5 步在 D14 之前统一记为"不涉及（无部署目标）"，D14 起记为"发布 DMG 到 Release" | D14 前：不涉及<br>D14 起：待定 |
 | **线上验证地址** | **无。** 产品侧无服务器（硬约束 4：服务器成本为 0），不存在线上环境。对应的"线上验证"= 本机安装后的真实用户路径验证（⌥Space 唤起 → 查词 → 看卡片 → 断网复看缓存） | 现状，非缺失 |
-| **文档路径** | 本文件 `MAINTENANCE_RULES.md`；`AGENTS.md`；交接入口 `SENSE-v1.0/START-HERE.md`；主方案 `SENSE-v1.0/docs/SENSE-落地方案.md`；契约与 prompt `SENSE-v1.0/spec/`（字段冻结，勿改）；工程文档（D1 起）`sense/docs/`。<br>**目前没有 README / CHANGELOG**，D1 建工程时一并创建，此后六步的第 3 步按需更新 | D1 起扩充 |
+| **文档路径** | 本文件 `MAINTENANCE_RULES.md`；`AGENTS.md`；`README.md`（仓库总览）；`CHANGELOG.md`（版本变更）；`sense/README.md`（工程运行说明）；交接入口 `SENSE-v1.0/START-HERE.md`；主方案 `SENSE-v1.0/docs/SENSE-落地方案.md`；契约与 prompt `SENSE-v1.0/spec/`（字段冻结，勿改） | ✅ |
+| **包管理器** | **npm**（`sense/package-lock.json` 入库）。不用 pnpm：本机沙箱拦截 pnpm 创建 symlink（`CODEBUDDY_BROKER_DENY`），`pnpm add` 直接失败。若将来环境不再拦截，切回 pnpm 需要重装依赖并替换锁文件 | 现状，环境约束 |
 | **回滚方式** | **代码**：`git revert <hash>`（前提：仓库已初始化，见 §2.1）。<br>**已安装版本**：重装上一个 DMG；DMG 归档位置与命名规则 **待 D14 确定**（当前还没有任何 DMG）。<br>**缓存**：删除本地 SQLite 库文件后重启。库文件路径 **待 D5 实测确认**——Tauri identifier 尚未定，可能与 Keychain service `com.sense.app` 不同，不要按 Keychain 的 service 名去找。<br>**数据**：无服务端、无业务数据库，故不存在数据回滚 | 部分待 D5 / D14 实测 |
 | **密钥与凭证** | API Key 只存 macOS Keychain（service `com.sense.app`，account `provider:<id>`）。代码、配置、日志、聊天、提交记录中均不得出现明文。设置页只回显 `sk-****abcd` | 硬约束 1，不可变更 |
 | **业务数据** | 无云端业务数据。本地只有 SQLite 缓存（词条）与点击统计，可随时删除，删除后仅损失缓存 | 现状 |
@@ -122,4 +123,5 @@
 
 | 日期 | 变更内容 | review 结论 | 文档更新 | commit | 部署 | 验证证据 | 回滚方式 |
 |---|---|---|---|---|---|---|---|
-| 2026-10-22 | 建立维护铁律与执行规范：新增 `MAINTENANCE_RULES.md`、`AGENTS.md`；初始化本地 git 仓库并配置远端（仅配置，未推送） | 自查 + 独立对抗 review 一轮：提出 P0 3 条 / P1 6 条；其中 2 条不成立（远端地址由负责人提供、提交尚未执行），其余 7 条已修，P0/P1 清零 | 新增两份文档；本文件 §1 原文标注来源、§2 项目信息、§3 记录表 | `docs: 建立维护铁律与执行规范` | 不涉及（无部署目标） | `git show --stat` 仅这两份文件；需求 A–F 逐条比对；review 问题逐条修复 | 直接删除两份文件（首个提交，无前序状态可回滚） |
+| 2026-10-22 | 建立维护铁律与执行规范：新增 `MAINTENANCE_RULES.md`、`AGENTS.md`；初始化本地 git 仓库并配置远端（仅配置，未推送） | 自查 + 独立对抗 review 一轮：提出 P0 3 条 / P1 6 条；其中 2 条不成立（远端地址由负责人提供、提交尚未执行），其余 7 条已修，P0/P1 清零 | 新增两份文档；本文件 §1 原文标注来源、§2 项目信息、§3 记录表 | `5434866` | 不涉及（无部署目标） | `git show --stat` 仅这两份文件；需求 A–F 逐条比对；review 问题逐条修复 | 直接删除两份文件（首个提交，无前序状态可回滚） |
+| 2026-10-22 | **D1**：工程骨架、无边框置顶窗、`⌥Space` 显隐；交接包 `spec/` 入库 | 自查 + 独立对抗 review：P0 1 条 / P1 6 条，已全部修复（热键失败兜底、宽限期改延迟复查、IME 下 Esc、呼出后重聚焦、`visibleOnAllWorkspaces`、CSP 收口、补默认菜单与退出路径）；P0/P1 清零 | 新增 `README.md`、`CHANGELOG.md`、`sense/README.md`；本文件 §2 回填测试/构建命令、文档路径、包管理器 | `56086f8`(spec) `93e2953`(feat) `ac09ea2`(fix) 本次(docs) | 不涉及（无部署目标） | `npm test` 3 passed；`cargo test` 4 passed；`npm run build` 成功；运行日志 `hotkey registered` / `window shown (680x520)` / `window focused`；截图见交付报告 | `git revert ac09ea2 93e2953 56086f8`；或整目录删除重来 |
