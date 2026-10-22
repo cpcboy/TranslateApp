@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sense.app/schema/proofread.json",
+  "title": "ProofreadResult",
+  "description": "长文校对结果。刻意不包含字符 offset：模型算不准，改由 quote + occurrence 在前端定位。",
+  "$comment": "用于 strict structured outputs 时同样需移除 minLength / maxLength / minItems / maxItems 等注解约束。所有字段 required，可选语义用 null。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "issues", "summary"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "issues": {
+      "type": "array",
+      "maxItems": 30,
+      "description": "按严重度排序：error > warning > suggestion；同 severity 按出现位置",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["quote", "occurrence", "suggestion", "category", "severity", "explanation", "rule_id"],
+        "properties": {
+          "quote": {
+            "type": "string",
+            "maxLength": 200,
+            "description": "原文中逐字一致的片段，≤12 个词。必须能在原文中搜索到，否则前端会丢弃"
+          },
+          "occurrence": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20,
+            "description": "该片段在原文中第几次出现，从 1 开始，用于消歧"
+          },
+          "suggestion": {
+            "type": "string",
+            "maxLength": 200,
+            "description": "替换后的文本；删除类问题给空字符串"
+          },
+          "category": {
+            "enum": [
+              "spelling",
+              "tense",
+              "agreement",
+              "article",
+              "preposition",
+              "collocation",
+              "word_order",
+              "chinese_english",
+              "punctuation",
+              "redundancy",
+              "style"
+            ]
+          },
+          "severity": {
+            "enum": ["error", "warning", "suggestion"],
+            "description": "error=必须改的语法/拼写错；warning=很可能有问题；suggestion=可选优化"
+          },
+          "explanation": {
+            "type": "string",
+            "maxLength": 160,
+            "description": "中文说明为什么错，≤40 字，不要复述建议"
+          },
+          "rule_id": {
+            "type": ["string", "null"],
+            "maxLength": 40,
+            "description": "可选规则标识，用于「这条不用管」的本地忽略规则"
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total", "errors", "warnings", "suggestions", "overall"],
+      "properties": {
+        "total": { "type": "integer", "minimum": 0, "maximum": 30 },
+        "errors": { "type": "integer", "minimum": 0, "maximum": 30 },
+        "warnings": { "type": "integer", "minimum": 0, "maximum": 30 },
+        "suggestions": { "type": "integer", "minimum": 0, "maximum": 30 },
+        "overall": {
+          "type": ["string", "null"],
+          "maxLength": 120,
+          "description": "一句话总评，不夸奖、不打击，只描述最突出的问题"
+        }
+      }
+    }
+  }
+}

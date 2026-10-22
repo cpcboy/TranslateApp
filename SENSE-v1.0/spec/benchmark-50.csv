@@ -1,0 +1,51 @@
+id,direction,input,probe,gold_sense_count,gold_order,must_have,status
+1,en2zh,charge,名动多义；商业 / 法律 / 物理三域,5,收费；要价 | 指控；控告 | 充电 | 掌管；负责 | 冲锋,charge sb for sth; be charged with; in charge of,sample
+2,en2zh,run,义项极多（20+），考义项预算截断,6,跑 | 经营；管理 | 运行 | 流动 | 竞选 | 延伸,run a business; run out of; run for,sample
+3,en2zh,set,词性最多（名 / 动 / 形），考 pos 数组与预算,5,放置 | 设定 | 一套 | 日落 | 固定的,set up; a set of; set the table,todo
+4,en2zh,address,名动重音不同；动词义最易漏,4,地址 | 处理；应对 | 向…讲话 | 称呼,address the issue; address a crowd,sample
+5,en2zh,break,短语动词多，考搭配而非单词义,5,打破 | 休息 | 违反 | 断裂 | 突破,break down; break up; take a break,todo
+6,en2zh,figure,名词三义 + 动词义，考义项区分度,4,数字 | 人物 | 身材 | 认为,figure out; a public figure,todo
+7,en2zh,issue,名 / 动；考「发行」这一冷义,4,问题 | 议题 | 发行 | 发布,issue a statement; the latest issue,todo
+8,en2zh,matter,名 / 动；考「要紧」,3,事情 | 物质 | 要紧,no matter what; it doesn't matter,todo
+9,en2zh,mean,形容词「刻薄」最易漏,4,意思是 | 意味着 | 刻薄的 | 平均的,mean well; a mean streak,todo
+10,en2zh,hold,短语动词密集,5,拿着 | 举行 | 容纳 | 认为 | 保持,hold on; hold up; hold a meeting,todo
+11,en2zh,stand,名 / 动，考场合义,5,站立 | 忍受 | 立场 | 摊位 | 位于,can't stand; take a stand,todo
+12,en2zh,fine,词性切换（形 / 名罚款）,3,好的 | 罚款 | 细微的,a fine of $200; fine details,todo
+13,en2zh,right,三词性，考排序是否被单一高频义吞掉,4,正确的 | 右边 | 权利 | 恰好,human rights; right now,todo
+14,en2zh,just,副词 / 形容词「公正」,3,刚刚 | 只是 | 公正的,just in time; a just cause,todo
+15,en2zh,term,术语 / 学期 / 条款 / 关系,4,术语 | 学期 | 条款 | 关系,in terms of; long-term,todo
+16,en2zh,present,重音变化（PREsent / preSENT），考音标一致性,4,现在的 | 出席的 | 礼物 | 呈现,be present at; present a plan,todo
+17,en2zh,state,状态 / 州 / 陈述,3,状态 | 州 | 陈述,state of mind; the State of Texas,todo
+18,en2zh,book,名 / 动，考「预订」,2,书 | 预订,book a table; by the book,todo
+19,en2zh,bank,银行 / 河岸,2,银行 | 河岸,bank account; river bank,todo
+20,en2zh,light,光 / 轻 / 点燃,4,光 | 灯 | 轻的 | 点燃,light up; light blue,todo
+21,en2zh,sound,声音 / 听起来 / 健全,3,声音 | 听起来 | 健全的,sound like; of sound mind,todo
+22,en2zh,spring,季节 / 弹簧 / 泉水 / 跳跃,4,春天 | 弹簧 | 泉水 | 跳跃,spring up; hot spring,todo
+23,en2zh,train,火车 / 训练,2,火车 | 训练,train for; by train,todo
+24,en2zh,company,公司 / 陪伴,2,公司 | 陪伴,keep sb company; a tech company,todo
+25,en2zh,current,当前 / 水流 / 电流,3,当前的 | 水流 | 电流,current affairs; electric current,todo
+26,zh2en,处理,一词多译，考英文对应而非中文解释,4,handle | deal with | process | dispose of,handle a complaint; process data,todo
+27,zh2en,安排,名 / 动，考 arrangement 与 arrange 的区分,3,arrange | plan | arrangement,arrange a meeting; a tight schedule,todo
+28,zh2en,影响,名 / 动，考 affect / influence / impact 的语域差异,3,influence | affect | impact,have an impact on; under the influence,todo
+29,zh2en,关系,关系 / 有关系 / 没关系 三义,4,relationship | relation | matter | connections,personal connections; it doesn't matter,todo
+30,zh2en,方便,形容词 / 动词 / 委婉语（洗手间）,3,convenient | to convenience sb | restroom,at your convenience; convenience store,todo
+31,zh2en,认真,形容词 / 副词，考 take sth seriously,3,serious | earnest | take sth seriously,take it seriously; an earnest effort,todo
+32,zh2en,开展,动词，考 carry out / launch 的搭配差异,3,carry out | launch | develop,carry out a campaign; launch a program,todo
+33,zh2en,落实,政策类高频，考 implement 与 put into practice,3,implement | put into practice | carry out,implement a policy; follow through,todo
+34,zh2en,讲究,动 / 形 / 名，三词性,4,be particular about | exquisite | stress,be particular about food; exquisite craft,todo
+35,zh2en,支持,支持某人 / 支持观点 / 技术支持,3,support | back | stand by,technical support; back a plan,todo
+36,zh2en,把握,动 / 名，考 certainty 与 grasp,3,grasp | seize | certainty,grasp an opportunity; have confidence,todo
+37,zh2en,体会,动 / 名，考 realize 与 understanding,3,realize | experience | understanding,come to realize; a deep understanding,todo
+38,zh2en,面子,文化词，考 face 的搭配,2,face | dignity,save face; lose face,todo
+39,zh2en,收拾,整理 / 打包 / 教训某人,3,tidy up | pack | fix sb,tidy up the room; pack your bags,todo
+40,zh2en,交代,说明 / 移交 / 坦白,3,explain | hand over | account for,hand over the work; account for sth,todo
+41,zh2en,打点,安排 / 打点关系（含贬义），考语域,2,arrange | bribe,arrange things; grease the wheels,todo
+42,zh2en,分寸,抽象名词，考 sense of propriety,2,sense of propriety | tact,sense of propriety; tactful,todo
+43,zh2en,意思,高歧义：含义 / 趣味 / 心意,4,meaning | interest | gesture | hint,a token of appreciation; not interested,todo
+44,zh2en,行情,市场类，考 market / quotes,2,market price | quotes,market price; stock quotes,todo
+45,zh2en,火候,具体 / 抽象两义,2,heat | maturity,control the heat; the time isn't right,todo
+46,zh2en,走心,新词，考 heartfelt 与 attentive,2,heartfelt | attentive,a heartfelt performance,todo
+47,zh2en,到位,到位 / adequate / in place,2,in place | adequate,the funding is in place,todo
+48,zh2en,体面,形容词 / 名词，考 decent 与 dignity,2,decent | dignity | face,a decent job; lose dignity,todo
+49,zh2en,折腾,口语，考 hassle / toss about,2,hassle | toss about,stop messing around; a lot of hassle,todo
+50,zh2en,凑合,口语，考 make do,2,make do | average,make do with; just so-so,todo
