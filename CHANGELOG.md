@@ -68,6 +68,7 @@
 - Keychain 在未签名 dev build 上可能反复弹授权，未人工确认
 - 查询中切换词不会终止上一条请求，只是前端丢弃其增量
 - 截图 / 划词 / 校对（D6–D10）未开始
+- DMG 打包未完成：本机 `bundle_dmg.sh` 的 grep 正则会挂（`bad regex '/dev/disk4s'`），已把 `bundle.targets` 暂设为 `["app"]`，产物 `SENSE.app` 8.86 MiB 可启动；DMG 与签名公证一并放到 D14
 
 ### D1 补丁 · 2026-10-22 — 快捷键避让 Gemini
 

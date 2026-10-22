@@ -47,7 +47,8 @@ npm run tauri dev                     # 设置里选 Ollama 即可用
 
 ```bash
 npm run build          # 只构建前端（tsc + vite build），已验证
-npm run tauri build    # 出 .app / DMG；D14 打包时才正式用
+npm run tauri build    # 出 SENSE.app（8.86 MiB，已验证可启动）
+                       # DMG 暂关闭：本机 bundle_dmg.sh 的 grep 会挂，D14 再处理
 ```
 
 ### 本机验证用环境变量（仅开发）

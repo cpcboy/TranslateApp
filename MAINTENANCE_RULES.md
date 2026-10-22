@@ -80,7 +80,7 @@
 | 项目 | 内容 | 状态 |
 |---|---|---|
 | **测试命令** | 在 `sense/` 下：`npm test`（Vitest 5，匹配 `src/**/*.test.{ts,tsx}`）、`npm run typecheck`（`tsc --noEmit`）、`cd src-tauri && cargo test`（Rust 单测）。M1 实测：前端 31 个用例、Rust 39 个用例，全绿 | ✅ M1 已验证 |
-| **构建命令** | 在 `sense/` 下：`npm run build`（`tsc && vite build`，已验证）；`npm run tauri build`（出 .app / DMG，未签名，**打包结果待 M1 收尾验证**） | 前端已验证 / 打包验证中 |
+| **构建命令** | 在 `sense/` 下：`npm run build`（`tsc && vite build`，已验证）；`npm run tauri build` → `bundle/macos/SENSE.app`（**8.86 MiB，已验证可启动并注册快捷键**）。当前 `bundle.targets = ["app"]`：本机 `bundle_dmg.sh` 的 grep 正则有 bug，DMG 留到 D14 连同签名公证一起处理 | ✅ 已验证 |
 | **部署命令** | **当前不存在部署动作。** v0.1 是本地 macOS 应用，没有服务端。D14 起分发形态才是"签名 + 公证的 DMG → GitHub Releases"，命令与证书届时确认。<br>六步里的第 5 步在 D14 之前统一记为"不涉及（无部署目标）"，D14 起记为"发布 DMG 到 Release" | D14 前：不涉及<br>D14 起：待定 |
 | **线上验证地址** | **无。** 产品侧无服务器（硬约束 4：服务器成本为 0），不存在线上环境。对应的"线上验证"= 本机安装后的真实用户路径验证（`⌃⌥⌘Space` 唤起 → 查词 → 看卡片 → 断网复看缓存） | 现状，非缺失 |
 | **文档路径** | 本文件 `MAINTENANCE_RULES.md`；`AGENTS.md`；`README.md`（仓库总览）；`CHANGELOG.md`（版本变更）；`sense/README.md`（工程运行说明）；交接入口 `SENSE-v1.0/START-HERE.md`；主方案 `SENSE-v1.0/docs/SENSE-落地方案.md`；契约与 prompt `SENSE-v1.0/spec/`（字段冻结，勿改） | ✅ |
