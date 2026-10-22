@@ -37,6 +37,38 @@
 - 全屏 App 下能否呼出依赖 `visibleOnAllWorkspaces`，需人工在全屏窗口中确认一次
 - D2 开工前需要决定：模型流式文本进入卡片后，CSP 是否还要再收紧（当前 `connect-src` 已限定）
 
+### M1 · 2026-10-23 — 查词闭环（D2–D5）
+
+**新增**
+
+- Keychain 读写（service `com.sense.app`，account `provider:<id>`）；设置页只读回掩码 `sk-****abcd`
+- 四个 provider 预设（DeepSeek / 通义千问 / OpenRouter / Ollama）+ 自定义 `base_url`；远端强制 https，明文 http 只允许回环地址
+- Rust 侧 SSE 客户端：自写增量解码器，支持多行 data、CRLF、注释、`[DONE]`、UTF-8 跨分片
+- `lookup` 命令：流式转发增量（`sense://delta`），完成后落库
+- spec 两份 JSON Schema 与 prompt 落入 `src-tauri/resources/`；prompt 用 `include_str!` 内联，并有测试保证变量行被替换、示例段不丢
+- zod 契约镜像：整包校验失败时逐义项救援，一个都不合法才算失败
+- 义项卡 UI：音标、词频、占比条、场景标签、逐条折叠、骨架屏、错误态
+- 增量 JSON 修复：栈式括号闭合（修掉了方案 §8.3 示例里「先补 ] 再补 }」的非法顺序）
+- SQLite 缓存（`entries` / `clicks`，表结构照 §7.1）；命中直接返回，0 网络请求
+- 校验失败自动重试一次（温度 0.2）并**跳过缓存**；失败结果标记 `stale`，不会被二次读到
+- `tools/mock-provider.mjs`：本地 OpenAI 兼容假服务，用于无 Key 的端到端验证
+
+**修复（review 后）**
+
+- P0：缓存把失败结果写死，导致「重试」永远命中同一份坏数据。改为只缓存结构完整的输出 + 重试时 bypass + 失败即标记过期
+- P1：并发查询时旧结果覆盖新结果（序号守卫写在 set 之后，等于没写）
+- P1：被截断的 JSON 被 `parseFinal` 静默修复，卡片会把残缺结果当成功。现在带 `repaired` 标记并明确告知
+- P1：prompt 改动不会让缓存失效。缓存 key 改为 prompt 内容哈希
+- P1：明文 Key 进过 React state。改为非受控输入 + ref，只经 DOM
+- P1：呼出后输入框没有焦点（D1 的回归）
+
+**已知限制**
+
+- 真实模型未验证：需要用户在设置页填自己的 Key（不经过对话、不落盘）
+- Keychain 在未签名 dev build 上可能反复弹授权，未人工确认
+- 查询中切换词不会终止上一条请求，只是前端丢弃其增量
+- 截图 / 划词 / 校对（D6–D10）未开始
+
 ### D1 补丁 · 2026-10-22 — 快捷键避让 Gemini
 
 **变更**

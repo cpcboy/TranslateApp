@@ -2,11 +2,11 @@
 
 macOS 上的 AI 翻译器桌面应用：查词给完整义项卡，长文给逐处批注，截图给即时解析。不做聊天框。
 
-**当前进度**：D1 / 15 —— 工程骨架与窗口已跑通，尚未接入模型。
+**当前进度**：M1 已完成（D1–D5）—— 查词闭环可用：⌃⌥⌘Space 呼出、查 `charge` 出完整义项卡、二次查询走本地缓存。W2（截图 / 校对）尚未开始。
 
 | 想了解 | 看这里 |
 |---|---|
-| 怎么跑起来、怎么测 | [`sense/README.md`](sense/README.md) |
+| 怎么跑起来、怎么测、怎么配模型 | [`sense/README.md`](sense/README.md) |
 | 产品与工程方案 | `SENSE-v1.0/docs/SENSE-落地方案.md`（交接包本地材料，未入库） |
 | 数据契约与 prompt | [`SENSE-v1.0/spec/`](SENSE-v1.0/spec/) |
 | 变更记录 | [`CHANGELOG.md`](CHANGELOG.md) |

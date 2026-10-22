@@ -15,7 +15,7 @@
 ## 项目速览
 
 - **形态**：macOS 桌面应用，Tauri 2 + React 19 + TypeScript + Tailwind 4
-- **当前阶段**：D1 已完成（骨架 + 无边框置顶窗 + `⌃⌥⌘Space` 显隐，快捷键可在 settings.json 里改），下一步 D2（Keychain + Provider + SSE）。M1 目标：查 `charge` 出一张完整义项卡；同词二次查询 0 网络请求
+- **当前阶段**：**M1 已完成**（D1–D5）：查 `charge` 出完整义项卡、二次查询命中缓存 0 请求。下一步 W2（D6 划词 / D7 截图 / D8 OCR / D9–D10 校对）
 - **交接材料**：`SENSE-v1.0/`（只读参考，勿修改其中 `spec/` 与 `docs/`）
 - **工程目录**：`sense/`（D1 建立）
 
