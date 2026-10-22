@@ -65,8 +65,8 @@ export function SettingsView({ onBack }: { onBack: () => void }) {
             onClick={() => setSelectedId(provider.id)}
             className={
               provider.id === selected.id
-                ? "rounded-full border border-acc/60 bg-[rgba(255,82,48,0.1)] px-2.5 py-1 text-[11px] text-paper"
-                : "rounded-full border border-line px-2.5 py-1 text-[11px] text-muted hover:border-line-strong hover:text-paper"
+                ? "rounded-full border border-acc/60 bg-[rgba(255,82,48,0.1)] px-3 py-1.5 text-[13px] text-paper"
+                : "rounded-full border border-line px-3 py-1.5 text-[13px] text-muted hover:border-line-strong hover:text-paper"
             }
           >
             {provider.label}
@@ -81,7 +81,7 @@ export function SettingsView({ onBack }: { onBack: () => void }) {
             value={baseUrl}
             onChange={(event) => setBaseUrl(event.currentTarget.value)}
             spellCheck={false}
-            className="w-full bg-transparent font-mono text-[11.5px] text-paper focus:outline-none"
+            className="w-full bg-transparent font-mono text-[13.5px] text-paper focus:outline-none"
           />
         </Field>
 
@@ -90,17 +90,17 @@ export function SettingsView({ onBack }: { onBack: () => void }) {
             value={model}
             onChange={(event) => setModel(event.currentTarget.value)}
             spellCheck={false}
-            className="w-full bg-transparent font-mono text-[11.5px] text-paper focus:outline-none"
+            className="w-full bg-transparent font-mono text-[13.5px] text-paper focus:outline-none"
           />
         </Field>
 
         <div className="rounded-lg border border-line px-3 py-2.5">
           <div className="flex items-center justify-between">
-            <span className="text-[10px] uppercase tracking-[0.12em] text-muted">API Key</span>
+            <span className="text-[11.5px] tracking-[0.1em] text-muted">API Key</span>
             {selected.key_masked ? (
-              <span className="font-mono text-[10.5px] text-[#8b8781]">{selected.key_masked}</span>
+              <span className="font-mono text-[12px] text-muted">{selected.key_masked}</span>
             ) : (
-              <span className="text-[10.5px] text-muted">
+              <span className="text-[12px] text-muted">
                 {selected.requires_key ? "未设置" : "本地模型，无需 Key"}
               </span>
             )}
@@ -114,7 +114,7 @@ export function SettingsView({ onBack }: { onBack: () => void }) {
               placeholder={selected.requires_key ? "粘贴 Key，只存本机钥匙串" : "本地模型可留空"}
               autoComplete="off"
               spellCheck={false}
-              className="min-w-0 flex-1 bg-transparent font-mono text-[11.5px] text-paper placeholder:text-muted/60 focus:outline-none"
+              className="min-w-0 flex-1 bg-transparent font-mono text-[13.5px] text-paper placeholder:text-muted/60 focus:outline-none"
             />
             <button
               type="button"
@@ -130,7 +130,7 @@ export function SettingsView({ onBack }: { onBack: () => void }) {
                   setNotice({ ok: true, text: `已存进钥匙串，设置页只显示 ${mask}` });
                 })
               }
-              className="rounded-md border border-line-strong px-2 py-1 text-[10.5px] text-paper disabled:opacity-40"
+              className="rounded-md border border-line-strong px-2.5 py-1.5 text-[12.5px] text-paper disabled:opacity-40"
             >
               保存 Key
             </button>
@@ -145,7 +145,7 @@ export function SettingsView({ onBack }: { onBack: () => void }) {
                     setNotice({ ok: true, text: "已从钥匙串删除" });
                   })
                 }
-                className="rounded-md px-2 py-1 text-[10.5px] text-muted hover:text-acc"
+                className="rounded-md px-2.5 py-1.5 text-[12.5px] text-muted hover:text-acc"
               >
                 删除
               </button>
@@ -164,7 +164,7 @@ export function SettingsView({ onBack }: { onBack: () => void }) {
                 setNotice({ ok: true, text: "配置已保存" });
               })
             }
-            className="rounded-md border border-line-strong px-2.5 py-1.5 text-[11px] text-paper disabled:opacity-40"
+            className="rounded-md border border-line-strong px-3 py-2 text-[12.5px] text-paper disabled:opacity-40"
           >
             保存配置
           </button>
@@ -183,7 +183,7 @@ export function SettingsView({ onBack }: { onBack: () => void }) {
                 });
               })
             }
-            className="rounded-md bg-acc px-2.5 py-1.5 text-[11px] font-medium text-[#0a0a0b] disabled:opacity-40"
+            className="rounded-md bg-acc-strong px-3 py-2 text-[12.5px] font-semibold text-[#0a0a0b] disabled:opacity-40"
           >
             {busy === "test" ? "测试中…" : "测试连接"}
           </button>
@@ -199,7 +199,7 @@ export function SettingsView({ onBack }: { onBack: () => void }) {
                   setNotice({ ok: true, text: `已切换到 ${selected.label}` });
                 })
               }
-              className="rounded-md px-2.5 py-1.5 text-[11px] text-muted hover:text-paper"
+              className="rounded-md px-3 py-2 text-[12.5px] text-muted hover:text-paper"
             >
               设为当前
             </button>
@@ -208,7 +208,7 @@ export function SettingsView({ onBack }: { onBack: () => void }) {
           <button
             type="button"
             onClick={onBack}
-            className="ml-auto rounded-md px-2 py-1.5 text-[11px] text-muted hover:text-paper"
+            className="ml-auto rounded-md px-2.5 py-2 text-[12.5px] text-muted hover:text-paper"
           >
             返回查词
           </button>
@@ -218,15 +218,15 @@ export function SettingsView({ onBack }: { onBack: () => void }) {
           <p
             className={
               notice.ok
-                ? "rounded-md bg-[rgba(108,138,90,0.12)] px-2.5 py-1.5 text-[11px] leading-relaxed text-[#9dbb8a]"
-                : "rounded-md bg-[rgba(255,82,48,0.1)] px-2.5 py-1.5 text-[11px] leading-relaxed text-[#e08a73]"
+                ? "rounded-md bg-[rgba(108,138,90,0.12)] px-3 py-2 text-[12.5px] leading-relaxed text-[#a9c79a]"
+                : "rounded-md bg-[rgba(255,82,48,0.1)] px-3 py-2 text-[12.5px] leading-relaxed text-[#f0a08a]"
             }
           >
             {notice.text}
           </p>
         )}
 
-        <p className="text-[10px] leading-relaxed text-[#5e5b57]">
+        <p className="text-[11.5px] leading-relaxed text-subtle">
           Key 只写进 macOS 钥匙串，不会出现在界面、日志或配置文件里。
           所有模型请求由 Rust 发起，前端拿不到 Key。
         </p>
@@ -238,7 +238,7 @@ export function SettingsView({ onBack }: { onBack: () => void }) {
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="block rounded-lg border border-line px-3 py-2">
-      <span className="block text-[10px] uppercase tracking-[0.12em] text-muted">{label}</span>
+      <span className="block text-[11.5px] tracking-[0.1em] text-muted">{label}</span>
       <div className="mt-1">{children}</div>
     </label>
   );

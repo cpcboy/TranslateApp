@@ -49,20 +49,28 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-2">
-      <div className="flex items-center gap-2.5 rounded-xl border border-line-strong bg-black/25 px-3.5 py-2.5">
-        <span className="font-mono text-[11px] text-acc">›</span>
-        <input
-          ref={inputRef}
-          value={text}
-          onChange={(event) => setText(event.currentTarget.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && !event.nativeEvent.isComposing) submit();
-          }}
-          placeholder="查一个词，比如 charge"
-          className="w-full bg-transparent text-[14px] text-paper placeholder:text-muted/70 focus:outline-none"
-        />
-        {busy && <span className="font-mono text-[9px] text-muted">查询中</span>}
-        <kbd className="rounded border border-line px-1.5 py-0.5 font-mono text-[9px] text-muted">↵</kbd>
+      <div className="flex items-center gap-2.5 rounded-xl border border-line-strong bg-black/25 px-4 py-3">
+        <span className="font-mono text-[12.5px] text-acc">›</span>
+        <div className="relative min-w-0 flex-1">
+          <input
+            ref={inputRef}
+            value={text}
+            aria-label="查一个词"
+            onChange={(event) => setText(event.currentTarget.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.nativeEvent.isComposing) submit();
+            }}
+            className="w-full bg-transparent text-[15.5px] text-paper focus:outline-none"
+          />
+          {/* 自绘占位符：WKWebView 里 input 的 placeholder 渲染不出中文 */}
+          {text.length === 0 && (
+            <span className="pointer-events-none absolute inset-y-0 left-0 flex items-center text-[15.5px] text-subtle">
+              查一个词，比如 charge
+            </span>
+          )}
+        </div>
+        {busy && <span className="font-mono text-[11px] text-muted">查询中</span>}
+        <kbd className="rounded border border-line px-1.5 py-0.5 font-mono text-[11px] text-muted">↵</kbd>
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto pr-0.5">
@@ -84,7 +92,7 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
       </div>
 
       {meta && (
-        <footer className="flex shrink-0 items-center justify-between font-mono text-[9.5px] text-[#5e5b57]">
+        <footer className="mt-1 flex shrink-0 items-center justify-between border-t border-line pt-2 font-mono text-[11px] text-subtle">
           <span>
             首义项 {formatMs(meta.firstDeltaMs)} · 总计 {formatMs(meta.totalMs)}
           </span>
@@ -100,8 +108,8 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
 function Empty({ onPick }: { onPick: (word: string) => void }) {
   return (
     <div className="flex h-full flex-col items-center justify-center px-6 text-center">
-      <p className="text-[13px] text-[#beb9b1]">查一个词，给它一张完整的义项卡。</p>
-      <p className="mt-1.5 text-[11px] leading-relaxed text-muted">
+      <p className="text-[15px] text-[#d7d2ca]">查一个词，给它一张完整的义项卡。</p>
+      <p className="mt-2 text-[13px] leading-relaxed text-muted">
         音标、按常用度排序的义项、每个义项的例句和场景。
         <br />
         查过的词会存本地，第二次不再走网络。
@@ -112,7 +120,7 @@ function Empty({ onPick }: { onPick: (word: string) => void }) {
             key={word}
             type="button"
             onClick={() => onPick(word)}
-            className="rounded-full border border-line px-2.5 py-1 font-mono text-[10.5px] text-muted hover:border-line-strong hover:text-paper"
+            className="rounded-full border border-line px-3 py-1.5 font-mono text-[12.5px] text-muted hover:border-line-strong hover:text-paper"
           >
             {word}
           </button>

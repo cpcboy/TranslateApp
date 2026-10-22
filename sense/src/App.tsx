@@ -57,10 +57,10 @@ export default function App() {
 
   return (
     <div className="h-full w-full p-3">
-      <div className="flex h-full flex-col overflow-hidden rounded-2xl border border-line bg-[#0d0d10]">
-        <header className="flex shrink-0 items-center justify-between border-b border-line px-4 py-2.5">
+      <div className="flex h-full flex-col overflow-hidden rounded-2xl border border-line bg-[#121217]">
+        <header className="flex shrink-0 items-center justify-between border-b border-line px-5 py-3">
           <div className="flex items-baseline gap-3">
-            <span className="font-serif text-[15px] font-semibold tracking-[0.18em] text-paper">
+            <span className="font-serif text-[17px] font-semibold tracking-[0.16em] text-paper">
               SENSE
             </span>
             <nav className="flex items-center gap-1">
@@ -72,7 +72,7 @@ export default function App() {
               </Tab>
             </nav>
           </div>
-          <span className="font-mono text-[10px] text-muted">
+          <span className="font-mono text-[11.5px] text-subtle">
             {hint ? `${hint} 呼出 · Esc 隐藏` : "Esc 隐藏"}
           </span>
         </header>
@@ -104,8 +104,8 @@ function Tab({
       onClick={onClick}
       className={
         active
-          ? "rounded-md bg-[rgba(242,239,233,0.08)] px-2 py-[3px] text-[10.5px] text-paper"
-          : "rounded-md px-2 py-[3px] text-[10.5px] text-muted hover:text-paper"
+          ? "rounded-md bg-[rgba(246,243,237,0.1)] px-2.5 py-1 text-[12.5px] text-paper"
+          : "rounded-md px-2.5 py-1 text-[12.5px] text-muted hover:text-paper"
       }
     >
       {children}

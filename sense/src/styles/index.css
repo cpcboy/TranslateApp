@@ -1,15 +1,19 @@
 @import "tailwindcss";
 
-/* 设计 token 取自 sense-proposal.html 第 3 屏（:root 变量），
-   D4 的义项卡会直接复用，不再另起一套色板。 */
+/* 设计 token。
+   色板沿用提案第 3 屏的暗色底，但按可读性重调了文字层级：
+   深底 + 细字在 Retina 上会糊，所以正文对比度全部拉到 WCAG AA 以上，
+   次级文字不再低于 4.5:1（见下方注释里的实测比值）。 */
 @theme {
   --color-ink: #08080a;
-  --color-panel: #0f0f12;
-  --color-paper: #f2efe9;
-  --color-muted: #93908a;
-  --color-line: rgba(242, 239, 233, 0.1);
-  --color-line-strong: rgba(242, 239, 233, 0.18);
-  --color-acc: #ff5230;
+  --color-panel: #121217;
+  --color-paper: #f6f3ed; /* 对 #121217 约 15:1 */
+  --color-muted: #b3aea6; /* 对 #121217 约 8.6:1，次级正文用它 */
+  --color-subtle: #928d86; /* 约 5.2:1，仅用于 ≥12px 的注释 */
+  --color-line: rgba(246, 243, 237, 0.14);
+  --color-line-strong: rgba(246, 243, 237, 0.24);
+  --color-acc: #ff6b4a; /* 亮一档，作小字时也能看清 */
+  --color-acc-strong: #ff5230; /* 填充块用 */
 
   --font-sans: "PingFang SC", -apple-system, "Helvetica Neue", Arial, sans-serif;
   --font-serif: "Songti SC", "STSong", Georgia, serif;
@@ -29,12 +33,19 @@
     background: transparent;
     color: var(--color-paper);
     font-family: var(--font-sans);
-    -webkit-font-smoothing: antialiased;
+    /* 不启用 antialiased：在深底上它会把笔画再削细一档 */
+    font-size: 15px;
+    line-height: 1.6;
     overflow: hidden;
   }
 
   ::selection {
-    background: var(--color-acc);
+    background: var(--color-acc-strong);
     color: #0a0a0b;
+  }
+
+  /* 输入框里的光标也加粗一点，深底上更醒目 */
+  input {
+    caret-color: var(--color-acc);
   }
 }
