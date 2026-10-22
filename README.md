@@ -7,7 +7,7 @@ macOS 上的 AI 翻译器桌面应用：查词给完整义项卡，长文给逐�
 | 想了解 | 看这里 |
 |---|---|
 | 怎么跑起来、怎么测 | [`sense/README.md`](sense/README.md) |
-| 产品与工程方案 | [`SENSE-v1.0/docs/SENSE-落地方案.md`](SENSE-v1.0/docs/SENSE-落地方案.md) |
+| 产品与工程方案 | `SENSE-v1.0/docs/SENSE-落地方案.md`（交接包本地材料，未入库） |
 | 数据契约与 prompt | [`SENSE-v1.0/spec/`](SENSE-v1.0/spec/) |
 | 变更记录 | [`CHANGELOG.md`](CHANGELOG.md) |
 | **改代码前必读** | [`MAINTENANCE_RULES.md`](MAINTENANCE_RULES.md)、[`AGENTS.md`](AGENTS.md) |
@@ -30,7 +30,7 @@ Rust 管权限、密钥、网络与缓存，React 只负责渲染。**API Key �
 ```
 TranslateApp/
 ├─ sense/            工程本体（Tauri 2 + React 19）
-├─ SENSE-v1.0/       交接包：方案、契约、prompt、提案（只读参考）
+├─ SENSE-v1.0/       交接包：方案、契约、prompt、提案（只读参考；仅 spec/ 入库）
 ├─ MAINTENANCE_RULES.md  变更规范：六步流程、项目命令、执行记录
 └─ AGENTS.md         AI 代理入口
 ```
