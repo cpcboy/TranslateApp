@@ -26,23 +26,23 @@ export function ErrorState({
   const needsSettings = error.code === "no_key" || error.code === "auth" || error.code === "no_provider";
 
   return (
-    <div className="rounded-2xl border border-[rgba(255,82,48,0.28)] bg-[rgba(255,82,48,0.06)] px-4 py-5">
-      <div className="flex items-baseline gap-2">
-        <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-acc">
+    <div className="rounded-2xl border border-[rgba(255,82,48,0.32)] bg-[rgba(255,82,48,0.07)] px-6 py-7">
+      <div className="flex items-baseline gap-2.5">
+        <span className="font-mono text-[14px] uppercase tracking-[0.12em] text-acc">
           {error.code}
         </span>
-        <h2 className="text-[14px] font-semibold text-paper">
+        <h2 className="text-[19px] font-semibold text-paper">
           {TITLES[error.code] ?? "查询失败"}
         </h2>
       </div>
-      <p className="mt-2 text-[12px] leading-relaxed text-[#beb9b1]">{error.message}</p>
+      <p className="mt-3 text-[16px] leading-relaxed text-[#d5d0c7]">{error.message}</p>
 
-      <div className="mt-3 flex items-center gap-2">
+      <div className="mt-4 flex items-center gap-2">
         {needsSettings ? (
           <button
             type="button"
             onClick={onOpenSettings}
-            className="rounded-md bg-acc px-3 py-1.5 text-[11.5px] font-medium text-[#0a0a0b] hover:opacity-90"
+            className="rounded-md bg-acc-strong px-4 py-2.5 text-[14.5px] font-semibold text-[#0a0a0b] hover:opacity-90"
           >
             去设置
           </button>
@@ -50,7 +50,7 @@ export function ErrorState({
           <button
             type="button"
             onClick={onRetry}
-            className="rounded-md border border-line-strong px-3 py-1.5 text-[11.5px] text-paper hover:bg-[rgba(242,239,233,0.05)]"
+            className="rounded-md border border-line-strong px-4 py-2.5 text-[14.5px] text-paper hover:bg-[rgba(248,246,241,0.06)]"
           >
             重试
           </button>

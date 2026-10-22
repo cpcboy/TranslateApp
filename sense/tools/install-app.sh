@@ -16,9 +16,13 @@ if [ ! -d "$APP" ]; then
 fi
 
 echo "==> 关闭正在运行的 SENSE"
-osascript -e 'tell application "SENSE" to quit' >/dev/null 2>&1 || true
+# 注意：可执行文件叫 sense（Tauri 用 Cargo 包名），不是 SENSE。
+# 按进程名杀会失败，导致旧实例占着快捷键、open 只是把旧窗口提到前面。
+osascript -e 'tell application id "com.sense.app" to quit' >/dev/null 2>&1 || true
 sleep 1
-pkill -x SENSE >/dev/null 2>&1 || true
+pkill -f "/Applications/SENSE.app/Contents/MacOS/sense" >/dev/null 2>&1 || true
+pkill -f "target/release/bundle/macos/SENSE.app/Contents/MacOS/sense" >/dev/null 2>&1 || true
+sleep 1
 
 echo "==> 安装到 /Applications"
 rm -rf "/Applications/SENSE.app"

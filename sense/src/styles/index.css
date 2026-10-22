@@ -1,18 +1,19 @@
 @import "tailwindcss";
 
 /* 设计 token。
-   色板沿用提案第 3 屏的暗色底，但按可读性重调了文字层级：
-   深底 + 细字在 Retina 上会糊，所以正文对比度全部拉到 WCAG AA 以上，
-   次级文字不再低于 4.5:1（见下方注释里的实测比值）。 */
+   这台机器的显示器是 1920×1080 @1x（非 Retina），CJK 字形在 1x 下需要
+   更大的字号才不糊，因此所有尺寸按「1x 屏幕可直接阅读」来定，而不是按
+   Retina 的观感缩。
+   文字层级全部拉到 WCAG AAA（≥7:1），灰色不再靠透明度做，避免发灰发糊。 */
 @theme {
   --color-ink: #08080a;
   --color-panel: #121217;
-  --color-paper: #f6f3ed; /* 对 #121217 约 15:1 */
-  --color-muted: #b3aea6; /* 对 #121217 约 8.6:1，次级正文用它 */
-  --color-subtle: #928d86; /* 约 5.2:1，仅用于 ≥12px 的注释 */
-  --color-line: rgba(246, 243, 237, 0.14);
-  --color-line-strong: rgba(246, 243, 237, 0.24);
-  --color-acc: #ff6b4a; /* 亮一档，作小字时也能看清 */
+  --color-paper: #f8f6f1; /* 对 #121217 约 17.3:1 */
+  --color-muted: #cfcac2; /* 约 11.5:1，次级正文 */
+  --color-subtle: #b0aaa1; /* 约 8.1:1，最小号注释也不低于 AAA */
+  --color-line: rgba(248, 246, 241, 0.16);
+  --color-line-strong: rgba(248, 246, 241, 0.36);
+  --color-acc: #ff7d5e; /* 约 7.4:1，作小字也够亮 */
   --color-acc-strong: #ff5230; /* 填充块用 */
 
   --font-sans: "PingFang SC", -apple-system, "Helvetica Neue", Arial, sans-serif;
@@ -27,6 +28,10 @@
     height: 100%;
   }
 
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
   body {
     margin: 0;
     /* 窗口是 transparent 的，body 必须透明，圆角由内层容器画 */
@@ -34,8 +39,9 @@
     color: var(--color-paper);
     font-family: var(--font-sans);
     /* 不启用 antialiased：在深底上它会把笔画再削细一档 */
-    font-size: 15px;
-    line-height: 1.6;
+    -webkit-font-smoothing: subpixel-antialiased;
+    font-size: 17px;
+    line-height: 1.62;
     overflow: hidden;
   }
 
@@ -47,5 +53,19 @@
   /* 输入框里的光标也加粗一点，深底上更醒目 */
   input {
     caret-color: var(--color-acc);
+  }
+
+  /* 英文例句：不要让它回退到 Times 斜体（1x 屏上细到发虚）。
+     Helvetica Neue 有真斜体，笔画实、x-height 大。 */
+  .ex-en {
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-style: italic;
+  }
+
+  /* 无边框窗口没有标题栏，靠 data-tauri-drag-region 拖动；
+     拖动区不应该选中文字。 */
+  [data-tauri-drag-region] {
+    user-select: none;
+    cursor: default;
   }
 }

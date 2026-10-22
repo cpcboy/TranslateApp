@@ -15,19 +15,20 @@
       {
         "label": "main",
         "title": "SENSE",
-        "width": 720,
-        "height": 660,
-        "minWidth": 600,
-        "minHeight": 560,
+        "width": 960,
+        "height": 900,
+        "minWidth": 760,
+        "minHeight": 720,
         "center": true,
-        "resizable": false,
+        "resizable": true,
         "decorations": false,
         "transparent": true,
         "alwaysOnTop": true,
         "visibleOnAllWorkspaces": true,
         "visible": true,
         "shadow": true,
-        "focus": true
+        "focus": true,
+        "maximizable": false
       }
     ],
     "security": {

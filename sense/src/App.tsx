@@ -1,10 +1,16 @@
 import { useEffect, useRef, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { LogicalSize } from "@tauri-apps/api/dpi";
 import { LookupView } from "./features/lookup/LookupView";
 import { SettingsView } from "./features/settings/SettingsView";
 import { api } from "./lib/ipc";
 import { useLookup } from "./lib/store";
 
 const isTauri = "__TAURI_INTERNALS__" in window;
+
+/** 与 tauri.conf.json 的 minWidth / minHeight 保持一致，拖拽时先夹一次。 */
+const MIN_WIDTH = 760;
+const MIN_HEIGHT = 720;
 
 type View = "lookup" | "settings";
 
@@ -56,11 +62,16 @@ export default function App() {
   }, [view]);
 
   return (
-    <div className="h-full w-full p-3">
+    <div className="relative h-full w-full p-3">
       <div className="flex h-full flex-col overflow-hidden rounded-2xl border border-line bg-[#121217]">
-        <header className="flex shrink-0 items-center justify-between border-b border-line px-5 py-3">
-          <div className="flex items-baseline gap-3">
-            <span className="font-serif text-[17px] font-semibold tracking-[0.16em] text-paper">
+        {/* 无边框窗口没有标题栏。deep 让整条 header 的空白都能拖动，
+            但按钮/输入框仍优先响应点击（Tauri 会在 clickable 元素上短路）。 */}
+        <header
+          data-tauri-drag-region="deep"
+          className="flex shrink-0 items-center justify-between border-b border-line px-7 py-4"
+        >
+          <div className="flex items-baseline gap-4">
+            <span className="font-serif text-[22px] font-semibold tracking-[0.16em] text-paper">
               SENSE
             </span>
             <nav className="flex items-center gap-1">
@@ -72,12 +83,12 @@ export default function App() {
               </Tab>
             </nav>
           </div>
-          <span className="font-mono text-[11.5px] text-subtle">
+          <span className="font-mono text-[13.5px] text-subtle">
             {hint ? `${hint} 呼出 · Esc 隐藏` : "Esc 隐藏"}
           </span>
         </header>
 
-        <main className="min-h-0 flex-1 px-3 py-2.5">
+        <main className="min-h-0 flex-1 px-4 py-3.5">
           {view === "lookup" ? (
             <LookupView onOpenSettings={() => setView("settings")} />
           ) : (
@@ -85,6 +96,77 @@ export default function App() {
           )}
         </main>
       </div>
+
+      <ResizeGrip />
+    </div>
+  );
+}
+
+/**
+ * 右下角的缩放把手。
+ *
+ * 注意：tao 0.37 在 macOS 上把 `drag_resize_window` 实现成直接返回
+ * NotSupported，所以 Tauri 的 `startResizeDragging` 在这台机器上是静默无效的
+ * （错误被 Rust 侧吞掉，前端 Promise 还会 resolve）。这里改成自己跟踪
+ * pointermove，用 `setSize` 逐帧设置窗口尺寸——这是当前唯一真实可用的路径。
+ */
+function ResizeGrip() {
+  if (!isTauri) return null;
+
+  const start = async (event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const handle = event.currentTarget;
+    handle.setPointerCapture(event.pointerId);
+
+    const win = getCurrentWindow();
+    const [size, scale] = await Promise.all([win.innerSize(), win.scaleFactor()]);
+    const startWidth = size.width / scale;
+    const startHeight = size.height / scale;
+    const startX = event.screenX;
+    const startY = event.screenY;
+
+    let frame = 0;
+    let nextWidth = startWidth;
+    let nextHeight = startHeight;
+
+    const onMove = (moveEvent: PointerEvent) => {
+      nextWidth = Math.max(MIN_WIDTH, Math.round(startWidth + moveEvent.screenX - startX));
+      nextHeight = Math.max(MIN_HEIGHT, Math.round(startHeight + moveEvent.screenY - startY));
+      if (frame) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        void win.setSize(new LogicalSize(nextWidth, nextHeight)).catch(() => {
+          /* 窗口被关掉时会失败，忽略 */
+        });
+      });
+    };
+
+    const onEnd = () => {
+      if (frame) cancelAnimationFrame(frame);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onEnd);
+      window.removeEventListener("pointercancel", onEnd);
+      if (handle.hasPointerCapture(event.pointerId)) {
+        handle.releasePointerCapture(event.pointerId);
+      }
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onEnd);
+    window.addEventListener("pointercancel", onEnd);
+  };
+
+  return (
+    <div
+      role="presentation"
+      aria-hidden="true"
+      title="拖动调整窗口大小"
+      onPointerDown={start}
+      className="group absolute bottom-0 right-0 z-10 flex h-6 w-6 cursor-nwse-resize items-end justify-end p-[3px]"
+    >
+      <svg width="12" height="12" viewBox="0 0 12 12" className="text-subtle group-hover:text-paper">
+        <path d="M11 4 L4 11 M11 8 L8 11" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+      </svg>
     </div>
   );
 }
@@ -104,8 +186,8 @@ function Tab({
       onClick={onClick}
       className={
         active
-          ? "rounded-md bg-[rgba(246,243,237,0.1)] px-2.5 py-1 text-[12.5px] text-paper"
-          : "rounded-md px-2.5 py-1 text-[12.5px] text-muted hover:text-paper"
+          ? "rounded-md bg-[rgba(248,246,241,0.12)] px-3.5 py-2 text-[15px] font-medium text-paper"
+          : "rounded-md px-3.5 py-2 text-[15px] text-muted hover:text-paper"
       }
     >
       {children}
