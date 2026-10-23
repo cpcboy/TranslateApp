@@ -20,6 +20,8 @@ export default function App() {
   const [hint, setHint] = useState("");
   const [notice, setNotice] = useState("");
   const run = useLookup((state) => state.run);
+  const longSource = useLookup((state) => state.longSource);
+  const resetLookup = useLookup((state) => state.reset);
 
   useEffect(() => {
     if (!isTauri) return;
@@ -70,11 +72,16 @@ export default function App() {
         setView("lookup");
         return;
       }
+      // 长文阅读中按 Esc 先退出阅读视图，不要直接把整个窗口收起来
+      if (longSource) {
+        resetLookup();
+        return;
+      }
       if (isTauri) void api.hideWindow();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [view]);
+  }, [view, longSource, resetLookup]);
 
   return (
     <div className="relative h-full w-full p-3">

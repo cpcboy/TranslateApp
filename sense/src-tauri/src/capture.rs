@@ -13,11 +13,11 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
-/// CoreGraphics 的两个 TCC 接口：
-/// - Preflight 只查询，不弹框；返回当前进程有没有屏幕录制权限
-/// - Request 会弹一次系统授权框
-///
-/// 用它们比「截一张图看是不是黑的」可靠得多。
+// CoreGraphics 的两个 TCC 接口：
+// - Preflight 只查询，不弹框；返回当前进程有没有屏幕录制权限
+// - Request 会弹一次系统授权框
+//
+// 用它们比「截一张图看是不是黑的」可靠得多。
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;

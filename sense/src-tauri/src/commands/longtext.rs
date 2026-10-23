@@ -24,6 +24,13 @@ pub fn cancel_translate() {
     CANCELLED.store(true, Ordering::Relaxed);
 }
 
+/// 长文结果：除了译文，还要告诉前端有没有被输出上限截断。
+#[derive(Clone, Serialize)]
+pub struct LongTextResult {
+    pub text: String,
+    pub truncated: bool,
+}
+
 #[derive(Clone, Serialize)]
 struct LongTextDelta {
     request_id: String,
@@ -42,7 +49,7 @@ pub async fn translate_text(
     app: AppHandle,
     text: String,
     request_id: String,
-) -> Result<String, String> {
+) -> Result<LongTextResult, String> {
     let source = text.trim().to_string();
     if source.is_empty() {
         return Err("还没有内容".to_string());
@@ -98,7 +105,16 @@ pub async fn translate_text(
     .await
     .map_err(|err| err.message())?;
 
-    Ok(outcome.text)
+    let truncated = outcome
+        .finish_reason
+        .as_deref()
+        .map(|reason| reason == "length")
+        .unwrap_or(false);
+
+    Ok(LongTextResult {
+        text: outcome.text,
+        truncated,
+    })
 }
 
 #[cfg(test)]

@@ -23,36 +23,50 @@ async function copyText(value: string): Promise<boolean> {
   }
 }
 
+type GlossState = { data: WordGloss | null; error: string | null; x: number; y: number } | null;
+
 export function LongTextView({
   source,
   text,
   busy,
+  truncated,
+  error,
   onStop,
+  onRetry,
+  onBack,
 }: {
   source: string;
   text: string;
   busy: boolean;
+  truncated: boolean;
+  error: string | null;
   onStop: () => void;
+  onRetry: () => void;
+  onBack: () => void;
 }) {
   const [copied, setCopied] = useState<"source" | "target" | null>(null);
   const [issues, setIssues] = useState<GrammarIssue[]>([]);
   const [checking, setChecking] = useState(false);
-  const [gloss, setGloss] = useState<{ data: WordGloss | null; error: string | null; x: number; y: number } | null>(null);
+  const [gloss, setGloss] = useState<GlossState>(null);
+
+  const leftRef = useRef<HTMLDivElement>(null);
+  const rightRef = useRef<HTMLDivElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
   const checkedFor = useRef<string>("");
 
+  // 流式时右栏自动跟到底
   useEffect(() => {
     if (busy) endRef.current?.scrollIntoView({ block: "end" });
   }, [text, busy]);
 
-  // 语法检查放在译文之后（用户选的是 B 方案：先出译文，波浪线后到）
+  // 语法检查放在译文之后（B 方案：先出译文，波浪线后到）
   useEffect(() => {
-    if (busy || !text || !source) return;
+    if (busy || !text || !source || error) return;
     if (checkedFor.current === source) return;
-    // 只检查英文；中文原文没有「语法错误」这回事
+
     const latin = (source.match(/[a-zA-Z]/g) ?? []).length;
     const cjk = (source.match(/[\u4e00-\u9fff]/g) ?? []).length;
-    if (latin < 40 || cjk * 2 >= latin) return;
+    if (latin < 40 || cjk * 2 >= latin) return; // 中文原文不查语法
 
     checkedFor.current = source;
     setChecking(true);
@@ -61,43 +75,79 @@ export function LongTextView({
       .then(setIssues)
       .catch(() => setIssues([]))
       .finally(() => setChecking(false));
-  }, [busy, text, source]);
+  }, [busy, text, source, error]);
 
-  const onSelect = useCallback(
-    async (event: React.MouseEvent) => {
+  /** 查一个词：鼠标划选后调用，键盘快捷键也走这里 */
+  const explain = useCallback(async (term: string, context: string, x: number, y: number) => {
+    if (!term || term.length > 60) return;
+    setGloss({ data: null, error: null, x, y });
+    try {
+      const data = await api.explainWord(term, context);
+      setGloss((current) => (current ? { ...current, data } : current));
+    } catch (err) {
+      setGloss((current) =>
+        current ? { ...current, error: String(err).replace(/^Error:\s*/, "") } : current,
+      );
+    }
+  }, []);
+
+  const onMouseUp = useCallback(
+    (event: React.MouseEvent) => {
       const selection = window.getSelection();
       const term = selection?.toString().trim() ?? "";
-      if (!term || term.length > 60) return;
-
-      // 取选中文本所在的句子当上下文，避免给「词典第一个义项」
-      const anchorNode = selection?.anchorNode?.textContent ?? "";
-      const context = anchorNode.slice(0, 400);
-
-      setGloss({ data: null, error: null, x: event.clientX, y: event.clientY });
-      try {
-        const data = await api.explainWord(term, context);
-        setGloss((current) => (current ? { ...current, data } : current));
-      } catch (err) {
-        setGloss((current) =>
-          current ? { ...current, error: String(err).replace(/^Error:\s*/, "") } : current,
-        );
-      }
+      if (!term) return;
+      const context = selection?.anchorNode?.textContent?.slice(0, 400) ?? "";
+      void explain(term, context, event.clientX, event.clientY);
     },
-    [],
+    [explain],
   );
 
+  // 键盘可达：选中后 ⌘⇧D 查词（鼠标不是唯一入口）
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setGloss(null);
+        return;
+      }
+      if (!(event.metaKey && event.shiftKey) || event.key.toLowerCase() !== "d") return;
+
+      const selection = window.getSelection();
+      const term = selection?.toString().trim() ?? "";
+      if (!term) return;
+      event.preventDefault();
+      const rect = selection?.rangeCount
+        ? selection.getRangeAt(0).getBoundingClientRect()
+        : ({ left: 240, bottom: 240 } as DOMRect);
+      const context = selection?.anchorNode?.textContent?.slice(0, 400) ?? "";
+      void explain(term, context, rect.left, rect.bottom);
+    };
+
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [explain]);
+
+  // 点别处收起浮层（浮层内部的 mousedown 已 stopPropagation）
   useEffect(() => {
     const close = () => setGloss(null);
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setGloss(null);
-    };
     window.addEventListener("mousedown", close);
-    window.addEventListener("keydown", onKey);
-    return () => {
-      window.removeEventListener("mousedown", close);
-      window.removeEventListener("keydown", onKey);
-    };
+    return () => window.removeEventListener("mousedown", close);
   }, []);
+
+  // 两栏按比例同步滚动
+  const syncing = useRef<"left" | "right" | null>(null);
+  const syncScroll = (from: "left" | "right") => () => {
+    if (syncing.current && syncing.current !== from) return;
+    syncing.current = from;
+    const a = from === "left" ? leftRef.current : rightRef.current;
+    const b = from === "left" ? rightRef.current : leftRef.current;
+    if (a && b) {
+      const ratio = a.scrollTop / Math.max(1, a.scrollHeight - a.clientHeight);
+      b.scrollTop = ratio * Math.max(0, b.scrollHeight - b.clientHeight);
+    }
+    requestAnimationFrame(() => {
+      syncing.current = null;
+    });
+  };
 
   const copy = async (which: "source" | "target", value: string) => {
     if (!value) return;
@@ -113,10 +163,24 @@ export function LongTextView({
         title="原文"
         hint={checking ? "检查中…" : issues.length > 0 ? `${issues.length} 处标记` : `${source.length} 字符`}
         action={
-          <CopyButton label={copied === "source" ? "已复制" : "复制原文"} onClick={() => void copy("source", source)} />
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onBack}
+              className="rounded-md px-2 py-1 text-[12.5px] text-subtle hover:text-paper"
+            >
+              ← 返回查词
+            </button>
+            <CopyButton
+              label={copied === "source" ? "已复制" : "复制原文"}
+              onClick={() => void copy("source", source)}
+            />
+          </div>
         }
+        scrollRef={leftRef}
+        onScroll={syncScroll("left")}
       >
-        <div onMouseUp={onSelect}>
+        <div onMouseUp={onMouseUp}>
           <Prose text={source} tone="source" issues={issues} />
         </div>
       </Pane>
@@ -142,18 +206,44 @@ export function LongTextView({
             )}
           </div>
         }
+        scrollRef={rightRef}
+        onScroll={syncScroll("right")}
       >
-        <div onMouseUp={onSelect}>
+        <div onMouseUp={onMouseUp}>
           <Prose text={text} tone="target" />
         </div>
+
         {busy && <span className="ml-[1px] inline-block h-[1.1em] w-[2px] animate-pulse bg-acc align-middle" />}
+
+        {!busy && error && !text && (
+          <div className="rounded-lg border border-[rgba(255,82,48,0.35)] bg-[rgba(255,82,48,0.08)] px-4 py-3">
+            <p className="text-[13.5px] leading-relaxed text-[#f6b09b]">{error}</p>
+            <button
+              type="button"
+              onClick={onRetry}
+              className="mt-2 rounded-md border border-line-strong px-3 py-1.5 text-[13px] text-paper hover:bg-[rgba(248,246,241,0.06)]"
+            >
+              重试
+            </button>
+          </div>
+        )}
+
+        {truncated && (
+          <p className="mt-3 rounded-lg border border-[rgba(240,180,94,0.35)] bg-[rgba(240,180,94,0.08)] px-3 py-2 text-[13px] leading-relaxed text-[#f0b45e]">
+            译文触到输出上限，最后一段可能不完整。可以选中剩余部分再翻一次。
+          </p>
+        )}
+
         <div ref={endRef} />
       </Pane>
 
       {gloss && (
         <div
           className="fixed z-50 w-[300px] rounded-xl border border-line-strong bg-[#16161b] px-4 py-3 shadow-[0_18px_50px_-20px_rgba(0,0,0,0.9)]"
-          style={{ left: Math.min(gloss.x, window.innerWidth - 320), top: Math.min(gloss.y + 14, window.innerHeight - 180) }}
+          style={{
+            left: Math.min(gloss.x, window.innerWidth - 320),
+            top: Math.min(gloss.y + 14, window.innerHeight - 200),
+          }}
           onMouseDown={(event) => event.stopPropagation()}
         >
           {gloss.error ? (
@@ -170,6 +260,7 @@ export function LongTextView({
               {gloss.data.note && (
                 <p className="mt-1 text-[13px] leading-relaxed text-subtle">{gloss.data.note}</p>
               )}
+              <p className="mt-2 font-mono text-[11px] text-subtle">Esc 关闭 · 选中词后 ⌘⇧D</p>
             </>
           )}
         </div>
@@ -178,7 +269,21 @@ export function LongTextView({
   );
 }
 
-function Pane({ title, hint, action, children }: { title: string; hint?: string; action: React.ReactNode; children: React.ReactNode }) {
+function Pane({
+  title,
+  hint,
+  action,
+  children,
+  scrollRef,
+  onScroll,
+}: {
+  title: string;
+  hint?: string;
+  action: React.ReactNode;
+  children: React.ReactNode;
+  scrollRef?: React.RefObject<HTMLDivElement | null>;
+  onScroll?: () => void;
+}) {
   return (
     <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-line bg-panel">
       <header className="flex shrink-0 items-center justify-between border-b border-line px-4 py-2.5">
@@ -188,7 +293,9 @@ function Pane({ title, hint, action, children }: { title: string; hint?: string;
         </div>
         {action}
       </header>
-      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">{children}</div>
+      <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
+        {children}
+      </div>
     </section>
   );
 }

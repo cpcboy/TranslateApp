@@ -20,6 +20,8 @@ pub struct ChatOutcome {
     pub text: String,
     pub first_delta_ms: u128,
     pub total_ms: u128,
+    /// 结束原因。`length` 表示撞到 max_tokens，内容是被截断的。
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +168,7 @@ pub async fn stream_chat(
     let mut decoder = SseDecoder::new();
     let mut text = String::new();
     let mut first_delta_ms: Option<u128> = None;
+    let mut finish_reason: Option<String> = None;
 
     loop {
         let next = if first_delta_ms.is_none() {
@@ -193,6 +196,13 @@ pub async fn stream_chat(
             let Ok(value) = serde_json::from_str::<Value>(&payload) else {
                 continue;
             };
+
+            if let Some(reason) = value
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+            {
+                finish_reason = Some(reason.to_string());
+            }
 
             if let Some(message) = value.get("error").and_then(|item| item.get("message")) {
                 return Err(ChatError::Server(message.as_str().map(sanitize_detail).unwrap_or_default()));
@@ -248,6 +258,7 @@ pub async fn stream_chat(
         text,
         first_delta_ms: first_delta_ms.unwrap_or(0),
         total_ms: started.elapsed().as_millis(),
+        finish_reason,
     })
 }
 

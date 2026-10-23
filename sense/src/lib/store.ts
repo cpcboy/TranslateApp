@@ -29,6 +29,7 @@ type LookupState = {
   longSource: string | null;
   longText: string;
   longBusy: boolean;
+  longTruncated: boolean;
   run: (word: string) => Promise<void>;
   runLong: (text: string) => Promise<void>;
   cancelLong: () => Promise<void>;
@@ -47,6 +48,7 @@ const empty = {
   longSource: null,
   longText: "",
   longBusy: false,
+  longTruncated: false,
 };
 
 /**
@@ -98,7 +100,12 @@ export const useLookup = create<LookupState>((set) => ({
       const result = await api.translateText(text, requestId);
       if (my !== epoch) return;
       flush();
-      set({ status: "done", longText: result, longBusy: false });
+      set({
+        status: "done",
+        longText: result.text,
+        longTruncated: result.truncated,
+        longBusy: false,
+      });
     } catch (err) {
       if (my !== epoch) return;
       set({

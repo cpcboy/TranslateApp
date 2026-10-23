@@ -11,8 +11,23 @@ import { Skeleton } from "./Skeleton";
 const EXAMPLES = ["charge", "落实", "run", "交代"];
 
 export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
-  const { status, query, entry, partial, warnings, error, meta, longSource, longText, longBusy, run, runLong, cancelLong } =
-    useLookup();
+  const {
+    status,
+    query,
+    entry,
+    partial,
+    warnings,
+    error,
+    meta,
+    longSource,
+    longText,
+    longBusy,
+    longTruncated,
+    run,
+    runLong,
+    cancelLong,
+    reset,
+  } = useLookup();
   const [text, setText] = useState("");
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -100,7 +115,11 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
             source={longSource}
             text={longText}
             busy={longBusy}
+            truncated={longTruncated}
+            error={error ? error.message : null}
             onStop={() => void cancelLong()}
+            onRetry={() => void runLong(longSource)}
+            onBack={() => reset()}
           />
         ) : error ? (
           <ErrorState
