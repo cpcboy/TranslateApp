@@ -37,6 +37,65 @@
 - 全屏 App 下能否呼出依赖 `visibleOnAllWorkspaces`，需人工在全屏窗口中确认一次
 - D2 开工前需要决定：模型流式文本进入卡片后，CSP 是否还要再收紧（当前 `connect-src` 已限定）
 
+### M1 补丁 4 · 2026-10-23 — 关掉思考，查词提速
+
+**根因**
+
+DeepSeek V4 系列的思考模式**默认开启、effort 默认 high**（官方文档）。我们之前只发了
+`model / temperature / stream / messages`，所以每次查词模型都先吐几千 token 的思维链，
+`content` 迟迟不来——卡片自然慢，`ttft` 也被这段思维链撑大。
+
+**变更**
+
+- 按 provider 注入「关思考」字段（认 id，不认模型名）：
+  | provider | 字段 |
+  |---|---|
+  | DeepSeek | `{"thinking":{"type":"disabled"}}` |
+  | 通义千问 | `{"enable_thinking":false}` |
+  | OpenRouter | `{"reasoning":{"enabled":false}}` |
+  | Ollama | `{"reasoning_effort":"none"}` |
+- 网关不认这些字段时（HTTP 400）去掉后**自动重试一次**；前提是还没有往前端吐过任何增量，
+  否则会把内容叠两遍
+- `max_tokens: 4096`：与 `deepseek-chat` 默认持平，防跑飞但不截断（截断会触发整条重试，更慢）
+- 启动时预热到 provider 的连接（`GET /models`，不带 Key、不花 token，响应体读空以便回池）
+- 连接池：`pool_idle_timeout 60s`、`tcp_keepalive 60s`、`connect_timeout 5s`
+- **本地模型绕开系统代理**：reqwest 默认读 `HTTP_PROXY`，而 `NO_PROXY` 通常不含 `127.0.0.1`，
+  一旦设了全局代理，发给 Ollama / LM Studio 的请求会被转给代理，本地模型直接不可用
+- 前端增量按 66ms 合流：原来**每来一个 token** 都把整包 JSON 重新补全解析一次再重渲染，
+  长输出时主线程被拖住，观感比实际更慢
+- 页脚的「首义项」改成真实的首个完整义项耗时（原来显示的是首字节），新增 `firstSenseMs`
+
+**修复（review 后）**
+
+- **P1** 合流定时器没有 epoch 守卫：上一轮查询的 66ms 定时器会在新查询开始后把旧 partial 写回去，
+  状态卡在「查询中」
+- **P1** 400 兜底用字符串 `contains("HTTP 400")` 判断，而流里的 `{"error":...}` 事件也会走
+  `ChatError::Server`——那种情况内容可能已经推给前端，重试会叠两遍。改为独立的
+  `ChatError::BadRequest`，并且只在「一个字节都没吐过」时才兜底
+- 预热不 drain 响应体：HTTP/1.1 下连接不会回池，等于只预热了 DNS
+- 预热前先确认 settings 可读：配置坏了不要朝默认 provider 发一次用户没配过的请求
+- `firstSenseMs` 用 `null` 表示「没测到」，不再拿首字节冒充
+- 终态清掉 `buffer` / `partial`，重试前先停掉合流定时器
+
+**实测**
+
+| 场景 | 首字节 | 首义项 | 全卡 |
+|---|---|---|---|
+| 本地 mock（2000 字符真实 SSE） | 45ms | **192ms** | 561ms |
+| `api.deepseek.com` 网络往返（未鉴权 `/models`） | — | — | TLS 37ms / TTFB 332ms |
+| 缓存命中 | — | — | ~0ms（0 请求） |
+
+第一行是**我们这条管线的开销**：从请求发出到第一个义项可渲染，只有约 150ms 是本地成本
+（解析 + 渲染），其余全是模型生成时间。
+
+**关于「500ms」**
+
+- 缓存命中：已经是 0 请求，远低于 500ms
+- 新词：500ms 出**完整卡片**做不到。光到 DeepSeek 的网络往返实测就 332ms，
+  再加 5 个义项约 1200–1800 token 的生成时间，物理上做不到
+- 现在能做到的是「首字节 ≈ 网络 RTT + prefill」「首个义项边到边渲染」，
+  实测数字会显示在卡片页脚，方便你自己核对
+
 ### M1 补丁 3 · 2026-10-23 — 大窗口、可缩放、字号再上一档
 
 **变更**
