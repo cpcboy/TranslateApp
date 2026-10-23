@@ -89,6 +89,7 @@ const server = createServer((req, res) => {
     req.resume();
     req.on("end", () => {
       // 把请求体的关键开关记下来：验证「关思考」到底有没有发出去
+      let source = payload;
       try {
         const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
         const thinking =
@@ -96,6 +97,19 @@ const server = createServer((req, res) => {
         log(
           `  > model=${body.model} max_tokens=${body.max_tokens ?? "-"} temperature=${body.temperature ?? "-"} thinking=${JSON.stringify(thinking)}`,
         );
+
+        // 截图翻译走同一个 provider：按 system 里的标记回一个等长译文数组
+        const system = body.messages?.[0]?.content ?? "";
+        if (system.includes("翻译引擎")) {
+          let items = [];
+          try {
+            items = JSON.parse(body.messages?.[1]?.content ?? "[]");
+          } catch {
+            items = [];
+          }
+          source = JSON.stringify(items.map((text, index) => `译文${index + 1} ${String(text).slice(0, 6)}`));
+          log(`  > 翻译请求：${items.length} 段`);
+        }
       } catch {
         log("  > body 解析失败");
       }
@@ -107,13 +121,13 @@ const server = createServer((req, res) => {
 
       let cursor = 0;
       const timer = setInterval(() => {
-        if (cursor >= payload.length) {
+        if (cursor >= source.length) {
           clearInterval(timer);
           res.write("data: [DONE]\n\n");
           res.end();
           return;
         }
-        const piece = payload.slice(cursor, cursor + CHUNK);
+        const piece = source.slice(cursor, cursor + CHUNK);
         cursor += CHUNK;
         res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: piece } }] })}\n\n`);
       }, DELAY);

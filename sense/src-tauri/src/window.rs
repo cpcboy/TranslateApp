@@ -6,7 +6,7 @@ use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Manager};
-use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
 
 use crate::settings::{self, DEFAULT_HOTKEY_SPEC};
 
@@ -16,8 +16,103 @@ pub const MAIN_WINDOW: &str = "main";
 /// 默认键帽，与 `DEFAULT_HOTKEY_SPEC` 对应；有断言守护。
 pub const DEFAULT_HOTKEY_DISPLAY: &str = "⌃⌥⌘Space";
 
+/// 截屏翻译的默认快捷键：⌃⌥⌘X。
+/// 选它的理由：不在 macOS 符号快捷键表里，也不与微信/QQ/系统截屏（⇧⌘4）冲突。
+pub const DEFAULT_CAPTURE_SPEC: &str = "ctrl+alt+cmd+x";
+
 /// 当前**已注册成功**的键帽。注册失败时保持 None，界面就不显示键帽。
 static ACTIVE_DISPLAY: RwLock<Option<String>> = RwLock::new(None);
+
+/// 已注册的两个快捷键。改键时要先 unregister 旧的、注册失败还要能回滚。
+#[derive(Default)]
+pub struct HotkeyState {
+    lookup: Mutex<Option<Shortcut>>,
+    capture: Mutex<Option<Shortcut>>,
+}
+
+impl HotkeyState {
+    fn slot(&self, kind: &str) -> &Mutex<Option<Shortcut>> {
+        if kind == "capture" {
+            &self.capture
+        } else {
+            &self.lookup
+        }
+    }
+
+    pub fn get(&self, kind: &str) -> Option<Shortcut> {
+        self.slot(kind).lock().ok().and_then(|slot| *slot)
+    }
+
+    pub fn remember(&self, kind: &str, shortcut: Shortcut) {
+        if let Ok(mut slot) = self.slot(kind).lock() {
+            *slot = Some(shortcut);
+        }
+    }
+
+    fn other(&self, kind: &str) -> Option<Shortcut> {
+        self.get(if kind == "capture" { "lookup" } else { "capture" })
+    }
+}
+
+/// 改一个快捷键：解析 → 查重 → 换注册 → 落盘。
+///
+/// 注册失败会把旧键装回去，并且返回可读的原因（最常见是被别的 App 占了）。
+#[tauri::command]
+pub fn set_hotkey(
+    app: AppHandle,
+    state: tauri::State<'_, HotkeyState>,
+    kind: String,
+    spec: String,
+) -> Result<HotkeyView, String> {
+    if kind != "lookup" && kind != "capture" {
+        return Err("未知的快捷键类型".to_string());
+    }
+
+    let parsed = parse_hotkey(&spec)?;
+
+    if let Some(other) = state.other(&kind) {
+        if other.to_string() == parsed.shortcut.to_string() {
+            return Err("这个组合已经分配给另一个功能了，换一个".to_string());
+        }
+    }
+
+    let plugin = app.global_shortcut();
+    let previous = state.get(&kind);
+    if let Some(shortcut) = previous {
+        let _ = plugin.unregister(shortcut);
+    }
+
+    match crate::register_hotkey(&app, &kind, parsed.shortcut) {
+        Ok(()) => {
+            state.remember(&kind, parsed.shortcut);
+            let key = if kind == "capture" {
+                "capture_hotkey"
+            } else {
+                "hotkey"
+            };
+            let value = spec.trim().to_string();
+            settings::update(&app, |map| {
+                map.insert(key.to_string(), serde_json::json!(value));
+            })
+            .map_err(|err| format!("键已生效，但写配置失败：{err}"))?;
+
+            if kind == "lookup" {
+                set_active_display(Some(parsed.display.clone()));
+            }
+            println!("[sense] hotkey updated: {kind} → {}", parsed.display);
+            Ok(HotkeyView {
+                kind,
+                display: parsed.display,
+            })
+        }
+        Err(err) => {
+            if let Some(shortcut) = previous {
+                let _ = crate::register_hotkey(&app, &kind, shortcut);
+            }
+            Err(format!("这个组合注册不上（可能被别的 App 占了）：{err}"))
+        }
+    }
+}
 
 /// 刚显示就被判为失焦的宽限期。
 ///
@@ -161,6 +256,17 @@ pub fn default_hotkey() -> Hotkey {
 ///
 /// 返回值第二项是给人看的来源说明，会打进日志，方便排查「为什么键不生效」。
 pub fn load_hotkey(app: &AppHandle) -> (Hotkey, String) {
+    load_named(app, "hotkey", DEFAULT_HOTKEY_SPEC)
+}
+
+/// 截屏翻译的快捷键。配置键名是 `capture_hotkey`，缺省 ⌃⌥⌘X。
+pub fn load_capture_hotkey(app: &AppHandle) -> (Hotkey, String) {
+    load_named(app, "capture_hotkey", DEFAULT_CAPTURE_SPEC)
+}
+
+/// 读某个键位的配置；任何失败都退回默认值并说清原因，不静默。
+fn load_named(app: &AppHandle, key: &str, default_spec: &str) -> (Hotkey, String) {
+    let fallback = || parse_hotkey(default_spec).expect("默认快捷键常量必须能被解析");
     let path_label = settings::path(app)
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| "settings.json".to_string());
@@ -168,35 +274,56 @@ pub fn load_hotkey(app: &AppHandle) -> (Hotkey, String) {
     let value = match settings::read_value(app) {
         Ok(value) => value,
         Err(err) => {
-            eprintln!("[sense] {err}，改用默认 {DEFAULT_HOTKEY_SPEC}");
-            return (
-                default_hotkey(),
-                format!("{path_label}（读取失败，已回退默认）"),
-            );
+            eprintln!("[sense] {err}，改用默认 {default_spec}");
+            return (fallback(), format!("{path_label}（读取失败，已回退默认）"));
         }
     };
 
     let spec = value
-        .get("hotkey")
+        .get(key)
         .and_then(|item| item.as_str())
         .map(str::trim)
         .filter(|spec| !spec.is_empty());
 
     let Some(spec) = spec else {
-        eprintln!("[sense] {path_label} 里没有 hotkey 字段，改用默认 {DEFAULT_HOTKEY_SPEC}");
-        return (default_hotkey(), format!("{path_label}（缺 hotkey 字段）"));
+        // 没配过就用默认，不算错误（首次启动就是这种情况）
+        return (fallback(), format!("{path_label}（未配置，用默认）"));
     };
 
     match parse_hotkey(spec) {
         Ok(hotkey) => (hotkey, path_label),
         Err(err) => {
-            eprintln!("[sense] {err}（来自 {path_label}），改用默认 {DEFAULT_HOTKEY_SPEC}");
+            eprintln!("[sense] {err}（来自 {path_label}），改用默认 {default_spec}");
             (
-                default_hotkey(),
+                fallback(),
                 format!("{path_label}（配置无效，已回退默认）"),
             )
         }
     }
+}
+
+/// 改键结果：前端拿到新的键帽显示。
+#[derive(serde::Serialize)]
+pub struct HotkeyView {
+    pub kind: String,
+    pub display: String,
+}
+
+/// 当前两个快捷键的键帽，供设置页展示。
+#[tauri::command]
+pub fn hotkey_list(app: AppHandle) -> Vec<HotkeyView> {
+    let (lookup, _) = load_named(&app, "hotkey", DEFAULT_HOTKEY_SPEC);
+    let (capture, _) = load_named(&app, "capture_hotkey", DEFAULT_CAPTURE_SPEC);
+    vec![
+        HotkeyView {
+            kind: "lookup".into(),
+            display: lookup.display,
+        },
+        HotkeyView {
+            kind: "capture".into(),
+            display: capture.display,
+        },
+    ]
 }
 
 /// 记录「当前实际生效的键帽」。注册成功才调用；传 None 表示没有可用快捷键。

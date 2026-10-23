@@ -30,6 +30,17 @@ export type LookupError = { code: string; message: string };
 
 export type DeltaEvent = { request_id: string; text: string };
 
+export type HotkeyView = { kind: "lookup" | "capture"; display: string };
+
+export type OverlayBlock = {
+  text: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  translated: boolean;
+};
+
 export type LookupArgs = {
   word: string;
   lang?: "en" | "zh";
@@ -52,6 +63,15 @@ export const api = {
   hotkeyHint: () => invoke<string>("hotkey_hint"),
   hideWindow: () => invoke<void>("hide_window"),
   devFlags: () => invoke<{ dev_lookup: string | null }>("dev_flags"),
+  hotkeyList: () => invoke<HotkeyView[]>("hotkey_list"),
+  setHotkey: (kind: string, spec: string) =>
+    invoke<HotkeyView>("set_hotkey", { kind, spec }),
+  startCapture: () => invoke<void>("start_capture"),
+  cancelCapture: () => invoke<void>("cancel_capture"),
+  finishCapture: (x: number, y: number, w: number, h: number) =>
+    invoke<number>("finish_capture", { x, y, w, h }),
+  captureBlocks: () => invoke<OverlayBlock[]>("capture_blocks"),
+  closeOverlay: () => invoke<void>("close_overlay"),
   invalidateLookup: (word: string, lang: string, context?: string) =>
     invoke<void>("invalidate_lookup", { word, lang, context }),
 };

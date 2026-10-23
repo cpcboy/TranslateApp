@@ -1,0 +1,426 @@
+//! 截屏翻译：选区 → 截图 → 离线 OCR → 翻译 → 原位覆盖。
+//!
+//! 分工：
+//! - 选区由一个全屏透明窗口完成（前端画框，Rust 负责建窗与收尾）
+//! - 截图用系统自带的 `screencapture -R`（准确、无需自己合成多屏坐标）
+//! - OCR 用 `tools/ocr.swift` 编译出的 sidecar（系统 Vision，离线免费）
+//! - 翻译走和查词同一个 provider / Key，不新增任何服务端
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Mutex;
+
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
+
+use crate::providers::openai_compat;
+use crate::providers as provider_registry;
+use crate::secrets;
+
+/// 选区窗口与结果窗口的 label。
+pub const CAPTURE_WINDOW: &str = "capture";
+pub const OVERLAY_WINDOW: &str = "overlay";
+
+/// OCR 出来的一行（图片像素坐标，原点左上）。
+#[derive(Debug, Clone, Default, Deserialize)]
+struct OcrLine {
+    text: String,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+/// 合并成段之后、经翻译的块（逻辑像素坐标，相对选区左上）。
+#[derive(Debug, Clone, Serialize)]
+pub struct Block {
+    pub text: String,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    /// 没有译文时为 false，前端只画原文
+    pub translated: bool,
+}
+
+#[derive(Default)]
+pub struct CaptureState {
+    blocks: Mutex<Vec<Block>>,
+    /// 最近一次选区（逻辑像素，全局坐标），重试或调试用
+    last_rect: Mutex<Option<(f64, f64, f64, f64)>>,
+}
+
+fn close(app: &AppHandle, label: &str) {
+    if let Some(window) = app.get_webview_window(label) {
+        let _ = window.close();
+    }
+}
+
+/// 在鼠标所在屏幕铺一层透明选区窗口。
+#[tauri::command]
+pub async fn start_capture(app: AppHandle) -> Result<(), String> {
+    close(&app, CAPTURE_WINDOW);
+
+    let cursor = app.cursor_position().map_err(|err| format!("取不到鼠标位置：{err}"))?;
+    let monitor = app
+        .monitor_from_point(cursor.x, cursor.y)
+        .map_err(|err| format!("取不到屏幕信息：{err}"))?
+        .ok_or_else(|| "找不到鼠标所在的屏幕".to_string())?;
+
+    let scale = monitor.scale_factor();
+    let position = monitor.position();
+    let size = monitor.size();
+    let x = position.x as f64 / scale;
+    let y = position.y as f64 / scale;
+    let width = size.width as f64 / scale;
+    let height = size.height as f64 / scale;
+
+    WebviewWindowBuilder::new(&app, CAPTURE_WINDOW, WebviewUrl::App("/?view=capture".into()))
+        .title("SENSE 截图")
+        .position(x, y)
+        .inner_size(width, height)
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .resizable(false)
+        .shadow(false)
+        .visible_on_all_workspaces(true)
+        .focused(true)
+        .build()
+        .map_err(|err| format!("打不开选区窗口：{err}"))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn cancel_capture(app: AppHandle) {
+    close(&app, CAPTURE_WINDOW);
+}
+
+#[tauri::command]
+pub fn close_overlay(app: AppHandle) {
+    close(&app, OVERLAY_WINDOW);
+}
+
+#[tauri::command]
+pub fn capture_blocks(state: State<'_, CaptureState>) -> Vec<Block> {
+    state.blocks.lock().map(|items| items.clone()).unwrap_or_default()
+}
+
+/// 选区确定：截图 → OCR → 翻译 → 原位覆盖。
+///
+/// `x/y/w/h` 是**全局逻辑坐标**（屏幕点），由选区窗口用 outerPosition + 框选尺寸算出来。
+#[tauri::command]
+pub async fn finish_capture(
+    app: AppHandle,
+    state: State<'_, CaptureState>,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+) -> Result<usize, String> {
+    run(app, &state, x, y, w, h).await
+}
+
+/// 命令的实体：抽出来是为了自动化验证（跳过选区直接给一个矩形）。
+pub async fn run(
+    app: AppHandle,
+    state: &CaptureState,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+) -> Result<usize, String> {
+    close(&app, CAPTURE_WINDOW);
+    // 给窗口系统一点时间把遮罩撤掉，否则截图里会带上一层暗色
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+
+    if w < 12.0 || h < 12.0 {
+        return Err("选区太小了".to_string());
+    }
+    if let Ok(mut slot) = state.last_rect.lock() {
+        *slot = Some((x, y, w, h));
+    }
+
+    let png = std::env::temp_dir().join(format!("sense-shot-{}.png", std::process::id()));
+    let rect = format!(
+        "{},{},{},{}",
+        x.round() as i64,
+        y.round() as i64,
+        w.round() as i64,
+        h.round() as i64
+    );
+
+    let output = Command::new("/usr/sbin/screencapture")
+        .args(["-x", "-R", &rect, &png.to_string_lossy()])
+        .output()
+        .map_err(|err| format!("调用截图失败了：{err}"))?;
+
+    if !output.status.success() || !png.exists() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            "截图失败。第一次使用需要在「系统设置 → 隐私与安全性 → 屏幕录制」里勾选 SENSE，然后重启应用。".to_string()
+        } else {
+            format!("截图失败：{detail}")
+        });
+    }
+
+    let lines = run_ocr(&png).map_err(|err| format!("识别失败：{err}"))?;
+    let _ = std::fs::remove_file(&png);
+
+    if lines.is_empty() {
+        return Err("选中的区域里没识别到文字。也可能是屏幕录制权限没给：系统设置 → 隐私与安全性 → 屏幕录制。".to_string());
+    }
+
+    let scale = monitor_scale(&app);
+    let mut blocks = merge_lines(&lines, scale);
+
+    if let Some(target) = translate_target(&blocks) {
+        match translate_blocks(&app, &mut blocks, target).await {
+            Ok(()) => {}
+            Err(err) => {
+                // 翻译失败也把原文盖上去：至少让用户看到识别结果，而不是一片空白
+                eprintln!("[sense] 截图翻译失败：{err}");
+            }
+        }
+    }
+
+    if let Ok(mut slot) = state.blocks.lock() {
+        *slot = blocks.clone();
+    }
+
+    WebviewWindowBuilder::new(&app, OVERLAY_WINDOW, WebviewUrl::App("/?view=overlay".into()))
+        .title("SENSE 译文")
+        .position(x, y)
+        .inner_size(w, h)
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .resizable(false)
+        .shadow(false)
+        .visible_on_all_workspaces(true)
+        .focused(true)
+        .build()
+        .map_err(|err| format!("打不开译文窗口：{err}"))?;
+
+    Ok(blocks.len())
+}
+
+/// 取鼠标所在屏幕的缩放，用来把图片像素换算成逻辑像素。
+fn monitor_scale(app: &AppHandle) -> f64 {
+    app.cursor_position()
+        .ok()
+        .and_then(|point| app.monitor_from_point(point.x, point.y).ok().flatten())
+        .map(|monitor| monitor.scale_factor())
+        .unwrap_or(1.0)
+}
+
+/// 找到 OCR sidecar：打包后在主程序旁边，dev 时在 src-tauri/binaries/。
+fn ocr_binary() -> Result<PathBuf, String> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join("sense-ocr");
+            if sibling.exists() {
+                return Ok(sibling);
+            }
+        }
+    }
+
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries");
+    if let Ok(entries) = std::fs::read_dir(&manifest) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().and_then(|item| item.to_str()).unwrap_or("");
+            if name.starts_with("sense-ocr") && path.exists() {
+                return Ok(path);
+            }
+        }
+    }
+
+    Err("找不到 OCR 组件（sense-ocr），重新构建一次应用".to_string())
+}
+
+fn run_ocr(png: &Path) -> Result<Vec<OcrLine>, String> {
+    let binary = ocr_binary()?;
+    let output = Command::new(&binary)
+        .arg(png)
+        .output()
+        .map_err(|err| format!("启动 OCR 失败：{err}"))?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+
+    serde_json::from_slice::<Vec<OcrLine>>(&output.stdout).map_err(|err| format!("OCR 输出解析失败：{err}"))
+}
+
+/// 同一段的多行合回一块：行高接近、竖直间隙小、水平有重叠。
+fn merge_lines(lines: &[OcrLine], scale: f64) -> Vec<Block> {
+    let mut sorted: Vec<&OcrLine> = lines.iter().filter(|line| !line.text.trim().is_empty()).collect();
+    sorted.sort_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut blocks: Vec<Block> = Vec::new();
+    for line in sorted {
+        let (x, y, w, h) = (line.x / scale, line.y / scale, line.w / scale, line.h / scale);
+        let text = line.text.trim().to_string();
+
+        if let Some(last) = blocks.last_mut() {
+            let same_column = x >= last.x - last.w * 0.5 && x <= last.x + last.w * 0.5;
+            let close_enough = y - (last.y + last.h) < last.h * 0.9;
+            let similar_height = (h - last.h).abs() < last.h.max(h) * 0.6;
+
+            if same_column && close_enough && similar_height {
+                let right = (last.x + last.w).max(x + w);
+                let bottom = (last.y + last.h).max(y + h);
+                last.x = last.x.min(x);
+                last.y = last.y.min(y);
+                last.w = right - last.x;
+                last.h = bottom - last.y;
+                last.text.push(' ');
+                last.text.push_str(&text);
+                continue;
+            }
+        }
+
+        blocks.push(Block {
+            text,
+            x,
+            y,
+            w,
+            h,
+            translated: false,
+        });
+    }
+
+    blocks
+}
+
+/// 目标语言：源文以英文为主就译成中文，否则译成英文。
+fn translate_target(blocks: &[Block]) -> Option<&'static str> {
+    let sample: String = blocks.iter().map(|block| block.text.as_str()).collect::<Vec<_>>().join(" ");
+    let cjk = sample.chars().filter(|ch| ('\u{4e00}'..='\u{9fff}').contains(ch)).count();
+    let latin = sample.chars().filter(|ch| ch.is_ascii_alphabetic()).count();
+    if cjk == 0 && latin == 0 {
+        return None;
+    }
+    Some(if cjk * 2 >= latin { "英文" } else { "中文" })
+}
+
+/// 一次请求翻译全部块，顺序对齐；失败就保留原文。
+async fn translate_blocks(app: &AppHandle, blocks: &mut [Block], target: &str) -> Result<(), String> {
+    let provider = provider_registry::active(app)?;
+    let key = if provider.requires_key {
+        secrets::get_key(&provider.id)?
+    } else {
+        None
+    };
+
+    let payload: Vec<&str> = blocks.iter().map(|block| block.text.as_str()).collect();
+    let user = serde_json::to_string(&payload).map_err(|err| err.to_string())?;
+    let system = format!(
+        "你是翻译引擎。把 user 给的 JSON 字符串数组逐条翻译成{target}，\
+         只输出同样长度、同样顺序的 JSON 字符串数组，不要解释、不要 Markdown 代码块。\
+         术语准确，语气自然，尽量简短以适配原来的版面。"
+    );
+
+    let reasoning = provider_registry::reasoning_fields(&provider.id);
+    let body = openai_compat::build_body(
+        &provider.model,
+        &system,
+        &user,
+        0.2,
+        reasoning.as_ref(),
+        openai_compat::MAX_TOKENS,
+    );
+
+    let mut raw = String::new();
+    let outcome = openai_compat::stream_chat(
+        crate::client_for(&provider.base_url),
+        &provider,
+        key.as_deref(),
+        &body,
+        &mut |delta: &str| raw.push_str(delta),
+    )
+    .await
+    .map_err(|err| err.message())?;
+
+    let translations = parse_translation_array(&outcome.text)?;
+    if translations.len() != blocks.len() {
+        return Err(format!(
+            "译文条数对不上：{} vs {}",
+            translations.len(),
+            blocks.len()
+        ));
+    }
+
+    for (block, text) in blocks.iter_mut().zip(translations) {
+        let text = text.trim().to_string();
+        if !text.is_empty() {
+            block.text = text;
+            block.translated = true;
+        }
+    }
+    Ok(())
+}
+
+/// 模型偶尔会包一层 ```json，这里统一剥掉再解析。
+fn parse_translation_array(raw: &str) -> Result<Vec<String>, String> {
+    let mut text = raw.trim();
+    if let Some(rest) = text.strip_prefix("```") {
+        let rest = rest.trim_start_matches("json").trim_start();
+        text = rest.trim_end_matches("```").trim();
+    }
+    let start = text.find('[').ok_or("译文里没有 JSON 数组")?;
+    let end = text.rfind(']').ok_or("译文 JSON 不完整")?;
+    serde_json::from_str::<Vec<String>>(&text[start..=end]).map_err(|err| format!("译文解析失败：{err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(text: &str, x: f64, y: f64, w: f64, h: f64) -> OcrLine {
+        OcrLine {
+            text: text.into(),
+            x,
+            y,
+            w,
+            h,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn adjacent_lines_merge_into_one_block() {
+        let lines = vec![
+            line("The quick brown", 10.0, 10.0, 200.0, 20.0),
+            line("fox jumps over", 10.0, 32.0, 180.0, 20.0),
+            line("另一个段落", 10.0, 200.0, 120.0, 20.0),
+        ];
+        let blocks = merge_lines(&lines, 1.0);
+        assert_eq!(blocks.len(), 2, "相邻两行应合成一段");
+        assert_eq!(blocks[0].text, "The quick brown fox jumps over");
+        assert!(blocks[0].h > 30.0, "高度要覆盖两行");
+    }
+
+    #[test]
+    fn translation_array_survives_code_fence() {
+        let raw = "```json\n[\"甲\",\"乙\"]\n```";
+        assert_eq!(parse_translation_array(raw).unwrap(), vec!["甲", "乙"]);
+    }
+
+    #[test]
+    fn target_language_follows_source() {
+        let english = vec![Block {
+            text: "hello world".into(),
+            x: 0.0,
+            y: 0.0,
+            w: 10.0,
+            h: 10.0,
+            translated: false,
+        }];
+        assert_eq!(translate_target(&english), Some("中文"));
+    }
+}

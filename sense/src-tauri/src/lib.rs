@@ -4,6 +4,7 @@
 //! 模型请求、密钥、缓存都在后面的日子进来，且一律留在 Rust 侧。
 
 mod cache;
+mod capture;
 mod commands;
 mod prompts;
 mod providers;
@@ -78,13 +79,35 @@ pub fn http_client() -> &'static reqwest::Client {
 
 /// 注册一个全局快捷键。抽出来是为了注册失败时能换默认值再试一次。
 fn register_shortcut(app: &tauri::AppHandle, shortcut: Shortcut) -> Result<(), String> {
-    app.global_shortcut()
-        .on_shortcut(shortcut, |app, _shortcut, event| {
+    register_hotkey(app, "lookup", shortcut)
+}
+
+/// 按用途注册：查词是显隐窗口，截屏是拉选区。
+pub fn register_hotkey(
+    app: &tauri::AppHandle,
+    kind: &str,
+    shortcut: Shortcut,
+) -> Result<(), String> {
+    let plugin = app.global_shortcut();
+    let result = match kind {
+        "capture" => plugin.on_shortcut(shortcut, |app, _shortcut, event| {
+            if event.state() != ShortcutState::Pressed {
+                return;
+            }
+            let handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(err) = capture::start_capture(handle).await {
+                    eprintln!("[sense] 截屏启动失败：{err}");
+                }
+            });
+        }),
+        _ => plugin.on_shortcut(shortcut, |app, _shortcut, event| {
             if event.state() == ShortcutState::Pressed {
                 window::toggle(app);
             }
-        })
-        .map_err(|err| err.to_string())
+        }),
+    };
+    result.map_err(|err| err.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -92,6 +115,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(window::WindowState::default())
+        .manage(window::HotkeyState::default())
+        .manage(capture::CaptureState::default())
         .invoke_handler(tauri::generate_handler![
             window::hide_window,
             window::hotkey_hint,
@@ -104,6 +129,13 @@ pub fn run() {
             commands::settings::dev_flags,
             commands::lookup::lookup,
             commands::lookup::invalidate_lookup,
+            window::hotkey_list,
+            window::set_hotkey,
+            capture::start_capture,
+            capture::cancel_capture,
+            capture::finish_capture,
+            capture::close_overlay,
+            capture::capture_blocks,
         ])
         .setup(|app| {
             // 默认菜单：给出 ⌘Q 退出与 Edit 菜单（输入框的 ⌘C/⌘V 依赖它）。
@@ -151,6 +183,8 @@ pub fn run() {
                         hotkey.display, source
                     );
                     window::set_active_display(Some(hotkey.display));
+                    app.state::<window::HotkeyState>()
+                        .remember("lookup", hotkey.shortcut);
                 }
                 Err(err) => {
                     eprintln!("[sense] hotkey register FAILED ({}): {err}", hotkey.display);
@@ -167,6 +201,50 @@ pub fn run() {
                     }
                     // 热键是唯一入口：注册不上还躲着不露脸，用户会以为应用坏了。
                     window::show(app.handle());
+                }
+            }
+
+            // 截屏翻译的快捷键。注册不上不影响查词，只打日志并让用户在设置里改。
+            {
+                let (hotkey, source) = window::load_capture_hotkey(app.handle());
+                match register_hotkey(app.handle(), "capture", hotkey.shortcut) {
+                    Ok(()) => {
+                        println!(
+                            "[sense] capture hotkey registered: {}；来源：{}",
+                            hotkey.display, source
+                        );
+                        app.state::<window::HotkeyState>()
+                            .remember("capture", hotkey.shortcut);
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[sense] capture hotkey FAILED ({}): {err}；可在设置里改",
+                            hotkey.display
+                        );
+                    }
+                }
+            }
+
+            // 仅供自动化验证：给一个矩形就直接走「截图 → OCR → 翻译 → 覆盖」，
+            // 跳过手动拖框（鼠标手势没法脚本化）。
+            #[cfg(debug_assertions)]
+            if let Ok(rect) = std::env::var("SENSE_DEV_CAPTURE") {
+                let parts: Vec<f64> = rect
+                    .split(',')
+                    .filter_map(|item| item.trim().parse::<f64>().ok())
+                    .collect();
+                if parts.len() == 4 {
+                    let handle = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(3000)).await;
+                        let state = handle.state::<capture::CaptureState>();
+                        match capture::run(handle.clone(), &state, parts[0], parts[1], parts[2], parts[3])
+                            .await
+                        {
+                            Ok(count) => println!("[sense] dev capture: {count} 块"),
+                            Err(err) => eprintln!("[sense] dev capture 失败: {err}"),
+                        }
+                    });
                 }
             }
 

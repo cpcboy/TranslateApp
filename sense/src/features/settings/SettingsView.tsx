@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type ProviderView } from "../../lib/ipc";
+import { api, type HotkeyView, type ProviderView } from "../../lib/ipc";
 
 export function SettingsView({ onBack }: { onBack: () => void }) {
   const [providers, setProviders] = useState<ProviderView[]>([]);
@@ -10,6 +10,9 @@ export function SettingsView({ onBack }: { onBack: () => void }) {
   // 明文 Key 只经过 DOM 节点，不进 React state / 任何可序列化的 store。
   const keyRef = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [hotkeys, setHotkeys] = useState<HotkeyView[]>([]);
+  const [capturing, setCapturing] = useState<string | null>(null);
+  const [hotkeyError, setHotkeyError] = useState<string | null>(null);
   const [notice, setNotice] = useState<{ ok: boolean; text: string } | null>(null);
 
   const refresh = useCallback(async () => {
@@ -25,6 +28,44 @@ export function SettingsView({ onBack }: { onBack: () => void }) {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    void api
+      .hotkeyList()
+      .then(setHotkeys)
+      .catch(() => {
+        /* 取不到就不显示这一栏 */
+      });
+  }, []);
+
+  // 改键：按下的下一个组合直接生效（Esc 取消）
+  useEffect(() => {
+    if (!capturing) return;
+    const onKey = (event: KeyboardEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.key === "Escape") {
+        setCapturing(null);
+        setHotkeyError(null);
+        return;
+      }
+      const parsed = comboFrom(event);
+      if ("error" in parsed) {
+        setHotkeyError(parsed.error);
+        return;
+      }
+      void api
+        .setHotkey(capturing, parsed.spec)
+        .then((view) => {
+          setHotkeys((list) => list.map((item) => (item.kind === view.kind ? view : item)));
+          setCapturing(null);
+          setHotkeyError(null);
+        })
+        .catch((err) => setHotkeyError(String(err).replace(/^Error:\s*/, "")));
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [capturing]);
 
   const selected = providers.find((item) => item.id === selectedId) ?? null;
 
@@ -237,6 +278,44 @@ export function SettingsView({ onBack }: { onBack: () => void }) {
           </p>
         )}
 
+        <div className="rounded-lg border border-line px-4 py-3">
+          <div className="text-[13.5px] tracking-[0.08em] text-muted">快捷键</div>
+          {hotkeys.map((item) => (
+            <div key={item.kind} className="mt-2 flex items-center justify-between gap-3">
+              <span className="text-[14.5px] text-paper">
+                {item.kind === "lookup" ? "查词" : "截屏翻译"}
+              </span>
+              <div className="flex items-center gap-2">
+                <kbd
+                  className={
+                    capturing === item.kind
+                      ? "rounded border border-acc/60 bg-[rgba(255,82,48,0.12)] px-2.5 py-1 font-mono text-[13.5px] text-paper"
+                      : "rounded border border-line px-2.5 py-1 font-mono text-[13.5px] text-muted"
+                  }
+                >
+                  {capturing === item.kind ? "按下新组合…" : item.display}
+                </kbd>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setHotkeyError(null);
+                    setCapturing(capturing === item.kind ? null : item.kind);
+                  }}
+                  className="rounded-md px-2.5 py-1 text-[13px] text-muted hover:text-paper"
+                >
+                  {capturing === item.kind ? "取消" : "修改"}
+                </button>
+              </div>
+            </div>
+          ))}
+          {hotkeyError && (
+            <p className="mt-2 text-[13px] leading-relaxed text-[#f6b09b]">{hotkeyError}</p>
+          )}
+          <p className="mt-2 text-[13px] leading-relaxed text-subtle">
+            至少包含 ⌃ 或 ⌘，主键支持字母、数字、空格。改完立刻生效，不用重启。
+          </p>
+        </div>
+
         <p className="text-[13.5px] leading-relaxed text-subtle">
           Key 只写进 macOS 钥匙串，不会出现在界面、日志或配置文件里。
           所有模型请求由 Rust 发起，前端拿不到 Key。
@@ -253,4 +332,42 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
       <div className="mt-1.5">{children}</div>
     </label>
   );
+}
+
+const MODIFIER_LABEL: Record<string, string> = {
+  ctrl: "⌃",
+  alt: "⌥",
+  shift: "⇧",
+  cmd: "⌘",
+};
+
+/** 键盘事件 → 配置里那种 `ctrl+alt+cmd+x`；不合规就返回原因。 */
+function comboFrom(event: KeyboardEvent): { spec: string } | { error: string } {
+  if (["Control", "Alt", "Shift", "Meta"].includes(event.key)) {
+    return { error: "还差一个主键：按住修饰键再按字母" };
+  }
+
+  const modifiers: string[] = [];
+  if (event.ctrlKey) modifiers.push("ctrl");
+  if (event.altKey) modifiers.push("alt");
+  if (event.shiftKey) modifiers.push("shift");
+  if (event.metaKey) modifiers.push("cmd");
+
+  if (!modifiers.includes("ctrl") && !modifiers.includes("cmd")) {
+    return { error: "至少要有 ⌃ 或 ⌘，否则会抢走所有输入框的按键" };
+  }
+
+  let main = "";
+  if (event.key === " ") main = "space";
+  else if (/^[a-z]$/i.test(event.key)) main = event.key.toLowerCase();
+  else if (/^[0-9]$/.test(event.key)) main = event.key;
+  else return { error: "只支持字母、数字、空格" };
+
+  return { spec: [...modifiers, main].join("+") };
+}
+
+export function hotkeyLabel(spec: string): string {
+  const parts = spec.split("+");
+  const main = parts.pop() ?? "";
+  return parts.map((part) => MODIFIER_LABEL[part] ?? part).join("") + main.toUpperCase();
 }
