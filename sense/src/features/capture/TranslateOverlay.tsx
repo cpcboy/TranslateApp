@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api, type OverlayBlock } from "../../lib/ipc";
 
 /**
@@ -34,23 +34,7 @@ export function TranslateOverlay() {
       onClick={() => void api.closeOverlay()}
     >
       {blocks?.map((block, index) => (
-        <div
-          key={`${block.x}-${block.y}-${index}`}
-          className="absolute overflow-hidden rounded-[3px] bg-[rgba(14,14,18,0.95)] px-[2px] text-[#f6f3ed]"
-          style={{
-            left: block.x,
-            top: block.y,
-            width: Math.max(block.w, 8),
-            height: Math.max(block.h, 8),
-            fontSize: Math.max(10, Math.min(17, Math.round(block.h * 0.62))),
-            lineHeight: 1.22,
-            display: "flex",
-            alignItems: "center",
-            opacity: block.translated ? 1 : 0.85,
-          }}
-        >
-          <span className="line-clamp-2 w-full">{block.text}</span>
-        </div>
+        <BlockView key={`${block.x}-${block.y}-${index}`} block={block} />
       ))}
 
       {blocks !== null && blocks.length === 0 && (
@@ -64,6 +48,50 @@ export function TranslateOverlay() {
           Esc 关闭
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * 单块译文。
+ *
+ * 字号不是拍脑袋定的：Vision 给的框高≈原文字高，先按 0.95 倍起步，
+ * 再实测是否溢出，逐级缩小到装得下为止——中文比英文短，通常不用缩。
+ */
+function BlockView({ block }: { block: OverlayBlock }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const base = Math.min(26, Math.max(12, Math.round(block.h * 0.95)));
+
+  useLayoutEffect(() => {
+    const node = ref.current;
+    if (!node) return;
+    let size = base;
+    node.style.fontSize = `${size}px`;
+    for (let step = 0; step < 16; step += 1) {
+      const overflow =
+        node.scrollHeight > node.clientHeight + 1 || node.scrollWidth > node.clientWidth + 1;
+      if (!overflow || size <= 10) break;
+      size -= 1;
+      node.style.fontSize = `${size}px`;
+    }
+  }, [block.text, block.w, block.h, base]);
+
+  return (
+    <div
+      ref={ref}
+      className="absolute overflow-hidden rounded-[3px] bg-[rgba(14,14,18,0.96)] px-[3px] text-[#f6f3ed]"
+      style={{
+        left: block.x,
+        top: block.y,
+        width: Math.max(block.w, 8),
+        height: Math.max(block.h, 8),
+        lineHeight: 1.18,
+        display: "flex",
+        alignItems: "center",
+        opacity: block.translated ? 1 : 0.82,
+      }}
+    >
+      {block.text}
     </div>
   );
 }

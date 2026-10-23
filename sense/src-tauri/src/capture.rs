@@ -339,11 +339,30 @@ fn merge_lines(lines: &[OcrLine], scale: f64) -> Vec<Block> {
         let text = line.text.trim().to_string();
 
         if let Some(last) = blocks.last_mut() {
-            let same_column = x >= last.x - last.w * 0.5 && x <= last.x + last.w * 0.5;
-            let close_enough = y - (last.y + last.h) < last.h * 0.9;
-            let similar_height = (h - last.h).abs() < last.h.max(h) * 0.6;
+            let same_column = x >= last.x - last.w * 0.35 && x <= last.x + last.w * 0.35;
+            let gap = y - (last.y + last.h);
+            let close_enough = gap >= -2.0 && gap < last.h * 0.55;
+            let similar_height = (h - last.h).abs() < last.h.max(h) * 0.4;
+            // 关键：只合并「明显是被折断的一句话」。
+            // 终端输出、代码、列表里相邻两行是两句独立的话，合起来反而翻错。
+            let previous = last.text.trim_end();
+            let ends_open = previous.ends_with(',')
+                || previous.ends_with('，')
+                || previous.ends_with('-')
+                || previous.ends_with('—');
+            let ends_sentence = previous
+                .chars()
+                .last()
+                .map(|ch| ".!?。！？:：;；$>|/\\）)】]」』".contains(ch))
+                .unwrap_or(true);
+            let starts_lower = text
+                .chars()
+                .next()
+                .map(|ch| ch.is_lowercase())
+                .unwrap_or(false);
+            let wraps = !ends_sentence && (ends_open || starts_lower);
 
-            if same_column && close_enough && similar_height {
+            if same_column && close_enough && similar_height && wraps {
                 let right = (last.x + last.w).max(x + w);
                 let bottom = (last.y + last.h).max(y + h);
                 last.x = last.x.min(x);
@@ -392,12 +411,16 @@ async fn translate_blocks(app: &AppHandle, blocks: &mut [Block], target: &str) -
     let payload: Vec<&str> = blocks.iter().map(|block| block.text.as_str()).collect();
     let user = serde_json::to_string(&payload).map_err(|err| err.to_string())?;
     let system = format!(
-        "你是翻译引擎。把 user 给的 JSON 字符串数组逐条翻译成{target}，\
-         只输出同样长度、同样顺序的 JSON 字符串数组，不要解释、不要 Markdown 代码块。\
-         术语准确，语气自然，尽量简短以适配原来的版面。"
+        "你是一位翻译，正在翻译屏幕上一段连续的文字。input 是按阅读顺序排好的 JSON 字符串数组，\
+         相邻两条通常属于同一段内容。\n\n要求：\n\
+         1. 先通读全部条目，理解整体在讲什么，再逐条翻译成{target}；指代、术语、语气前后保持一致。\n\
+         2. 输出同样长度、同样顺序的 JSON 字符串数组，只输出数组本身，不要解释、不要代码块。\n\
+         3. 命令行、代码、变量名、路径、URL、版本号、错误码、日志级别原样保留，不要翻译。\n\
+         4. 每条尽量简短，以适配原来的版面宽度。"
     );
 
-    let reasoning = provider_registry::reasoning_fields(&provider.id);
+    // 截屏场景优先质量：让模型先「想一想」再翻，比查词慢一点没关系
+    let reasoning = provider_registry::understanding_fields(&provider.id);
     let body = openai_compat::build_body(
         &provider.model,
         &system,
