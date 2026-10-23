@@ -12,7 +12,9 @@ export const SCHEMA_VERSION = 1;
 /** prompt 版本进缓存 key：改 prompt 后旧缓存自然失效。 */
 export const PROMPT_VERSION = 1;
 
-export const posSchema = z.enum([
+// 词性 / 语域 / 场景都只用于展示，不该因为它们不在名单里就让整张卡作废。
+// 之前 `interj`（shit、wow 这类感叹词）缺失，导致这条词无论重试多少次都判非法。
+const KNOWN_POS = [
   "n",
   "v",
   "adj",
@@ -22,29 +24,24 @@ export const posSchema = z.enum([
   "pron",
   "num",
   "phr",
-]);
+  "interj",
+  "aux",
+  "det",
+  "art",
+  "part",
+  "abbr",
+] as const;
 
-export const sceneSchema = z.enum([
-  "日常",
-  "职场",
-  "学术",
-  "新闻",
-  "法律",
-  "技术",
-  "旅行",
-  "消费",
-  "医疗",
-  "教育",
-]);
+export const posSchema = z.enum(KNOWN_POS).catch("n");
 
-export const registerSchema = z.enum([
-  "neutral",
-  "formal",
-  "informal",
-  "technical",
-  "legal",
-  "slang",
-]);
+export const sceneSchema = z
+  .enum(["日常", "职场", "学术", "新闻", "法律", "技术", "旅行", "消费", "医疗", "教育", "口语", "网络", "娱乐", "商业"])
+  .catch("日常");
+
+export const registerSchema = z
+  .enum(["neutral", "formal", "informal", "technical", "legal", "slang", "vulgar", "colloquial", "idiom", "literary"])
+  .nullable()
+  .catch("neutral");
 
 export const exampleSchema = z.object({
   text: z.string().min(1).max(200),

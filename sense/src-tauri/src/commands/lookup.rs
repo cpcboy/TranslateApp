@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::cache::{entry_key, Cache};
 use crate::providers::openai_compat::{self, ChatError};
@@ -252,12 +252,26 @@ pub async fn lookup(
             .into_iter()
             .rev()
             .collect();
-        eprintln!(
-            "[sense] 输出结构不完整 len={} finish={:?} tail={:?}",
+        let line = format!(
+            "lookup {word}: len={} chunks={} finish={:?} tail={:?}",
             outcome.text.chars().count(),
+            outcome.chunks,
             outcome.finish_reason,
             tail
         );
+        eprintln!("[sense] 输出结构不完整 {line}");
+        // 从访达启动时 stdout 看不到，落一份文件
+        if let Ok(dir) = app.path().app_data_dir() {
+            use std::io::Write;
+            let _ = std::fs::create_dir_all(&dir);
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("lookup.log"))
+            {
+                let _ = writeln!(file, "{line}");
+            }
+        }
     }
 
     Ok(LookupResult {

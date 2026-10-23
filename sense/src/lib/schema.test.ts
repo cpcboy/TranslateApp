@@ -94,11 +94,26 @@ describe("wordEntrySchema（与 spec JSON Schema 对拍）", () => {
     expect(wordEntrySchema.safeParse(broken).success).toBe(false);
   });
 
-  it("枚举值非法时两边都拒绝", () => {
+  it("展示类枚举非法时：zod 兜底成默认值，spec 仍然拒绝", () => {
+    // 这是刻意的分歧：spec 是给模型看的严格契约，
+    // 应用侧不能因为一个展示标签（场景/词性/语域）丢掉整张卡。
     const broken = structuredClone(CHARGE) as typeof CHARGE;
     broken.senses[0].examples[0].scene = "办公室";
     expect(validate(broken)).toBe(false);
-    expect(wordEntrySchema.safeParse(broken).success).toBe(false);
+
+    const parsed = wordEntrySchema.safeParse(broken);
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.senses[0].examples[0].scene).toBe("日常");
+    }
+  });
+
+  it("interj 这类词性不再让整条记录作废", () => {
+    const entry = structuredClone(CHARGE) as typeof CHARGE;
+    (entry.senses[0] as { pos: string }).pos = "interj";
+    const parsed = parseWordEntry(entry);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) expect(parsed.entry.senses[0].pos).toBe("interj");
   });
 
   it("多一个字段：zod 容忍（strip），不因此判失败", () => {

@@ -22,6 +22,8 @@ pub struct ChatOutcome {
     pub total_ms: u128,
     /// 结束原因。`length` 表示撞到 max_tokens，内容是被截断的。
     pub finish_reason: Option<String>,
+    /// 收到的 SSE 分片数。用来区分「服务端只发了这么多」和「我们解析丢了」。
+    pub chunks: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +171,7 @@ pub async fn stream_chat(
     let mut text = String::new();
     let mut first_delta_ms: Option<u128> = None;
     let mut finish_reason: Option<String> = None;
+    let mut chunks = 0usize;
 
     loop {
         let next = if first_delta_ms.is_none() {
@@ -190,6 +193,7 @@ pub async fn stream_chat(
         let chunk = chunk.map_err(|err| ChatError::Network(err.to_string()))?;
 
         for payload in decoder.push(&chunk) {
+            chunks += 1;
             if payload.trim() == "[DONE]" {
                 continue;
             }
@@ -259,6 +263,7 @@ pub async fn stream_chat(
         first_delta_ms: first_delta_ms.unwrap_or(0),
         total_ms: started.elapsed().as_millis(),
         finish_reason,
+        chunks,
     })
 }
 

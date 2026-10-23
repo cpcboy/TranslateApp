@@ -154,7 +154,7 @@ function SenseRow({
 }) {
   const example = sense.examples[0];
   const opacity = [1, 0.62, 0.38, 0.2][index] ?? 0.2;
-  const register = REGISTER_LABEL[sense.register] ?? "";
+  const register = sense.register ? (REGISTER_LABEL[sense.register] ?? "") : "";
 
   return (
     <div
