@@ -22,6 +22,14 @@ use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 unsafe extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
     fn CGRequestScreenCaptureAccess() -> bool;
+    /// 组合会话里鼠标左键是否按下（0 = kCGEventSourceStateCombinedSessionState，
+    /// 0 = kCGMouseButtonLeft）。只读状态，不需要辅助功能权限。
+    fn CGEventSourceButtonState(state: i32, button: u32) -> bool;
+}
+
+/// 左键是否按住。
+fn left_button_down() -> bool {
+    unsafe { CGEventSourceButtonState(0, 0) }
 }
 
 /// 当前进程有没有屏幕录制权限。
@@ -98,70 +106,6 @@ fn close(app: &AppHandle, label: &str) {
     }
 }
 
-/// 在鼠标所在屏幕铺一层透明选区窗口。
-#[tauri::command]
-pub async fn start_capture(app: AppHandle) -> Result<(), String> {
-    trace(
-        &app,
-        format!("start_capture: screen_permission={}", has_screen_permission()),
-    );
-    if !has_screen_permission() {
-        let granted = request_screen_permission();
-        return Err(if granted {
-            "权限已拿到，再按一次快捷键试试".to_string()
-        } else {
-            "SENSE 还没有「屏幕录制」权限。系统已经弹出授权框（没看到就去 系统设置 → 隐私与安全性 → 屏幕录制 里勾选 SENSE），\
-             勾选后**退出并重新打开 SENSE** 才会生效——这是 macOS 的规定，不是应用的问题。"
-                .to_string()
-        });
-    }
-    close(&app, CAPTURE_WINDOW);
-
-    let cursor = app.cursor_position().map_err(|err| format!("取不到鼠标位置：{err}"))?;
-    // 优先取鼠标所在屏幕；拿不到就退回主屏。
-    // （拿不到不是罕见情况：刚启动、鼠标在屏幕边缘、或系统还没把显示器信息给到进程）
-    let monitor = app
-        .monitor_from_point(cursor.x, cursor.y)
-        .map_err(|err| format!("取不到屏幕信息：{err}"))?
-        .or_else(|| app.primary_monitor().ok().flatten())
-        .ok_or_else(|| format!("找不到可用屏幕（cursor={},{}）", cursor.x, cursor.y))?;
-    trace(
-        &app,
-        format!("select monitor: cursor=({}, {}) size={:?}", cursor.x, cursor.y, monitor.size()),
-    );
-
-    let scale = monitor.scale_factor();
-    let position = monitor.position();
-    let size = monitor.size();
-    let x = position.x as f64 / scale;
-    let y = position.y as f64 / scale;
-    let width = size.width as f64 / scale;
-    let height = size.height as f64 / scale;
-
-    let window = WebviewWindowBuilder::new(&app, CAPTURE_WINDOW, WebviewUrl::App("index.html".into()))
-        .title("SENSE 截图")
-        .position(x, y)
-        .inner_size(width, height)
-        .decorations(false)
-        .transparent(true)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .resizable(false)
-        .shadow(false)
-        .visible_on_all_workspaces(true)
-        .focused(true)
-        .build()
-        .map_err(|err| format!("打不开选区窗口：{err}"))?;
-
-    // 关键：把应用和这个窗口都顶到最前。
-    // 触发截屏时 SENSE 通常不是前台应用，macOS 会把「激活应用」的那一次按下
-    // 自己吃掉——用户看到遮罩却拖不动，就是这个原因。
-    let _ = window.set_focus();
-    trace(&app, "select window focused");
-
-    Ok(())
-}
-
 #[tauri::command]
 pub fn cancel_capture(app: AppHandle) {
     close(&app, CAPTURE_WINDOW);
@@ -177,83 +121,136 @@ pub fn capture_blocks(state: State<'_, CaptureState>) -> Vec<Block> {
     state.blocks.lock().map(|items| items.clone()).unwrap_or_default()
 }
 
+/// 原生选区：调 `screencapture -i` 让系统画选框（拖动永远可靠），
+/// 同时以 15ms 频率采样鼠标位置——用户拖出来的矩形就是这些采样点的包围盒。
+///
+/// 为什么不用自绘遮罩：透明全屏 WebView 在 macOS 上拿第一次点击、重绘、
+/// 焦点都不可靠，实测拖不动、松手才刷新。
+fn select_region(app: &AppHandle) -> Result<Option<(f64, f64, f64, f64, std::path::PathBuf)>, String> {
+    let png = std::env::temp_dir().join(format!("sense-select-{}.png", std::process::id()));
+    let _ = std::fs::remove_file(&png);
+
+    let mut child = Command::new("/usr/sbin/screencapture")
+        .args(["-i", "-x", &png.to_string_lossy()])
+        .spawn()
+        .map_err(|err| format!("启动选区失败：{err}"))?;
+
+    let mut min = (f64::MAX, f64::MAX);
+    let mut max = (f64::MIN, f64::MIN);
+    let mut dragging = false;
+
+    loop {
+        // 只在按住左键期间采样：否则开始拖之前光标停在哪，都会被算进包围盒
+        let down = left_button_down();
+        if down && !dragging {
+            dragging = true;
+            min = (f64::MAX, f64::MAX);
+            max = (f64::MIN, f64::MIN);
+        }
+        if dragging && !down {
+            dragging = false;
+        }
+
+        if dragging {
+            if let Ok(pos) = app.cursor_position() {
+                min.0 = min.0.min(pos.x);
+                min.1 = min.1.min(pos.y);
+                max.0 = max.0.max(pos.x);
+                max.1 = max.1.max(pos.y);
+            }
+        }
+
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(12)),
+            Err(_) => break,
+        }
+    }
+
+    trace(app, format!("native select: min={min:?} max={max:?} exists={}", png.exists()));
+
+    if !png.exists() || max.0 <= min.0 || max.1 <= min.1 {
+        let _ = std::fs::remove_file(&png);
+        return Ok(None); // 用户按 Esc 取消
+    }
+
+    let scale = monitor_scale(app);
+    let x = min.0 / scale;
+    let y = min.1 / scale;
+    let w = (max.0 - min.0) / scale;
+    let h = (max.1 - min.1) / scale;
+    if w < 8.0 || h < 8.0 {
+        let _ = std::fs::remove_file(&png);
+        return Ok(None);
+    }
+
+    Ok(Some((x, y, w, h, png)))
+}
+
+/// 开始一次截屏翻译：原生选区 → OCR → 翻译 → 原位覆盖。
+#[tauri::command]
+pub async fn start_capture(app: AppHandle, state: State<'_, CaptureState>) -> Result<(), String> {
+    if !has_screen_permission() {
+        let granted = request_screen_permission();
+        return Err(if granted {
+            "权限已拿到，再按一次快捷键试试".to_string()
+        } else {
+            "SENSE 还没有「屏幕录制」权限。系统已经弹出授权框（没看到就去 系统设置 → 隐私与安全性 → 屏幕录制 里勾选 SENSE），\
+             勾选后**退出并重新打开 SENSE** 才会生效——这是 macOS 的规定，不是应用的问题。"
+                .to_string()
+        });
+    }
+
+    // 先收起主窗口，别让它挡住要截的内容
+    if let Some(main) = app.get_webview_window(crate::window::MAIN_WINDOW) {
+        let _ = main.hide();
+    }
+
+    let picked = {
+        let handle = app.clone();
+        tauri::async_runtime::spawn_blocking(move || select_region(&handle))
+            .await
+            .map_err(|err| format!("选区线程失败：{err}"))??
+    };
+
+    let Some((x, y, w, h, png)) = picked else {
+        return Ok(());
+    };
+
+    trace(&app, format!("capture rect={x},{y},{w},{h}"));
+
+    let result = run_with_image(&app, &state, x, y, w, h, &png).await;
+    let _ = std::fs::remove_file(&png);
+    result.map(|_| ())
+}
+
 /// 选区确定：截图 → OCR → 翻译 → 原位覆盖。
 ///
 /// `x/y/w/h` 是**全局逻辑坐标**（屏幕点），由选区窗口用 outerPosition + 框选尺寸算出来。
-#[tauri::command]
-pub async fn finish_capture(
-    app: AppHandle,
-    state: State<'_, CaptureState>,
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-) -> Result<usize, String> {
-    run(app, &state, x, y, w, h).await
-}
-
 /// 命令的实体：抽出来是为了自动化验证（跳过选区直接给一个矩形）。
-pub async fn run(
-    app: AppHandle,
+pub async fn run_with_image(
+    app: &AppHandle,
     state: &CaptureState,
     x: f64,
     y: f64,
     w: f64,
     h: f64,
+    png: &Path,
 ) -> Result<usize, String> {
-    close(&app, CAPTURE_WINDOW);
-    // 给窗口系统一点时间把遮罩撤掉，否则截图里会带上一层暗色
-    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-
     if w < 12.0 || h < 12.0 {
         return Err("选区太小了".to_string());
     }
-    if let Ok(mut slot) = state.last_rect.lock() {
-        *slot = Some((x, y, w, h));
-    }
 
-    let png = std::env::temp_dir().join(format!("sense-shot-{}.png", std::process::id()));
-    let rect = format!(
-        "{},{},{},{}",
-        x.round() as i64,
-        y.round() as i64,
-        w.round() as i64,
-        h.round() as i64
-    );
 
-    trace(&app, format!("capture rect={rect}"));
-    let output = Command::new("/usr/sbin/screencapture")
-        .args(["-x", "-R", &rect, &png.to_string_lossy()])
-        .output()
-        .map_err(|err| format!("调用截图失败了：{err}"))?;
-
-    trace(
-        &app,
-        format!(
-            "screencapture status={:?} exists={} stderr={}",
-            output.status.code(),
-            png.exists(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
-    );
-    if !output.status.success() || !png.exists() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if detail.is_empty() {
-            "截图失败。第一次使用需要在「系统设置 → 隐私与安全性 → 屏幕录制」里勾选 SENSE，然后重启应用。".to_string()
-        } else {
-            format!("截图失败：{detail}")
-        });
-    }
-
-    let lines = run_ocr(&png).map_err(|err| format!("识别失败：{err}"))?;
+    let lines = run_ocr(png).map_err(|err| format!("识别失败：{err}"))?;
     let _ = std::fs::remove_file(&png);
 
-    trace(&app, format!("ocr lines={}", lines.len()));
+    trace(app, format!("ocr lines={}", lines.len()));
     if lines.is_empty() {
         return Err("选中的区域里没识别到文字。也可能是屏幕录制权限没给：系统设置 → 隐私与安全性 → 屏幕录制。".to_string());
     }
 
-    let scale = monitor_scale(&app);
+    let scale = monitor_scale(app);
     let mut blocks = merge_lines(&lines, scale);
 
     if let Some(target) = translate_target(&blocks) {
@@ -267,7 +264,7 @@ pub async fn run(
     }
 
     trace(
-        &app,
+        app,
         format!(
             "blocks={} translated={}",
             blocks.len(),
@@ -278,7 +275,7 @@ pub async fn run(
         *slot = blocks.clone();
     }
 
-    let overlay = WebviewWindowBuilder::new(&app, OVERLAY_WINDOW, WebviewUrl::App("index.html".into()))
+    let overlay = WebviewWindowBuilder::new(app, OVERLAY_WINDOW, WebviewUrl::App("index.html".into()))
         .title("SENSE 译文")
         .position(x, y)
         .inner_size(w, h)

@@ -97,7 +97,8 @@ pub fn register_hotkey(
             }
             let handle = app.clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(err) = capture::start_capture(handle.clone()).await {
+                let state = handle.state::<capture::CaptureState>();
+                if let Err(err) = capture::start_capture(handle.clone(), state).await {
                     eprintln!("[sense] 截屏启动失败：{err}");
                     // 热键触发时用户看不到终端，必须把原因放到界面上
                     window::show(&handle);
@@ -141,7 +142,6 @@ pub fn run() {
             window::set_hotkey,
             capture::start_capture,
             capture::cancel_capture,
-            capture::finish_capture,
             capture::close_overlay,
             capture::capture_blocks,
         ])
@@ -238,33 +238,11 @@ pub fn run() {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(1200)).await;
-                    if let Err(err) = capture::start_capture(handle).await {
+                    let state = handle.state::<capture::CaptureState>();
+                    if let Err(err) = capture::start_capture(handle.clone(), state).await {
                         eprintln!("[sense] dev select 失败: {err}");
                     }
                 });
-            }
-
-            // 仅供自动化验证：给一个矩形就直接走「截图 → OCR → 翻译 → 覆盖」，
-            // 跳过手动拖框（鼠标手势没法脚本化）。
-            #[cfg(debug_assertions)]
-            if let Ok(rect) = std::env::var("SENSE_DEV_CAPTURE") {
-                let parts: Vec<f64> = rect
-                    .split(',')
-                    .filter_map(|item| item.trim().parse::<f64>().ok())
-                    .collect();
-                if parts.len() == 4 {
-                    let handle = app.handle().clone();
-                    tauri::async_runtime::spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(3000)).await;
-                        let state = handle.state::<capture::CaptureState>();
-                        match capture::run(handle.clone(), &state, parts[0], parts[1], parts[2], parts[3])
-                            .await
-                        {
-                            Ok(count) => println!("[sense] dev capture: {count} 块"),
-                            Err(err) => eprintln!("[sense] dev capture 失败: {err}"),
-                        }
-                    });
-                }
             }
 
             // 仅供本机验证：不设这个变量时，启动后窗口保持隐藏（产品行为）。
