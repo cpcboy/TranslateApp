@@ -17,6 +17,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use tauri::menu::Menu;
+use tauri::Emitter;
 use tauri::Manager;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
@@ -96,8 +97,11 @@ pub fn register_hotkey(
             }
             let handle = app.clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(err) = capture::start_capture(handle).await {
+                if let Err(err) = capture::start_capture(handle.clone()).await {
                     eprintln!("[sense] 截屏启动失败：{err}");
+                    // 热键触发时用户看不到终端，必须把原因放到界面上
+                    window::show(&handle);
+                    let _ = handle.emit("sense://capture-error", err);
                 }
             });
         }),

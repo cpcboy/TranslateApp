@@ -13,6 +13,27 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
+/// CoreGraphics 的两个 TCC 接口：
+/// - Preflight 只查询，不弹框；返回当前进程有没有屏幕录制权限
+/// - Request 会弹一次系统授权框
+///
+/// 用它们比「截一张图看是不是黑的」可靠得多。
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGPreflightScreenCaptureAccess() -> bool;
+    fn CGRequestScreenCaptureAccess() -> bool;
+}
+
+/// 当前进程有没有屏幕录制权限。
+pub fn has_screen_permission() -> bool {
+    unsafe { CGPreflightScreenCaptureAccess() }
+}
+
+/// 请求权限：会弹系统框，并返回**当前**是否已经拿到（刚点允许时通常还是 false）。
+pub fn request_screen_permission() -> bool {
+    unsafe { CGRequestScreenCaptureAccess() }
+}
+
 use crate::providers::openai_compat;
 use crate::providers as provider_registry;
 use crate::secrets;
@@ -50,6 +71,24 @@ pub struct CaptureState {
     last_rect: Mutex<Option<(f64, f64, f64, f64)>>,
 }
 
+/// 记一行到 `~/Library/Application Support/com.sense.app/capture.log`。
+///
+/// 从访达启动时 stdout 是看不到的，出问题只能靠这个文件复盘。
+fn trace(app: &AppHandle, line: impl AsRef<str>) {
+    use std::io::Write;
+    let Ok(dir) = app.path().app_data_dir() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("capture.log"))
+    {
+        let _ = writeln!(file, "{}", line.as_ref());
+    }
+}
+
 fn close(app: &AppHandle, label: &str) {
     if let Some(window) = app.get_webview_window(label) {
         let _ = window.close();
@@ -59,6 +98,20 @@ fn close(app: &AppHandle, label: &str) {
 /// 在鼠标所在屏幕铺一层透明选区窗口。
 #[tauri::command]
 pub async fn start_capture(app: AppHandle) -> Result<(), String> {
+    trace(
+        &app,
+        format!("start_capture: screen_permission={}", has_screen_permission()),
+    );
+    if !has_screen_permission() {
+        let granted = request_screen_permission();
+        return Err(if granted {
+            "权限已拿到，再按一次快捷键试试".to_string()
+        } else {
+            "SENSE 还没有「屏幕录制」权限。系统已经弹出授权框（没看到就去 系统设置 → 隐私与安全性 → 屏幕录制 里勾选 SENSE），\
+             勾选后**退出并重新打开 SENSE** 才会生效——这是 macOS 的规定，不是应用的问题。"
+                .to_string()
+        });
+    }
     close(&app, CAPTURE_WINDOW);
 
     let cursor = app.cursor_position().map_err(|err| format!("取不到鼠标位置：{err}"))?;
@@ -152,11 +205,21 @@ pub async fn run(
         h.round() as i64
     );
 
+    trace(&app, format!("capture rect={rect}"));
     let output = Command::new("/usr/sbin/screencapture")
         .args(["-x", "-R", &rect, &png.to_string_lossy()])
         .output()
         .map_err(|err| format!("调用截图失败了：{err}"))?;
 
+    trace(
+        &app,
+        format!(
+            "screencapture status={:?} exists={} stderr={}",
+            output.status.code(),
+            png.exists(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    );
     if !output.status.success() || !png.exists() {
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if detail.is_empty() {
@@ -169,6 +232,7 @@ pub async fn run(
     let lines = run_ocr(&png).map_err(|err| format!("识别失败：{err}"))?;
     let _ = std::fs::remove_file(&png);
 
+    trace(&app, format!("ocr lines={}", lines.len()));
     if lines.is_empty() {
         return Err("选中的区域里没识别到文字。也可能是屏幕录制权限没给：系统设置 → 隐私与安全性 → 屏幕录制。".to_string());
     }
@@ -186,6 +250,14 @@ pub async fn run(
         }
     }
 
+    trace(
+        &app,
+        format!(
+            "blocks={} translated={}",
+            blocks.len(),
+            blocks.iter().filter(|block| block.translated).count()
+        ),
+    );
     if let Ok(mut slot) = state.blocks.lock() {
         *slot = blocks.clone();
     }

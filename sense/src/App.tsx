@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { LookupView } from "./features/lookup/LookupView";
 import { SettingsView } from "./features/settings/SettingsView";
@@ -17,6 +18,7 @@ type View = "lookup" | "settings";
 export default function App() {
   const [view, setView] = useState<View>("lookup");
   const [hint, setHint] = useState("");
+  const [notice, setNotice] = useState("");
   const run = useLookup((state) => state.run);
 
   useEffect(() => {
@@ -44,6 +46,19 @@ export default function App() {
         /* 拿不到就正常空跑 */
       });
   }, [run]);
+
+  // 截屏失败（尤其没授权）必须让人看见，否则就是「按了没反应」
+  useEffect(() => {
+    if (!isTauri) return;
+    let unlisten: (() => void) | undefined;
+    void listen<string>("sense://capture-error", (event) => {
+      setNotice(event.payload);
+      setView("lookup");
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
+  }, []);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -87,6 +102,21 @@ export default function App() {
             {hint ? `${hint} 呼出 · Esc 隐藏` : "Esc 隐藏"}
           </span>
         </header>
+
+        {notice && (
+          <div className="mx-4 mt-3 shrink-0 rounded-lg border border-[rgba(255,82,48,0.35)] bg-[rgba(255,82,48,0.1)] px-4 py-3 text-[13.5px] leading-relaxed text-[#f6b09b]">
+            <div className="flex items-start justify-between gap-3">
+              <span>{notice}</span>
+              <button
+                type="button"
+                onClick={() => setNotice("")}
+                className="shrink-0 rounded px-2 py-0.5 text-[13px] text-[#f6b09b] hover:text-paper"
+              >
+                知道了
+              </button>
+            </div>
+          </div>
+        )}
 
         <main className="min-h-0 flex-1 px-4 py-3.5">
           {view === "lookup" ? (

@@ -37,6 +37,31 @@
 - 全屏 App 下能否呼出依赖 `visibleOnAllWorkspaces`，需人工在全屏窗口中确认一次
 - D2 开工前需要决定：模型流式文本进入卡片后，CSP 是否还要再收紧（当前 `connect-src` 已限定）
 
+### 修复 · 2026-10-23 — 截屏「授权了还是不行」
+
+**根因**
+
+SENSE 是 **ad-hoc 签名**（`Signature=adhoc`，`codesign -dv` 可查），没有开发者证书，
+而且 Info.plist 没绑进签名，codesign 用二进制哈希当 identifier
+（`Identifier=sense-80fcd402f0848225`）。结果是：**每次重新构建，macOS 眼里都是另一个应用**，
+而 TCC 的屏幕录制授权绑的正是那一次的二进制。系统设置里的开关仍然是开的，
+但申请权限的是新二进制，对不上——所以既不生效，也不再弹窗。
+
+**修复**
+
+- 截屏前先调 `CGPreflightScreenCaptureAccess()` 判断权限，没权限就
+  `CGRequestScreenCaptureAccess()` 弹系统授权框，并把「授权后必须重启应用」写进提示
+- 失败不再只写终端：主窗口顶部会出现红色提示条（热键触发时也会把窗口拉出来）
+- 新增 `~/Library/Application Support/com.sense.app/capture.log`：
+  权限状态、截图返回码与 stderr、OCR 行数、翻译块数
+- 新增 `tools/grant-screen-recording.sh`：清掉旧的 TCC 记录并重启，
+  下次截屏会为**当前构建**重新弹窗
+
+**说明**
+
+这是 ad-hoc 签名的固有问题，不是应用逻辑的 bug。根治要一张代码签名证书
+（Apple 开发者证书，或自签一张「代码签名」证书），之后授权记录才会跨构建保留。
+
 ### M2 起步 · 2026-10-23 — 截屏翻译 + 自定义快捷键
 
 **新增 · 截屏翻译（⌃⌥⌘X，或点主窗口右上角「截屏翻译」）**
