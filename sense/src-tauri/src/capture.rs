@@ -424,8 +424,9 @@ async fn translate_blocks(app: &AppHandle, blocks: &mut [Block], target: &str) -
          4. 每条尽量简短，以适配原来的版面宽度。"
     );
 
-    // 截屏场景优先质量：让模型先「想一想」再翻，比查词慢一点没关系
-    let reasoning = provider_registry::understanding_fields(&provider.id);
+    // 上下文由「整屏一次送 + 先通读再翻」的提示词保证，不靠思维链。
+    // 实测开思考要多等 2–5 秒，换来的是翻译任务里几乎看不出的提升。
+    let reasoning = provider_registry::reasoning_fields(&provider.id);
     let body = openai_compat::build_body(
         &provider.model,
         &system,

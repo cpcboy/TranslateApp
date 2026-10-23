@@ -113,23 +113,6 @@ pub fn reasoning_fields(id: &str) -> Option<serde_json::Value> {
     }
 }
 
-/// 截屏翻译用：打开思考但压到 low，先理解整段再翻，质量优先。
-///
-/// 查词要快所以关掉；截屏是一次性动作，多等一两秒换准确度是值的。
-pub fn understanding_fields(id: &str) -> Option<serde_json::Value> {
-    match id {
-        "deepseek" => Some(serde_json::json!({
-            "thinking": { "type": "enabled" },
-            "reasoning_effort": "low"
-        })),
-        "qwen" => Some(serde_json::json!({ "enable_thinking": true })),
-        "openrouter" => Some(serde_json::json!({
-            "reasoning": { "enabled": true, "effort": "low" }
-        })),
-        _ => None,
-    }
-}
-
 /// 当前选中的 provider：settings.active_provider 优先，缺省 deepseek。
 pub fn active_id(app: &tauri::AppHandle) -> String {
     settings::get_string(app, "active_provider").unwrap_or_else(|| "deepseek".to_string())
