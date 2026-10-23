@@ -25,9 +25,10 @@ type LookupState = {
   warnings: string[];
   error: LookupError | null;
   meta: LookupMeta | null;
-  /** 长文翻译结果；非空时界面显示它而不是义项卡 */
-  longText: string | null;
-  longProgress: { done: number; total: number } | null;
+  /** 长文模式：原文、流式译文、是否还在生成 */
+  longSource: string | null;
+  longText: string;
+  longBusy: boolean;
   run: (word: string) => Promise<void>;
   runLong: (text: string) => Promise<void>;
   reset: () => void;
@@ -42,8 +43,9 @@ const empty = {
   warnings: [] as string[],
   error: null,
   meta: null,
-  longText: null,
-  longProgress: null,
+  longSource: null,
+  longText: "",
+  longBusy: false,
 };
 
 /**
@@ -58,30 +60,40 @@ export const useLookup = create<LookupState>((set) => ({
   runLong: async (raw: string) => {
     const text = raw.trim();
     if (!text) return;
-    const my = ++epoch;
-    set({ ...empty, status: "loading", query: text.slice(0, 24) });
 
-    let unlisten: (() => void) | undefined;
-    if ("__TAURI_INTERNALS__" in window) {
-      const { listen } = await import("@tauri-apps/api/event");
-      unlisten = await listen<{ done: number; total: number }>("sense://longtext", (event) => {
-        if (my !== epoch) return;
-        set({ longProgress: event.payload });
-      });
-    }
+    const my = ++epoch;
+    const requestId = `long-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    set({
+      ...empty,
+      status: "loading",
+      query: text.slice(0, 24),
+      longSource: text,
+      longBusy: true,
+    });
+
+    const { listen } = await import("@tauri-apps/api/event");
+    const unlisten = await listen<{ request_id: string; text: string }>(
+      "sense://longtext-delta",
+      (event) => {
+        if (my !== epoch || event.payload.request_id !== requestId) return;
+        set((state) => ({ longText: state.longText + event.payload.text, status: "streaming" }));
+      },
+    );
 
     try {
-      const result = await api.translateText(text);
+      // 整篇一次送：切块会丢上下文，译文会和原文意思有偏
+      const result = await api.translateText(text, requestId);
       if (my !== epoch) return;
-      set({ status: "done", longText: result, longProgress: null });
+      set({ status: "done", longText: result, longBusy: false });
     } catch (err) {
       if (my !== epoch) return;
       set({
         status: "error",
+        longBusy: false,
         error: { code: "longtext", message: String(err).replace(/^Error:\s*/, "") },
       });
     } finally {
-      unlisten?.();
+      unlisten();
     }
   },
 

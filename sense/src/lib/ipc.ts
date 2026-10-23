@@ -74,7 +74,8 @@ export const api = {
     invoke<number>("finish_capture", { x, y, w, h }),
   captureBlocks: () => invoke<OverlayBlock[]>("capture_blocks"),
   closeOverlay: () => invoke<void>("close_overlay"),
-  translateText: (text: string) => invoke<string>("translate_text", { text }),
+  translateText: (text: string, requestId: string) =>
+    invoke<string>("translate_text", { text, requestId }),
   invalidateLookup: (word: string, lang: string, context?: string) =>
     invoke<void>("invalidate_lookup", { word, lang, context }),
 };

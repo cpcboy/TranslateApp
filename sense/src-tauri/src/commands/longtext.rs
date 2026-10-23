@@ -1,10 +1,7 @@
-//! 长文翻译：粘贴一大段文章，按段落切块逐块翻译。
+//! 长文翻译：整篇一次送，边生成边推给前端。
 //!
-//! 和查词是两条完全不同的链路：查词要的是 WordEntry 的 JSON，
-//! 长文要的是「把这段话说成人话」，所以用独立的提示词，不套 schema。
-
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+//! 不切块。切块会让第二段丢失第一段的指代和术语，译文与原文意思偏；
+//! 代价是输出更长，所以上限放到 8192，并全程流式。
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -13,46 +10,13 @@ use crate::providers as provider_registry;
 use crate::providers::openai_compat;
 use crate::secrets;
 
+/// 长文的输出上限。一篇 3000 词的文章译文约 8000 token。
+const LONG_MAX_TOKENS: u32 = 8192;
+
 #[derive(Clone, Serialize)]
-pub struct LongTextProgress {
-    pub done: usize,
-    pub total: usize,
-}
-
-/// 每块的最大字符数。太小请求多、太大会被上下文截断。
-const CHUNK_CHARS: usize = 1500;
-
-/// 按段落聚合成块，尽量不把一个自然段劈开。
-fn chunk(text: &str) -> Vec<String> {
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    for paragraph in text.split_inclusive('\n') {
-        if !current.is_empty() && current.chars().count() + paragraph.chars().count() > CHUNK_CHARS {
-            chunks.push(std::mem::take(&mut current));
-        }
-        // 单段就超长时硬切
-        if paragraph.chars().count() > CHUNK_CHARS {
-            if !current.is_empty() {
-                chunks.push(std::mem::take(&mut current));
-            }
-            let mut buffer = String::new();
-            for ch in paragraph.chars() {
-                buffer.push(ch);
-                if buffer.chars().count() >= CHUNK_CHARS {
-                    chunks.push(std::mem::take(&mut buffer));
-                }
-            }
-            if !buffer.is_empty() {
-                chunks.push(buffer);
-            }
-            continue;
-        }
-        current.push_str(paragraph);
-    }
-    if !current.trim().is_empty() {
-        chunks.push(current);
-    }
-    chunks
+struct LongTextDelta {
+    request_id: String,
+    text: String,
 }
 
 fn looks_chinese(text: &str) -> bool {
@@ -61,8 +25,13 @@ fn looks_chinese(text: &str) -> bool {
     cjk * 2 >= latin && cjk > 0
 }
 
+/// 整篇翻译。增量通过 `sense://longtext-delta` 推给右栏。
 #[tauri::command]
-pub async fn translate_text(app: AppHandle, text: String) -> Result<String, String> {
+pub async fn translate_text(
+    app: AppHandle,
+    text: String,
+    request_id: String,
+) -> Result<String, String> {
     let source = text.trim().to_string();
     if source.is_empty() {
         return Err("还没有内容".to_string());
@@ -77,52 +46,45 @@ pub async fn translate_text(app: AppHandle, text: String) -> Result<String, Stri
 
     let target = if looks_chinese(&source) { "英文" } else { "中文" };
     let system = format!(
-        "你是翻译引擎。把 user 给的文本翻译成{target}。\n\
-         要求：保留原有分段与换行；专有名词、代码、命令、数字原样保留；\
-         只输出译文本身，不要解释、不要加引号或 Markdown 代码块。"
+        "你是翻译引擎。把 user 给的整篇文本翻译成{target}。\n\
+         要求：\n\
+         1. 先通读全文再动笔，术语、人名、指代前后保持一致；\n\
+         2. 保留原有分段与换行；\n\
+         3. 代码、命令、路径、URL、版本号、数字原样保留；\n\
+         4. 只输出译文，不要解释、不要加引号或 Markdown 代码块。"
     );
 
-    let chunks = chunk(&source);
-    let total = chunks.len();
-    let mut output = String::new();
+    let reasoning = provider_registry::reasoning_fields(&provider.id);
+    let body = openai_compat::build_body(
+        &provider.model,
+        &system,
+        &source,
+        0.3,
+        reasoning.as_ref(),
+        LONG_MAX_TOKENS,
+    );
 
-    for (index, piece) in chunks.iter().enumerate() {
-        let reasoning = provider_registry::reasoning_fields(&provider.id);
-        let body = openai_compat::build_body(
-            &provider.model,
-            &system,
-            piece,
-            0.3,
-            reasoning.as_ref(),
-            openai_compat::MAX_TOKENS,
-        );
+    let emitter = app.clone();
+    let rid = request_id.clone();
+    let outcome = openai_compat::stream_chat(
+        crate::client_for(&provider.base_url),
+        &provider,
+        key.as_deref(),
+        &body,
+        &mut move |delta: &str| {
+            let _ = emitter.emit(
+                "sense://longtext-delta",
+                LongTextDelta {
+                    request_id: rid.clone(),
+                    text: delta.to_string(),
+                },
+            );
+        },
+    )
+    .await
+    .map_err(|err| err.message())?;
 
-        let mut raw = String::new();
-        let outcome = openai_compat::stream_chat(
-            crate::client_for(&provider.base_url),
-            &provider,
-            key.as_deref(),
-            &body,
-            &mut |delta: &str| raw.push_str(delta),
-        )
-        .await
-        .map_err(|err| err.message())?;
-
-        output.push_str(outcome.text.trim_end());
-        if index + 1 < total {
-            output.push_str("\n\n");
-        }
-
-        let _ = app.emit(
-            "sense://longtext",
-            LongTextProgress {
-                done: index + 1,
-                total,
-            },
-        );
-    }
-
-    Ok(output)
+    Ok(outcome.text)
 }
 
 #[cfg(test)]
@@ -130,17 +92,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn long_text_is_split_without_losing_content() {
-        let text = "第一段。\n".repeat(400);
-        let chunks = chunk(&text);
-        assert!(chunks.len() > 1);
-        assert_eq!(chunks.concat(), text);
-        assert!(chunks.iter().all(|item| item.chars().count() <= CHUNK_CHARS));
-    }
-
-    #[test]
     fn target_language_follows_source() {
         assert!(looks_chinese("这是一段中文"));
         assert!(!looks_chinese("this is english"));
+        // 中英混排偏英文时仍译成中文
+        assert!(!looks_chinese("Rust 的所有权模型 the ownership model in Rust"));
     }
 }

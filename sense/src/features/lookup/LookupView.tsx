@@ -4,13 +4,15 @@ import { buildPreview } from "../../lib/schema";
 import { useLookup } from "../../lib/store";
 import { cn } from "../../lib/cn";
 import { ErrorState } from "./ErrorState";
+import { LongTextView } from "./LongTextView";
 import { SenseCard } from "./SenseCard";
 import { Skeleton } from "./Skeleton";
 
 const EXAMPLES = ["charge", "落实", "run", "交代"];
 
 export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
-  const { status, query, entry, partial, warnings, error, meta, longText, longProgress, run, runLong } = useLookup();
+  const { status, query, entry, partial, warnings, error, meta, longSource, longText, longBusy, run, runLong } =
+    useLookup();
   const [text, setText] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -45,6 +47,7 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
     // 超过一个词的长度就当长文翻译：查词那套 JSON 契约放不下整篇文章
     if (value.length > 64) {
       void runLong(value);
+      setText("");
       return;
     }
     void run(value);
@@ -79,16 +82,8 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto pr-0.5">
-        {longProgress ? (
-          <div className="flex h-full items-center justify-center text-[15px] text-muted">
-            正在翻译第 {longProgress.done} / {longProgress.total} 段…
-          </div>
-        ) : longText ? (
-          <div className="h-full overflow-y-auto rounded-2xl border border-line bg-panel px-6 py-5">
-            <pre className="whitespace-pre-wrap font-sans text-[15.5px] leading-[1.75] text-[#e6e1d8]">
-              {longText}
-            </pre>
-          </div>
+        {longSource ? (
+          <LongTextView source={longSource} text={longText} busy={longBusy} />
         ) : error ? (
           <ErrorState
             error={error}
