@@ -32,6 +32,14 @@ export type DeltaEvent = { request_id: string; text: string };
 
 export type HotkeyView = { kind: "lookup" | "capture"; display: string };
 
+export type GrammarIssue = {
+  fragment: string;
+  replacement: string;
+  explanation: string;
+};
+
+export type WordGloss = { term: string; gloss: string; pos: string; note: string };
+
 export type OverlayBlock = {
   text: string;
   x: number;
@@ -77,6 +85,9 @@ export const api = {
   translateText: (text: string, requestId: string) =>
     invoke<string>("translate_text", { text, requestId }),
   cancelTranslate: () => invoke<void>("cancel_translate"),
+  checkGrammar: (text: string) => invoke<GrammarIssue[]>("check_grammar", { text }),
+  explainWord: (term: string, context: string) =>
+    invoke<WordGloss>("explain_word", { term, context }),
   invalidateLookup: (word: string, lang: string, context?: string) =>
     invoke<void>("invalidate_lookup", { word, lang, context }),
 };

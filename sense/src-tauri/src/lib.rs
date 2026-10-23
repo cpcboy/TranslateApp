@@ -135,6 +135,8 @@ pub fn run() {
             commands::lookup::invalidate_lookup,
             commands::longtext::translate_text,
             commands::longtext::cancel_translate,
+            commands::reading::check_grammar,
+            commands::reading::explain_word,
             window::hotkey_list,
             window::set_hotkey,
             capture::start_capture,
