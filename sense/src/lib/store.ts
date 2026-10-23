@@ -201,11 +201,16 @@ export const useLookup = create<LookupState>((set) => ({
 
         parsed = validate(second.raw, second);
         if (!parsed.ok) {
+          // 把模型的原文露出来：多数情况是它没按词典格式回答（比如自己拒答了），
+          // 这时候藏着只会让人以为是应用屏蔽了词。
+          const snippet = second.raw.trim().replace(/\s+/g, " ").slice(0, 180);
           set({
             status: "error",
             error: {
               code: "invalid_json",
-              message: "这次返回格式不对，已自动重试一次，仍然不合格。",
+              message: snippet
+                ? `模型没有按词典格式回答（已自动重试一次）。它返回的是：「${snippet}」`
+                : "模型返回了空内容，已自动重试一次。",
             },
           });
           return;
