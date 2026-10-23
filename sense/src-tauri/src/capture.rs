@@ -138,7 +138,7 @@ pub async fn start_capture(app: AppHandle) -> Result<(), String> {
     let width = size.width as f64 / scale;
     let height = size.height as f64 / scale;
 
-    WebviewWindowBuilder::new(&app, CAPTURE_WINDOW, WebviewUrl::App("index.html".into()))
+    let window = WebviewWindowBuilder::new(&app, CAPTURE_WINDOW, WebviewUrl::App("index.html".into()))
         .title("SENSE 截图")
         .position(x, y)
         .inner_size(width, height)
@@ -152,6 +152,12 @@ pub async fn start_capture(app: AppHandle) -> Result<(), String> {
         .focused(true)
         .build()
         .map_err(|err| format!("打不开选区窗口：{err}"))?;
+
+    // 关键：把应用和这个窗口都顶到最前。
+    // 触发截屏时 SENSE 通常不是前台应用，macOS 会把「激活应用」的那一次按下
+    // 自己吃掉——用户看到遮罩却拖不动，就是这个原因。
+    let _ = window.set_focus();
+    trace(&app, "select window focused");
 
     Ok(())
 }
@@ -272,7 +278,7 @@ pub async fn run(
         *slot = blocks.clone();
     }
 
-    WebviewWindowBuilder::new(&app, OVERLAY_WINDOW, WebviewUrl::App("index.html".into()))
+    let overlay = WebviewWindowBuilder::new(&app, OVERLAY_WINDOW, WebviewUrl::App("index.html".into()))
         .title("SENSE 译文")
         .position(x, y)
         .inner_size(w, h)
@@ -286,6 +292,7 @@ pub async fn run(
         .focused(true)
         .build()
         .map_err(|err| format!("打不开译文窗口：{err}"))?;
+    let _ = overlay.set_focus();
 
     Ok(blocks.len())
 }
