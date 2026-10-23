@@ -28,6 +28,17 @@ echo "==> 安装到 /Applications"
 rm -rf "/Applications/SENSE.app"
 cp -R "$APP" "/Applications/SENSE.app"
 
+# 有稳定的签名身份就签上：TCC（屏幕录制）与钥匙串授权都绑定签名，
+# ad-hoc 每次构建都会变，等于每次都要重新授权。
+IDENTITY="${SENSE_SIGN_IDENTITY:-SENSE Dev}"
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "$IDENTITY"; then
+  echo "==> 用「$IDENTITY」签名"
+  codesign --force --deep --sign "$IDENTITY" "/Applications/SENSE.app" 2>&1 | sed 's/^/    /'
+  codesign -dv "/Applications/SENSE.app" 2>&1 | grep -E "Authority|Signature" | sed 's/^/    /'
+else
+  echo "==> 没找到「$IDENTITY」，保持 ad-hoc 签名（每次构建后都要重新授权）"
+fi
+
 echo "==> 启动"
 open "/Applications/SENSE.app"
 
