@@ -24,6 +24,7 @@ export type LookupResult = {
   model: string;
   first_delta_ms: number;
   total_ms: number;
+  finish_reason?: string | null;
 };
 
 export type LookupError = { code: string; message: string };

@@ -204,15 +204,16 @@ export const useLookup = create<LookupState>((set) => ({
           // 把模型的原文露出来：多数情况是它没按词典格式回答（比如自己拒答了），
           // 这时候藏着只会让人以为是应用屏蔽了词。
           const snippet = second.raw.trim().replace(/\s+/g, " ").slice(0, 180);
-          set({
-            status: "error",
-            error: {
-              code: "invalid_json",
-              message: snippet
-                ? `模型没有按词典格式回答（已自动重试一次）。它返回的是：「${snippet}」`
-                : "模型返回了空内容，已自动重试一次。",
-            },
-          });
+          const reason = second.finish_reason;
+          const message =
+            reason === "content_filter"
+              ? "模型服务在输出途中以「内容策略」中止了这次请求，与应用无关——应用不做任何词语过滤。换一个 provider 或模型再试。"
+              : reason === "length"
+                ? "模型输出撞到长度上限被截断（这次不是格式问题）。可以重试，或换个输出上限更大的模型。"
+                : snippet
+                  ? `流被提前中断了（不是格式问题）。已收到的内容：「${snippet}…」`
+                  : "模型返回了空内容，已自动重试一次。";
+          set({ status: "error", error: { code: "invalid_json", message } });
           return;
         }
       }

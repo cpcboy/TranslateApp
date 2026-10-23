@@ -42,6 +42,8 @@ pub struct LookupResult {
     pub model: String,
     pub first_delta_ms: u128,
     pub total_ms: u128,
+    /// 模型为什么停下：`stop` 正常、`length` 撞上限、`content_filter` 被内容策略中止
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,6 +126,7 @@ pub async fn lookup(
                 model: provider.model,
                 first_delta_ms: 0,
                 total_ms: 0,
+                finish_reason: Some("cache".to_string()),
             });
         }
     }
@@ -224,11 +227,12 @@ pub async fn lookup(
     };
 
     println!(
-        "[sense] lookup {word}: ttft={}ms total={}ms chars={} thinking={}",
+        "[sense] lookup {word}: ttft={}ms total={}ms chars={} thinking={} finish={:?}",
         outcome.first_delta_ms,
         outcome.total_ms,
         outcome.text.chars().count(),
-        if reasoning.is_some() { "off" } else { "n/a" }
+        if reasoning.is_some() { "off" } else { "n/a" },
+        outcome.finish_reason
     );
 
     // 只缓存「结构完整」的输出：半截 JSON 进了库，下次查询会拿着坏数据反复失败。
@@ -238,7 +242,22 @@ pub async fn lookup(
             eprintln!("[sense] {err}");
         }
     } else {
-        eprintln!("[sense] 输出结构不完整，不写缓存");
+        // 记下长度与结尾：判断是「模型被中止」还是「解析丢了尾巴」
+        let tail: String = outcome
+            .text
+            .chars()
+            .rev()
+            .take(80)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        eprintln!(
+            "[sense] 输出结构不完整 len={} finish={:?} tail={:?}",
+            outcome.text.chars().count(),
+            outcome.finish_reason,
+            tail
+        );
     }
 
     Ok(LookupResult {
@@ -247,6 +266,7 @@ pub async fn lookup(
         model: provider.model,
         first_delta_ms: outcome.first_delta_ms,
         total_ms: outcome.total_ms,
+        finish_reason: outcome.finish_reason,
     })
 }
 
