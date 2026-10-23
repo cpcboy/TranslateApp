@@ -443,6 +443,7 @@ async fn translate_blocks(app: &AppHandle, blocks: &mut [Block], target: &str) -
         key.as_deref(),
         &body,
         &mut |delta: &str| raw.push_str(delta),
+        None,
     )
     .await
     .map_err(|err| err.message())?;

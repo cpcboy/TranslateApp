@@ -31,6 +31,7 @@ type LookupState = {
   longBusy: boolean;
   run: (word: string) => Promise<void>;
   runLong: (text: string) => Promise<void>;
+  cancelLong: () => Promise<void>;
   reset: () => void;
 };
 
@@ -71,12 +72,24 @@ export const useLookup = create<LookupState>((set) => ({
       longBusy: true,
     });
 
+    // 增量按 60ms 合流：8192 token 的输出如果每片都 setState，右栏会卡成幻灯片
+    let buffer = "";
+    let pending: ReturnType<typeof setTimeout> | null = null;
+    const flush = () => {
+      pending = null;
+      if (!buffer) return;
+      const chunk = buffer;
+      buffer = "";
+      set((state) => ({ longText: state.longText + chunk, status: "streaming" }));
+    };
+
     const { listen } = await import("@tauri-apps/api/event");
     const unlisten = await listen<{ request_id: string; text: string }>(
       "sense://longtext-delta",
       (event) => {
         if (my !== epoch || event.payload.request_id !== requestId) return;
-        set((state) => ({ longText: state.longText + event.payload.text, status: "streaming" }));
+        buffer += event.payload.text;
+        if (pending === null) pending = setTimeout(flush, 60);
       },
     );
 
@@ -84,6 +97,7 @@ export const useLookup = create<LookupState>((set) => ({
       // 整篇一次送：切块会丢上下文，译文会和原文意思有偏
       const result = await api.translateText(text, requestId);
       if (my !== epoch) return;
+      flush();
       set({ status: "done", longText: result, longBusy: false });
     } catch (err) {
       if (my !== epoch) return;
@@ -93,8 +107,14 @@ export const useLookup = create<LookupState>((set) => ({
         error: { code: "longtext", message: String(err).replace(/^Error:\s*/, "") },
       });
     } finally {
+      if (pending !== null) clearTimeout(pending);
       unlisten();
     }
+  },
+
+  cancelLong: async () => {
+    await api.cancelTranslate().catch(() => {});
+    set({ longBusy: false });
   },
 
   reset: () => {

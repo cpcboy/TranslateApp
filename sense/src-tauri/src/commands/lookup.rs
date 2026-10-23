@@ -196,6 +196,7 @@ pub async fn lookup(
         api_key.as_deref(),
         &body,
         &mut on_delta,
+        None,
     )
     .await
     {
@@ -214,6 +215,7 @@ pub async fn lookup(
                 api_key.as_deref(),
                 &plain_body(),
                 &mut on_delta,
+                None,
             )
             .await
             .map_err(|err| LookupError::from_chat(&err))?

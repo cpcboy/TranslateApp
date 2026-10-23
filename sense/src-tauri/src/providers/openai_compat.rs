@@ -135,6 +135,7 @@ pub async fn stream_chat(
     api_key: Option<&str>,
     body: &Value,
     on_delta: &mut (dyn FnMut(&str) + Send),
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<ChatOutcome, ChatError> {
     let url = format!(
         "{}/chat/completions",
@@ -176,6 +177,11 @@ pub async fn stream_chat(
                 .await
                 .map_err(|_| ChatError::Timeout)?
         };
+
+        // 用户点了「停止」：保留已经收到的部分，不再等后续分片
+        if cancel.map(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) == Some(true) {
+            break;
+        }
 
         let Some(chunk) = next else { break };
         let chunk = chunk.map_err(|err| ChatError::Network(err.to_string()))?;

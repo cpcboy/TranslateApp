@@ -76,6 +76,7 @@ export const api = {
   closeOverlay: () => invoke<void>("close_overlay"),
   translateText: (text: string, requestId: string) =>
     invoke<string>("translate_text", { text, requestId }),
+  cancelTranslate: () => invoke<void>("cancel_translate"),
   invalidateLookup: (word: string, lang: string, context?: string) =>
     invoke<void>("invalidate_lookup", { word, lang, context }),
 };

@@ -11,15 +11,23 @@ import { Skeleton } from "./Skeleton";
 const EXAMPLES = ["charge", "落实", "run", "交代"];
 
 export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
-  const { status, query, entry, partial, warnings, error, meta, longSource, longText, longBusy, run, runLong } =
+  const { status, query, entry, partial, warnings, error, meta, longSource, longText, longBusy, run, runLong, cancelLong } =
     useLookup();
   const [text, setText] = useState("");
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
 
   // 窗口一显示就聚焦输入框：用户按完快捷键应该能直接打字。
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
+
+  // 输入框跟着内容长高：粘贴长文时不能只露出一行
+  useEffect(() => {
+    const node = inputRef.current;
+    if (!node) return;
+    node.style.height = "auto";
+    node.style.height = `${Math.min(node.scrollHeight, 200)}px`;
+  }, [text]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -60,15 +68,20 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
       <div className="flex items-center gap-3 rounded-xl border border-line-strong bg-black/25 px-5 py-4">
         <span className="font-mono text-[16px] text-acc">›</span>
         <div className="relative min-w-0 flex-1">
-          <input
+          <textarea
             ref={inputRef}
             value={text}
-            aria-label="查一个词"
+            rows={1}
+            aria-label="查一个词，或粘贴一段长文"
             onChange={(event) => setText(event.currentTarget.value)}
             onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.nativeEvent.isComposing) submit();
+              // Enter 翻译，Shift+Enter 换行；输入法组字时不拦
+              if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                event.preventDefault();
+                submit();
+              }
             }}
-            className="w-full bg-transparent text-[18px] text-paper focus:outline-none"
+            className="max-h-[200px] w-full resize-none overflow-y-auto bg-transparent text-[18px] leading-[1.6] text-paper focus:outline-none"
           />
           {/* 自绘占位符：WKWebView 里 input 的 placeholder 渲染不出中文 */}
           {text.length === 0 && (
@@ -83,7 +96,12 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
 
       <div className="min-h-0 flex-1 overflow-y-auto pr-0.5">
         {longSource ? (
-          <LongTextView source={longSource} text={longText} busy={longBusy} />
+          <LongTextView
+            source={longSource}
+            text={longText}
+            busy={longBusy}
+            onStop={() => void cancelLong()}
+          />
         ) : error ? (
           <ErrorState
             error={error}

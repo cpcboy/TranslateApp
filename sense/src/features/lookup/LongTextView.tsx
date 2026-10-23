@@ -26,10 +26,12 @@ export function LongTextView({
   source,
   text,
   busy,
+  onStop,
 }: {
   source: string;
   text: string;
   busy: boolean;
+  onStop: () => void;
 }) {
   const [copied, setCopied] = useState<"source" | "target" | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
@@ -57,26 +59,33 @@ export function LongTextView({
           <CopyButton label={copied === "source" ? "已复制" : "复制原文"} onClick={() => void copy("source", source)} />
         }
       >
-        <pre className="whitespace-pre-wrap font-sans text-[15px] leading-[1.75] text-[#e6e1d8]">
-          {source}
-        </pre>
+        <Prose text={source} tone="source" />
       </Pane>
 
       <Pane
         title="译文"
         hint={busy ? "生成中…" : text ? `${text.length} 字符` : ""}
         action={
-          <CopyButton
-            label={copied === "target" ? "已复制" : "复制译文"}
-            disabled={!text || busy}
-            onClick={() => void copy("target", text)}
-          />
+          <div className="flex items-center gap-2">
+            <CopyButton
+              label={copied === "target" ? "已复制" : "复制译文"}
+              disabled={!text || busy}
+              onClick={() => void copy("target", text)}
+            />
+            {busy && (
+              <button
+                type="button"
+                onClick={onStop}
+                className="rounded-md border border-[rgba(255,107,74,0.5)] px-2.5 py-1 text-[12.5px] text-acc hover:bg-[rgba(255,107,74,0.12)]"
+              >
+                停止
+              </button>
+            )}
+          </div>
         }
       >
-        <pre className="whitespace-pre-wrap font-sans text-[15px] leading-[1.75] text-[#f6f3ed]">
-          {text}
-          {busy && <span className="ml-[1px] inline-block h-[1.1em] w-[2px] animate-pulse bg-acc align-middle" />}
-        </pre>
+        <Prose text={text} tone="target" />
+        {busy && <span className="ml-[1px] inline-block h-[1.1em] w-[2px] animate-pulse bg-acc align-middle" />}
         <div ref={endRef} />
       </Pane>
     </div>
@@ -126,5 +135,52 @@ function CopyButton({
     >
       {label}
     </button>
+  );
+}
+
+/**
+ * 按原文的结构渲染：空行 = 段落间隔，短行且无句末标点 = 小标题，`- `/`• ` = 列表。
+ *
+ * 剪贴板只给纯文本，字体大小拿不回来，但版式层级可以靠这些线索还原。
+ * 译文由模型保留同样的分段，所以两边用同一套规则即可对齐。
+ */
+function Prose({ text, tone }: { text: string; tone: "source" | "target" }) {
+  const color = tone === "source" ? "text-[#e6e1d8]" : "text-[#f6f3ed]";
+  const blocks = text.split(/\n\s*\n/).filter((block) => block.trim().length > 0);
+
+  return (
+    <div className="space-y-3.5">
+      {blocks.map((block, index) => {
+        const lines = block.split("\n").filter((line) => line.trim().length > 0);
+
+        if (lines.length > 0 && lines.every((line) => /^\s*[-*•]\s+/.test(line))) {
+          return (
+            <ul key={index} className={`list-disc space-y-1 pl-5 text-[15px] leading-[1.75] ${color}`}>
+              {lines.map((line, item) => (
+                <li key={item}>{line.replace(/^\s*[-*•]\s+/, "")}</li>
+              ))}
+            </ul>
+          );
+        }
+
+        const trimmed = block.trim();
+        const isHeading =
+          lines.length === 1 && trimmed.length <= 60 && !/[.!?。！？:：;；]$/.test(trimmed);
+
+        if (isHeading) {
+          return (
+            <h3 key={index} className="pt-1 font-serif text-[19px] font-semibold leading-snug text-paper">
+              {trimmed}
+            </h3>
+          );
+        }
+
+        return (
+          <p key={index} className={`whitespace-pre-wrap text-[15px] leading-[1.75] ${color}`}>
+            {block}
+          </p>
+        );
+      })}
+    </div>
   );
 }

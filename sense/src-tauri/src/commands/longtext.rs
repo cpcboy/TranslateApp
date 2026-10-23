@@ -3,6 +3,8 @@
 //! 不切块。切块会让第二段丢失第一段的指代和术语，译文与原文意思偏；
 //! 代价是输出更长，所以上限放到 8192，并全程流式。
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
@@ -12,6 +14,15 @@ use crate::secrets;
 
 /// 长文的输出上限。一篇 3000 词的文章译文约 8000 token。
 const LONG_MAX_TOKENS: u32 = 8192;
+
+/// 当前这次长文翻译是否被用户取消。全局只有一个长文请求，够用。
+static CANCELLED: AtomicBool = AtomicBool::new(false);
+
+/// 用户点「停止」。
+#[tauri::command]
+pub fn cancel_translate() {
+    CANCELLED.store(true, Ordering::Relaxed);
+}
 
 #[derive(Clone, Serialize)]
 struct LongTextDelta {
@@ -64,6 +75,8 @@ pub async fn translate_text(
         LONG_MAX_TOKENS,
     );
 
+    CANCELLED.store(false, Ordering::Relaxed);
+
     let emitter = app.clone();
     let rid = request_id.clone();
     let outcome = openai_compat::stream_chat(
@@ -80,6 +93,7 @@ pub async fn translate_text(
                 },
             );
         },
+        Some(&CANCELLED),
     )
     .await
     .map_err(|err| err.message())?;

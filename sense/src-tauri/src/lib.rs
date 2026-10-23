@@ -134,6 +134,7 @@ pub fn run() {
             commands::lookup::lookup,
             commands::lookup::invalidate_lookup,
             commands::longtext::translate_text,
+            commands::longtext::cancel_translate,
             window::hotkey_list,
             window::set_hotkey,
             capture::start_capture,
