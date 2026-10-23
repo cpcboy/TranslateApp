@@ -93,6 +93,26 @@ pub fn resolve(app: &tauri::AppHandle, id: &str) -> Result<Provider, String> {
     Ok(provider)
 }
 
+/// 各家的「关掉思考」写法不同，认 id 不认模型名。
+///
+/// DeepSeek V4 系列的思考模式**默认开启**、effort 默认 high：不显式关掉，
+/// 一次查词要先吐几 k token 的思维链，卡片就慢得没法看。
+/// 参数名取自各家文档，写错不会静默降级——服务端会回 400，
+/// 调用方会去掉这些字段再试一次（见 commands/lookup.rs）。
+pub fn reasoning_fields(id: &str) -> Option<serde_json::Value> {
+    match id {
+        // OpenAI 格式：{"thinking": {"type": "enabled/disabled"}}
+        "deepseek" => Some(serde_json::json!({ "thinking": { "type": "disabled" } })),
+        // DashScope 兼容模式用 enable_thinking（qwen3 及之后的混合思考模型）
+        "qwen" => Some(serde_json::json!({ "enable_thinking": false })),
+        // OpenRouter 统一 reasoning 开关
+        "openrouter" => Some(serde_json::json!({ "reasoning": { "enabled": false } })),
+        // Ollama 的 OpenAI 兼容层认 reasoning_effort；不认的版本会忽略未知字段
+        "ollama" => Some(serde_json::json!({ "reasoning_effort": "none" })),
+        _ => None,
+    }
+}
+
 /// 当前选中的 provider：settings.active_provider 优先，缺省 deepseek。
 pub fn active_id(app: &tauri::AppHandle) -> String {
     settings::get_string(app, "active_provider").unwrap_or_else(|| "deepseek".to_string())
@@ -106,6 +126,21 @@ pub fn active(app: &tauri::AppHandle) -> Result<Provider, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_preset_can_turn_thinking_off() {
+        for preset in presets() {
+            let fields = reasoning_fields(&preset.id);
+            assert!(fields.is_some(), "{} 缺关思考参数，查词会慢", preset.id);
+            let text = fields.unwrap().to_string();
+            assert!(
+                text.contains("disabled") || text.contains("false") || text.contains("\"none\""),
+                "{} 的关思考参数看起来没关掉：{text}",
+                preset.id
+            );
+        }
+        assert!(reasoning_fields("unknown-provider").is_none());
+    }
 
     #[test]
     fn presets_are_unique_and_complete() {

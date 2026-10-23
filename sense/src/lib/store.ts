@@ -8,7 +8,10 @@ export type LookupStatus = "idle" | "loading" | "streaming" | "done" | "error";
 export type LookupMeta = {
   source: "cache" | "network";
   model: string;
+  /** 第一个 token 到达（首字节） */
   firstDeltaMs: number;
+  /** 第一个完整义项可以渲染，这才是用户眼里的「出结果」；没测到就是 null */
+  firstSenseMs: number | null;
   totalMs: number;
 };
 
@@ -60,15 +63,34 @@ export const useLookup = create<LookupState>((set) => ({
     set({ ...empty, status: "loading", query: word });
 
     let buffer = "";
-    const unlisten = await onDelta((event) => {
-      if (event.request_id !== requestId || my !== epoch) return;
-      buffer += event.text;
+    let attemptStart = performance.now();
+    let firstSenseMs: number | null = null;
+    let pending: ReturnType<typeof setTimeout> | null = null;
+    let dirty = false;
+
+    // 增量合流：每个 token 都解析一次整包 JSON 再重渲染，主线程会被拖住，
+    // 看起来比实际更慢。按 66ms（≈4 帧）合并一次足够跟手。
+    const flush = () => {
+      pending = null;
+      // 旧查询的定时器可能在 epoch++ 之后才触发，这里必须再挡一次
+      if (my !== epoch || !dirty) return;
+      dirty = false;
       const partial = tryParsePartial(buffer);
+      if (!firstSenseMs && partial) {
+        firstSenseMs = Math.round(performance.now() - attemptStart);
+      }
       set({
         buffer,
         partial,
         status: partial ? "streaming" : "loading",
       });
+    };
+
+    const unlisten = await onDelta((event) => {
+      if (event.request_id !== requestId || my !== epoch) return;
+      buffer += event.text;
+      dirty = true;
+      if (pending === null) pending = setTimeout(flush, 66);
     });
 
     try {
@@ -78,11 +100,20 @@ export const useLookup = create<LookupState>((set) => ({
       let parsed = validate(first.raw, first);
 
       if (!parsed.ok) {
-        // 校验失败：先把这条缓存标废，再用 0.2 重试一次并跳过缓存。
+        // 校验失败：先停掉上一轮的合流（否则它会把 attempt-1 的半截写回去），
+        // 再把这条缓存标废，用 0.2 重试一次并跳过缓存。
+        if (pending !== null) {
+          clearTimeout(pending);
+          pending = null;
+        }
+        dirty = false;
+
         await api.invalidateLookup(word, detectLang(word)).catch(() => {});
         if (my !== epoch) return;
 
         buffer = "";
+        firstSenseMs = null;
+        attemptStart = performance.now();
         set({ status: "loading", buffer, partial: null });
 
         const second = await api.lookup({
@@ -111,12 +142,16 @@ export const useLookup = create<LookupState>((set) => ({
         entry: parsed.entry,
         warnings: parsed.warnings,
         error: null,
-        meta: parsed.meta,
+        buffer: "",
+        partial: null,
+        meta: { ...parsed.meta, firstSenseMs },
       });
     } catch (err) {
       if (my !== epoch) return;
       set({ status: "error", error: toLookupError(err) });
     } finally {
+      if (pending !== null) clearTimeout(pending);
+      pending = null;
       unlisten();
     }
   },
@@ -150,6 +185,7 @@ function validate(
       source: result.source === "cache" ? "cache" : "network",
       model: result.model,
       firstDeltaMs: result.first_delta_ms,
+      firstSenseMs: null,
       totalMs: result.total_ms,
     },
   };

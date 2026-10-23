@@ -94,7 +94,7 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
       {meta && (
         <footer className="mt-1 flex shrink-0 items-center justify-between border-t border-line pt-3 font-mono text-[13.5px] text-subtle">
           <span>
-            首义项 {formatMs(meta.firstDeltaMs)} · 总计 {formatMs(meta.totalMs)}
+            首义项 {formatMs(meta.firstSenseMs)} · 总计 {formatMs(meta.totalMs)}
           </span>
           <span className={cn(meta.source === "cache" && "text-[#8fb07a]")}>
             {meta.source === "cache" ? "缓存命中 · 0 请求" : "网络"} · {meta.model}
@@ -130,7 +130,7 @@ function Empty({ onPick }: { onPick: (word: string) => void }) {
   );
 }
 
-function formatMs(ms: number): string {
+function formatMs(ms: number | null | undefined): string {
   if (!ms) return "—";
   return ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${Math.round(ms)}ms`;
 }

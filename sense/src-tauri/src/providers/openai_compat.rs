@@ -28,6 +28,9 @@ pub enum ChatError {
     Auth,
     /// 限流（429）。
     RateLimit,
+    /// 请求被拒（400）：多半是我们塞的 reasoning 字段这家网关不认识。
+    /// 单独一个变体，避免和「流里的 error 事件」混在一起误判。
+    BadRequest(String),
     /// 服务端错误（5xx）或其它非 2xx。
     Server(String),
     /// 首字节超时。
@@ -44,6 +47,7 @@ impl ChatError {
         match self {
             ChatError::Auth => "Key 无效或已过期。检查一下，或换一个 provider。".to_string(),
             ChatError::RateLimit => "请求太频繁，歇几秒再试。".to_string(),
+            ChatError::BadRequest(detail) => format!("请求被模型服务拒绝（HTTP 400）：{detail}"),
             ChatError::Server(detail) => format!("模型服务出错了：{detail}"),
             ChatError::Timeout => "模型 8 秒没回。检查网络，或换个模型。".to_string(),
             ChatError::Network(detail) => format!("连不上模型服务：{detail}"),
@@ -58,17 +62,67 @@ impl ChatError {
     }
 }
 
+/// 输出上限：五个义项 + 例句 + 备注，实测正常 1200–1800 token。
+/// 给到 4096 与 deepseek-chat 的默认值持平——cap 比默认还低会截断，
+/// 截断一次就得整条重来，那才是真的慢。
+pub const MAX_TOKENS: u32 = 4096;
+
 /// 组装请求体。`stream` 恒为 true：卡片靠增量渲染。
-pub fn build_body(model: &str, system: &str, user: &str, temperature: f64) -> Value {
-    json!({
+///
+/// `reasoning` 是「关掉思考」的 provider 专属字段，直接并进顶层：
+/// DeepSeek 的 `thinking`、DashScope 的 `enable_thinking` 都是顶层键。
+pub fn build_body(
+    model: &str,
+    system: &str,
+    user: &str,
+    temperature: f64,
+    reasoning: Option<&Value>,
+    max_tokens: u32,
+) -> Value {
+    let mut body = json!({
         "model": model,
         "temperature": temperature,
+        "max_tokens": max_tokens,
         "stream": true,
         "messages": [
             { "role": "system", "content": system },
             { "role": "user", "content": user }
         ]
-    })
+    });
+
+    if let (Some(extra), Some(target)) = (reasoning, body.as_object_mut()) {
+        if let Some(fields) = extra.as_object() {
+            for (key, value) in fields {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    body
+}
+
+/// 只认真正的 HTTP 400。流里那种 `{"error":...}` 事件不算——
+/// 那时内容可能已经推给前端了，重试会把增量叠两遍。
+pub fn is_bad_request(err: &ChatError) -> bool {
+    matches!(err, ChatError::BadRequest(_))
+}
+
+/// 预热连接：只做 DNS + TCP + TLS 握手，不带 Key、不花 token。
+///
+/// 不带 Key 时 `/models` 会回 401，但握手已经完成；后续 POST 直接复用连接池，
+/// 省掉首次查词 100–300ms 的建连时间。
+pub async fn warmup(client: &reqwest::Client, provider: &Provider) {
+    let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
+    // 必须把 body 读完：HTTP/1.1 下没读完的响应不能回池，连接会被关掉，
+    // 那就只剩 DNS 预热，等于没做。
+    if let Ok(response) = client
+        .get(&url)
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await
+    {
+        let _ = response.text().await;
+    }
 }
 
 /// 发一次流式请求，边收边回调。
@@ -203,6 +257,7 @@ fn sanitize_detail(body: &str) -> String {
 
 fn map_status(status: u16, body: &str) -> ChatError {
     match status {
+        400 => ChatError::BadRequest(sanitize_detail(body)),
         401 | 403 => ChatError::Auth,
         429 => ChatError::RateLimit,
         500..=599 => ChatError::Server(format!("HTTP {status}")),
@@ -265,12 +320,30 @@ mod tests {
 
     #[test]
     fn body_is_streaming_and_carries_both_messages() {
-        let body = build_body("m", "sys", "user", 0.3);
+        let body = build_body("m", "sys", "user", 0.3, None, MAX_TOKENS);
         assert_eq!(body["stream"], json!(true));
         assert_eq!(body["model"], json!("m"));
         assert_eq!(body["temperature"], json!(0.3));
+        assert_eq!(body["max_tokens"], json!(4096));
         assert_eq!(body["messages"][0]["role"], json!("system"));
         assert_eq!(body["messages"][1]["content"], json!("user"));
+        assert!(body.get("thinking").is_none(), "没传就不该凭空出现");
+    }
+
+    #[test]
+    fn reasoning_fields_are_merged_at_top_level() {
+        let extra = json!({ "thinking": { "type": "disabled" } });
+        let body = build_body("deepseek-flash", "sys", "user", 0.3, Some(&extra), MAX_TOKENS);
+        assert_eq!(body["thinking"]["type"], json!("disabled"));
+        assert_eq!(body["model"], json!("deepseek-flash"), "不能把原有字段冲掉");
+    }
+
+    #[test]
+    fn only_http_400_counts_as_bad_request() {
+        assert!(is_bad_request(&map_status(400, "unknown field")));
+        assert!(!is_bad_request(&map_status(422, "HTTP 400 in body")));
+        assert!(!is_bad_request(&map_status(401, "")));
+        assert!(!is_bad_request(&map_status(500, "")));
     }
 
     #[test]
@@ -285,7 +358,13 @@ mod tests {
     fn server_error_message_is_truncated() {
         let long = "x".repeat(500);
         match map_status(400, &long) {
-            ChatError::Server(detail) => assert!(detail.chars().count() <= 200, "错误信息要截断"),
+            ChatError::BadRequest(detail) => {
+                assert!(detail.chars().count() <= 200, "错误信息要截断")
+            }
+            other => panic!("应为 BadRequest，实际 {other:?}"),
+        }
+        match map_status(503, &long) {
+            ChatError::Server(detail) => assert_eq!(detail, "HTTP 503", "5xx 不回传整页 HTML"),
             other => panic!("应为 Server，实际 {other:?}"),
         }
     }

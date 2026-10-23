@@ -22,12 +22,55 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 /// 全局复用一个 HTTP 客户端：连接池、TLS 会话都能复用。
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
+/// 本地模型专用：绕开系统代理。
+///
+/// reqwest 默认读 HTTP_PROXY / HTTPS_PROXY，而 NO_PROXY 里通常没有 127.0.0.1。
+/// 一旦用户（或开发机）设了全局代理，发给 Ollama / LM Studio 的请求会被
+/// 转给代理，本地模型直接不可用，报错还很难懂。
+static LOOPBACK_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn is_loopback(base_url: &str) -> bool {
+    let rest = base_url.split("://").nth(1).unwrap_or_default();
+    let authority = rest.split('/').next().unwrap_or_default();
+    // 去掉 user:pass@：不然 split(':') 会先把用户名当成 host
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        // IPv6 字面量：[::1]:11434
+        stripped.split(']').next().unwrap_or_default()
+    } else {
+        authority.split(':').next().unwrap_or_default()
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+/// 按目标地址挑客户端：本地直连，远端才走系统代理。
+pub fn client_for(base_url: &str) -> &'static reqwest::Client {
+    if !is_loopback(base_url) {
+        return http_client();
+    }
+    LOOPBACK_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(180))
+            .pool_idle_timeout(Duration::from_secs(60))
+            .build()
+            .expect("构建本地 HTTP 客户端失败")
+    })
+}
+
 pub fn http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             // 连接要快，整条流给足时间；卡住由 openai_compat 里的分片超时兜底。
-            .connect_timeout(Duration::from_secs(8))
+            .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(180))
+            // 查词是一次一次来的，连接必须留着复用：每次重新握手要多 100–300ms。
+            // 很多网关/LB 在 60–120s 就掐掉空闲连接；留太久会拿到半关闭的连接，
+            // 表现为「连不上模型服务」，比多握一次手更糟。
+            .pool_idle_timeout(Duration::from_secs(60))
+            .pool_max_idle_per_host(4)
+            .tcp_keepalive(Duration::from_secs(60))
             .build()
             .expect("构建 HTTP 客户端失败")
     })
@@ -65,6 +108,23 @@ pub fn run() {
         .setup(|app| {
             // 默认菜单：给出 ⌘Q 退出与 Edit 菜单（输入框的 ⌘C/⌘V 依赖它）。
             app.set_menu(Menu::default(app.handle())?)?;
+
+            // 预热到 provider 的连接：DNS + TCP + TLS 在启动时就做完，
+            // 第一次查词不用再付这 100–300ms。
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    // 配置读不出来就别猜默认 provider：那会朝 deepseek 发一次
+                    // 用户根本没配过的请求。
+                    if settings::read_value(&handle).is_err() {
+                        return;
+                    }
+                    if let Ok(provider) = providers::active(&handle) {
+                        providers::openai_compat::warmup(client_for(&provider.base_url), &provider)
+                            .await;
+                    }
+                });
+            }
 
             // 缓存：打不开就退到内存缓存，别为此让应用起不来。
             let cache = match app.path().app_data_dir() {
@@ -141,4 +201,19 @@ pub fn run() {
                 window::show(app);
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_loopback;
+
+    #[test]
+    fn loopback_detection_covers_local_models() {
+        assert!(is_loopback("http://127.0.0.1:11434/v1"));
+        assert!(is_loopback("http://localhost:11434/v1"));
+        assert!(is_loopback("http://[::1]:11434/v1"));
+        assert!(!is_loopback("https://api.deepseek.com/v1"));
+        // 域名里带 localhost 不算本地，别把远端请求也绕开代理
+        assert!(!is_loopback("https://localhost.example.com/v1"));
+    }
 }

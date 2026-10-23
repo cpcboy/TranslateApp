@@ -3,6 +3,9 @@
 //! 这里不解释模型输出、也不做字段校验——那是前端的 zod 的活。
 //! Rust 只负责：取 Key、发请求、转发增量、落缓存。
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
@@ -59,7 +62,7 @@ impl LookupError {
         let (code, message) = match err {
             ChatError::Auth => ("auth", err.message()),
             ChatError::RateLimit => ("rate_limit", err.message()),
-            ChatError::Server(_) => ("server", err.message()),
+            ChatError::Server(_) | ChatError::BadRequest(_) => ("server", err.message()),
             ChatError::Timeout => ("timeout", err.message()),
             ChatError::Network(_) => ("network", err.message()),
             ChatError::Empty => ("empty", err.message()),
@@ -143,7 +146,27 @@ pub async fn lookup(
     let system = prompts::word_system();
     let user = prompts::user_message(&word, &lang, req.context.as_deref());
     let temperature = req.temperature.unwrap_or(0.3);
-    let body = openai_compat::build_body(&provider.model, system, &user, temperature);
+    // 关掉思考：DeepSeek V4 默认开着 thinking（effort=high），
+    // 一次查词光思维链就要几秒，卡片等于转圈。
+    let reasoning = provider_registry::reasoning_fields(&provider.id);
+    let body = openai_compat::build_body(
+        &provider.model,
+        system,
+        &user,
+        temperature,
+        reasoning.as_ref(),
+        openai_compat::MAX_TOKENS,
+    );
+    let plain_body = || {
+        openai_compat::build_body(
+            &provider.model,
+            system,
+            &user,
+            temperature,
+            None,
+            openai_compat::MAX_TOKENS,
+        )
+    };
 
     let request_id = req
         .request_id
@@ -151,7 +174,12 @@ pub async fn lookup(
 
     let app_for_emit = app.clone();
     let request_for_emit = request_id.clone();
+    // 只要往前端推过一个字节，就不能再「去掉 reasoning 字段重发」——
+    // 重发的增量会接在同一段 buffer 后面，卡片里会出现两份义项。
+    let emitted = Arc::new(AtomicBool::new(false));
+    let emitted_for_delta = emitted.clone();
     let mut on_delta = move |chunk: &str| {
+        emitted_for_delta.store(true, Ordering::Relaxed);
         let _ = app_for_emit.emit(
             "sense://delta",
             DeltaEvent {
@@ -161,15 +189,45 @@ pub async fn lookup(
         );
     };
 
-    let outcome = openai_compat::stream_chat(
-        crate::http_client(),
+    let client = crate::client_for(&provider.base_url);
+    let outcome = match openai_compat::stream_chat(
+        client,
         &provider,
         api_key.as_deref(),
         &body,
         &mut on_delta,
     )
     .await
-    .map_err(|err| LookupError::from_chat(&err))?;
+    {
+        Ok(outcome) => outcome,
+        // 网关不认 reasoning 字段：去掉再来一次，别让用户看到 400。
+        // 前提是从没往前端吐过字，否则会把内容叠两遍。
+        Err(err)
+            if reasoning.is_some()
+                && !emitted.load(Ordering::Relaxed)
+                && openai_compat::is_bad_request(&err) =>
+        {
+            eprintln!("[sense] provider 不认关思考字段，去掉后重试");
+            openai_compat::stream_chat(
+                client,
+                &provider,
+                api_key.as_deref(),
+                &plain_body(),
+                &mut on_delta,
+            )
+            .await
+            .map_err(|err| LookupError::from_chat(&err))?
+        }
+        Err(err) => return Err(LookupError::from_chat(&err)),
+    };
+
+    println!(
+        "[sense] lookup {word}: ttft={}ms total={}ms chars={} thinking={}",
+        outcome.first_delta_ms,
+        outcome.total_ms,
+        outcome.text.chars().count(),
+        if reasoning.is_some() { "off" } else { "n/a" }
+    );
 
     // 只缓存「结构完整」的输出：半截 JSON 进了库，下次查询会拿着坏数据反复失败。
     if looks_complete(&outcome.text) {

@@ -84,8 +84,21 @@ const server = createServer((req, res) => {
   }
 
   if (req.method === "POST" && req.url?.endsWith("/chat/completions")) {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
     req.resume();
     req.on("end", () => {
+      // 把请求体的关键开关记下来：验证「关思考」到底有没有发出去
+      try {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        const thinking =
+          body.thinking ?? body.enable_thinking ?? body.reasoning ?? body.reasoning_effort ?? null;
+        log(
+          `  > model=${body.model} max_tokens=${body.max_tokens ?? "-"} temperature=${body.temperature ?? "-"} thinking=${JSON.stringify(thinking)}`,
+        );
+      } catch {
+        log("  > body 解析失败");
+      }
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
