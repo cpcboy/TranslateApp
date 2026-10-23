@@ -133,6 +133,7 @@ pub fn run() {
             commands::settings::dev_flags,
             commands::lookup::lookup,
             commands::lookup::invalidate_lookup,
+            commands::longtext::translate_text,
             window::hotkey_list,
             window::set_hotkey,
             capture::start_capture,

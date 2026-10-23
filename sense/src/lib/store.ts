@@ -25,7 +25,11 @@ type LookupState = {
   warnings: string[];
   error: LookupError | null;
   meta: LookupMeta | null;
+  /** 长文翻译结果；非空时界面显示它而不是义项卡 */
+  longText: string | null;
+  longProgress: { done: number; total: number } | null;
   run: (word: string) => Promise<void>;
+  runLong: (text: string) => Promise<void>;
   reset: () => void;
 };
 
@@ -38,6 +42,8 @@ const empty = {
   warnings: [] as string[],
   error: null,
   meta: null,
+  longText: null,
+  longProgress: null,
 };
 
 /**
@@ -48,6 +54,36 @@ let epoch = 0;
 
 export const useLookup = create<LookupState>((set) => ({
   ...empty,
+
+  runLong: async (raw: string) => {
+    const text = raw.trim();
+    if (!text) return;
+    const my = ++epoch;
+    set({ ...empty, status: "loading", query: text.slice(0, 24) });
+
+    let unlisten: (() => void) | undefined;
+    if ("__TAURI_INTERNALS__" in window) {
+      const { listen } = await import("@tauri-apps/api/event");
+      unlisten = await listen<{ done: number; total: number }>("sense://longtext", (event) => {
+        if (my !== epoch) return;
+        set({ longProgress: event.payload });
+      });
+    }
+
+    try {
+      const result = await api.translateText(text);
+      if (my !== epoch) return;
+      set({ status: "done", longText: result, longProgress: null });
+    } catch (err) {
+      if (my !== epoch) return;
+      set({
+        status: "error",
+        error: { code: "longtext", message: String(err).replace(/^Error:\s*/, "") },
+      });
+    } finally {
+      unlisten?.();
+    }
+  },
 
   reset: () => {
     epoch += 1;
