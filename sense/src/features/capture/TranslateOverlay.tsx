@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { api, type OverlayBlock } from "../../lib/ipc";
 
 /**
@@ -22,9 +23,24 @@ export function TranslateOverlay() {
     window.addEventListener("keydown", onKey);
     const timer = window.setTimeout(() => setHint(false), 2200);
 
+    // 点到别的窗口就收起来：否则这层一直浮在最上面，Esc 又发不到它
+    const mountedAt = Date.now();
+    let unlisten: (() => void) | undefined;
+    void getCurrentWindow()
+      .onFocusChanged(({ payload }) => {
+        if (!payload && Date.now() - mountedAt > 200) void api.closeOverlay();
+      })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => {
+        /* 拿不到焦点事件就退回只靠 Esc */
+      });
+
     return () => {
       window.removeEventListener("keydown", onKey);
       window.clearTimeout(timer);
+      unlisten?.();
     };
   }, []);
 
@@ -60,7 +76,8 @@ export function TranslateOverlay() {
  */
 function BlockView({ block }: { block: OverlayBlock }) {
   const ref = useRef<HTMLDivElement>(null);
-  const base = Math.min(26, Math.max(12, Math.round(block.h * 0.95)));
+  // 按「一行」的高度算字号：合并成两行的块，h 也是两行，直接用会变大两倍
+  const base = Math.min(26, Math.max(12, Math.round(block.line_h * 0.95)));
 
   useLayoutEffect(() => {
     const node = ref.current;
@@ -74,7 +91,7 @@ function BlockView({ block }: { block: OverlayBlock }) {
       size -= 1;
       node.style.fontSize = `${size}px`;
     }
-  }, [block.text, block.w, block.h, base]);
+  }, [block.text, block.w, block.h, block.line_h, base]);
 
   return (
     <div

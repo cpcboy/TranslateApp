@@ -60,6 +60,9 @@ pub struct Block {
     pub y: f64,
     pub w: f64,
     pub h: f64,
+    /// 这一块里**单行**的高度。合并了多行时 h 会是两倍三倍，
+    /// 字号必须按 line_h 算，否则一段会突然变成巨字。
+    pub line_h: f64,
     /// 没有译文时为 false，前端只画原文
     pub translated: bool,
 }
@@ -369,6 +372,7 @@ fn merge_lines(lines: &[OcrLine], scale: f64) -> Vec<Block> {
                 last.y = last.y.min(y);
                 last.w = right - last.x;
                 last.h = bottom - last.y;
+                last.line_h = last.line_h.max(h);
                 last.text.push(' ');
                 last.text.push_str(&text);
                 continue;
@@ -381,6 +385,7 @@ fn merge_lines(lines: &[OcrLine], scale: f64) -> Vec<Block> {
             y,
             w,
             h,
+            line_h: h,
             translated: false,
         });
     }
@@ -514,6 +519,7 @@ mod tests {
             y: 0.0,
             w: 10.0,
             h: 10.0,
+            line_h: 10.0,
             translated: false,
         }];
         assert_eq!(translate_target(&english), Some("中文"));

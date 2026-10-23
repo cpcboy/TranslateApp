@@ -38,6 +38,8 @@ export type OverlayBlock = {
   y: number;
   w: number;
   h: number;
+  /** 单行高度：多行合并后 h 会变大，字号要按这个算 */
+  line_h: number;
   translated: boolean;
 };
 
