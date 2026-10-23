@@ -103,7 +103,7 @@ export function CaptureOverlay() {
         </>
       )}
 
-      <div className="pointer-events-none absolute bottom-6 left-1/2 -translate-x-1/2 rounded-full bg-[rgba(12,12,16,0.86)] px-4 py-2 text-[13px] text-[#f6f3ed]">
+      <div className="pointer-events-none absolute bottom-[120px] left-1/2 -translate-x-1/2 rounded-full bg-[rgba(12,12,16,0.86)] px-4 py-2 text-[13px] text-[#f6f3ed]">
         {busy ? "识别中…" : "拖动选择区域 · Esc 取消"}
       </div>
     </div>

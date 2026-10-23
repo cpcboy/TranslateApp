@@ -233,6 +233,17 @@ pub fn run() {
                 }
             }
 
+            // 仅供自动化验证：直接拉起选区窗口（模拟按快捷键）
+            if std::env::var_os("SENSE_DEV_SELECT").is_some() {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(1200)).await;
+                    if let Err(err) = capture::start_capture(handle).await {
+                        eprintln!("[sense] dev select 失败: {err}");
+                    }
+                });
+            }
+
             // 仅供自动化验证：给一个矩形就直接走「截图 → OCR → 翻译 → 覆盖」，
             // 跳过手动拖框（鼠标手势没法脚本化）。
             #[cfg(debug_assertions)]

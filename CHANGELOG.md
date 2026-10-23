@@ -37,6 +37,28 @@
 - 全屏 App 下能否呼出依赖 `visibleOnAllWorkspaces`，需人工在全屏窗口中确认一次
 - D2 开工前需要决定：模型流式文本进入卡片后，CSP 是否还要再收紧（当前 `connect-src` 已限定）
 
+### 修复 · 2026-10-23 — 截屏选区窗口白屏 / 打不开
+
+**现象**：点「截屏翻译」或按 ⌃⌥⌘X，选区窗口不出或白屏（WebView 显示 Reload）。
+
+**两个独立原因**
+
+1. **白屏**：选区/译文窗口用 `WebviewUrl::App("/?view=capture")` 加载，生产环境里
+   这个 query 路由解析不到页面，WebView 落到错误页（就是那个 Reload 提示）。
+   改为两个副窗口都加载 `index.html`，**用窗口 label 判断渲染哪个组件**，
+   不再依赖 URL。
+2. **窗口根本没出来**：`monitor_from_point(cursor)` 返回 None（刚启动/鼠标在边缘时会出现），
+   直接报「找不到鼠标所在的屏幕」。改为拿不到就退回 `primary_monitor()`，
+   并把 cursor 与屏幕尺寸写进 capture.log。
+
+**顺带**
+
+- 选区提示条从 `bottom-6` 抬到 `bottom-[120px]`：原来被 Dock 挡住
+- 新增 `SENSE_DEV_SELECT=1` 环境变量，直接拉起选区窗口，便于自动化验证
+
+**验证**：dev 钩子拉起后截图，全屏压暗 + 「拖动选择区域 · Esc 取消」可见；
+`capture.log` 记录 `select monitor: cursor=(12, 17) size=1920x1080`。
+
 ### 优化 · 2026-10-23 — 阅读视图收尾
 
 - **截断提示**：流里读 `finish_reason`，撞到 `max_tokens` 时右栏底部出现黄色提示，

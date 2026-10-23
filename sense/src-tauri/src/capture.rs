@@ -118,10 +118,17 @@ pub async fn start_capture(app: AppHandle) -> Result<(), String> {
     close(&app, CAPTURE_WINDOW);
 
     let cursor = app.cursor_position().map_err(|err| format!("取不到鼠标位置：{err}"))?;
+    // 优先取鼠标所在屏幕；拿不到就退回主屏。
+    // （拿不到不是罕见情况：刚启动、鼠标在屏幕边缘、或系统还没把显示器信息给到进程）
     let monitor = app
         .monitor_from_point(cursor.x, cursor.y)
         .map_err(|err| format!("取不到屏幕信息：{err}"))?
-        .ok_or_else(|| "找不到鼠标所在的屏幕".to_string())?;
+        .or_else(|| app.primary_monitor().ok().flatten())
+        .ok_or_else(|| format!("找不到可用屏幕（cursor={},{}）", cursor.x, cursor.y))?;
+    trace(
+        &app,
+        format!("select monitor: cursor=({}, {}) size={:?}", cursor.x, cursor.y, monitor.size()),
+    );
 
     let scale = monitor.scale_factor();
     let position = monitor.position();
@@ -131,7 +138,7 @@ pub async fn start_capture(app: AppHandle) -> Result<(), String> {
     let width = size.width as f64 / scale;
     let height = size.height as f64 / scale;
 
-    WebviewWindowBuilder::new(&app, CAPTURE_WINDOW, WebviewUrl::App("/?view=capture".into()))
+    WebviewWindowBuilder::new(&app, CAPTURE_WINDOW, WebviewUrl::App("index.html".into()))
         .title("SENSE 截图")
         .position(x, y)
         .inner_size(width, height)
@@ -265,7 +272,7 @@ pub async fn run(
         *slot = blocks.clone();
     }
 
-    WebviewWindowBuilder::new(&app, OVERLAY_WINDOW, WebviewUrl::App("/?view=overlay".into()))
+    WebviewWindowBuilder::new(&app, OVERLAY_WINDOW, WebviewUrl::App("index.html".into()))
         .title("SENSE 译文")
         .position(x, y)
         .inner_size(w, h)
