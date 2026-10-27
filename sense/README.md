@@ -129,7 +129,7 @@ npm run tauri dev
 ### 测试
 
 ```bash
-npm test                     # Vitest：zod 契约、展示上限整形、增量解析、查询状态机、失败文案、查词/长文分流、阅读视图纯逻辑、标签覆盖、mock 提示词防漂移、与 spec JSON Schema 对拍（107 个）
+npm test                     # Vitest：zod 契约、展示上限整形、增量解析、查询状态机、失败文案、查词/长文分流、阅读视图纯逻辑、左右栏同步滚动、标签覆盖、mock 提示词防漂移、与 spec JSON Schema 对拍（118 个）
 npm run typecheck            # tsc --noEmit
 cd src-tauri && cargo test   # Rust：SSE、流式时限与断流、关思考字段兜底、长文结束原因与取消、缓存与淘汰、快捷键注册与回退、选区落点推算、密钥掩码（90 个）
 ```
