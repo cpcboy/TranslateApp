@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, type GrammarIssue, type WordGloss } from "../../lib/ipc";
 import { lastBlockIsOpen, markedCount, shouldCheckGrammar, sliceAround, splitMarked } from "./reading";
+import { createScrollSync } from "./scrollSync";
 
 /** 复制到剪贴板：优先 Clipboard API，不行就退回 textarea + execCommand。 */
 async function copyText(value: string): Promise<boolean> {
@@ -211,20 +212,12 @@ export function LongTextView({
     return () => window.removeEventListener("mousedown", close);
   }, []);
 
-  // 两栏按比例同步滚动
-  const syncing = useRef<"left" | "right" | null>(null);
+  // 两栏按比例同步滚动；写对方 scrollTop 引出的回响事件怎么挡住的，见 scrollSync.ts
+  const [scrollSync] = useState(() => createScrollSync());
   const syncScroll = (from: "left" | "right") => () => {
-    if (syncing.current && syncing.current !== from) return;
-    syncing.current = from;
     const a = from === "left" ? leftRef.current : rightRef.current;
     const b = from === "left" ? rightRef.current : leftRef.current;
-    if (a && b) {
-      const ratio = a.scrollTop / Math.max(1, a.scrollHeight - a.clientHeight);
-      b.scrollTop = ratio * Math.max(0, b.scrollHeight - b.clientHeight);
-    }
-    requestAnimationFrame(() => {
-      syncing.current = null;
-    });
+    if (a && b) scrollSync(a, b);
   };
 
   const copy = async (which: "source" | "target", value: string) => {
