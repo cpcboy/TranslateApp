@@ -98,6 +98,7 @@ describe("wordEntrySchema（与 spec JSON Schema 对拍）", () => {
   it("展示类枚举非法时：zod 兜底成默认值，spec 仍然拒绝", () => {
     // 这是刻意的分歧：spec 是给模型看的严格契约，
     // 应用侧不能因为一个展示标签（场景/词性/语域）丢掉整张卡。
+    // （词性、语域现在不兜底成默认值，而是归一后原样保留，见 labels.test.ts；这里只验场景）
     const broken = structuredClone(CHARGE) as typeof CHARGE;
     broken.senses[0].examples[0].scene = "办公室";
     expect(validate(broken)).toBe(false);

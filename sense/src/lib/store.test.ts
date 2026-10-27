@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   translateText: vi.fn(),
   lookup: vi.fn(),
   cancelTranslate: vi.fn(async () => {}),
+  invalidateLookup: vi.fn(async () => {}),
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
@@ -20,7 +21,7 @@ vi.mock("./ipc", () => ({
     translateText: mocks.translateText,
     lookup: mocks.lookup,
     cancelTranslate: mocks.cancelTranslate,
-    invalidateLookup: vi.fn(async () => {}),
+    invalidateLookup: mocks.invalidateLookup,
   },
   onDelta: vi.fn(async (handler: (payload: unknown) => void) => {
     mocks.handlers.set("sense://delta", (event) => handler(event.payload));
@@ -88,6 +89,40 @@ describe("查词：重试后仍不合格", () => {
     expect(state.status).toBe("error");
     expect(state.error?.message).toContain("不符合词典格式");
     expect(state.error?.message).not.toContain("中断");
+  });
+
+  it("两次都不合格：两次都把缓存标废，下次不会再命中坏数据", async () => {
+    mocks.lookup.mockResolvedValue({
+      raw: "抱歉，不能回答。",
+      source: "network",
+      model: "m",
+      first_delta_ms: 1,
+      total_ms: 2,
+      finish_reason: "stop",
+    });
+    await useLookup.getState().run("refuse");
+    // 一次在重试之前，一次在最终放弃之后（Rust 会把重试的结果也写进库）
+    expect(mocks.invalidateLookup).toHaveBeenCalledTimes(2);
+    expect(mocks.invalidateLookup).toHaveBeenLastCalledWith("refuse", "en");
+  });
+
+  it("重试换新的 requestId：第一轮迟到的增量混不进第二轮", async () => {
+    const emitDelta = (request_id: string, text: string) =>
+      mocks.handlers.get("sense://delta")?.({ payload: { request_id, text } });
+    const ids: string[] = [];
+    mocks.lookup.mockImplementation(async (args: { requestId: string; temperature: number }) => {
+      ids.push(args.requestId);
+      if (args.temperature !== 0.3) {
+        emitDelta(ids[0], '{"word":"迟到的旧增量"'); // 第一轮的尾巴，现在才到
+        await new Promise((resolve) => setTimeout(resolve, 100)); // 超过 66ms 合流窗口
+      }
+      return { raw: "坏的", source: "network", model: "m", first_delta_ms: 1, total_ms: 2, finish_reason: "stop" };
+    });
+    await useLookup.getState().run("refuse");
+    // 断言放在 mock 外面：mock 里抛错会被 store 的 catch 吞掉，测试就成了摆设
+    expect(ids).toHaveLength(2);
+    expect(ids[1]).not.toBe(ids[0]);
+    expect(useLookup.getState().buffer).not.toContain("迟到的旧增量");
   });
 });
 

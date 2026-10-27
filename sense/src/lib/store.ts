@@ -60,6 +60,10 @@ const empty = {
  */
 let epoch = 0;
 
+function newRequestId(): string {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 /**
  * 离开阅读视图、开始新查询时，把还在生成的长文停掉。
  * 前端丢弃增量不等于后端停了：不停的话，那条流会一直生成、一直计费。
@@ -153,7 +157,8 @@ export const useLookup = create<LookupState>((set, get) => ({
 
     void stopLongIfBusy(get().longBusy);
     const my = ++epoch;
-    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    // 重试会换新的 requestId：第一轮迟到的增量带的是旧 id，混不进第二轮的预览
+    let requestId = newRequestId();
     set({ ...empty, status: "loading", query: word });
 
     let buffer = "";
@@ -208,6 +213,7 @@ export const useLookup = create<LookupState>((set, get) => ({
         buffer = "";
         firstSenseMs = null;
         attemptStart = performance.now();
+        requestId = newRequestId();
         set({ status: "loading", buffer, partial: null });
 
         const second = await api.lookup({
@@ -220,6 +226,10 @@ export const useLookup = create<LookupState>((set, get) => ({
 
         parsed = validate(second.raw, second);
         if (!parsed.ok) {
+          // 重试写进库的也是坏数据（Rust 只做结构门）：不标废的话，
+          // 以后每查一次这个词都是「命中坏缓存 + 一次必然失败的请求」
+          await api.invalidateLookup(word, detectLang(word)).catch(() => {});
+          if (my !== epoch) return;
           set({
             status: "error",
             error: { code: "invalid_json", message: describeFailure(second, parsed.reason) },

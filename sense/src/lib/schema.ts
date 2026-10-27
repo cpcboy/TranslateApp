@@ -10,12 +10,14 @@ import { LIMITS, normalizeEntry } from "./normalize";
  */
 
 export const SCHEMA_VERSION = 1;
-/** prompt 版本进缓存 key：改 prompt 后旧缓存自然失效。 */
-export const PROMPT_VERSION = 1;
 
 // 词性 / 语域 / 场景都只用于展示，不该因为它们不在名单里就让整张卡作废。
 // 之前 `interj`（shit、wow 这类感叹词）缺失，导致这条词无论重试多少次都判非法。
-const KNOWN_POS = [
+//
+// 词性不再兜底成某个具体值：名单外的词性（modal 之类）原样保留，界面直接显示原文；
+// 只有根本不是字符串时才记成 "other"（界面写「其他」）。以前一律改成 "n"，
+// 卡片上会凭空多出一个错的「n.」。已知词性的写法见 labels.ts（有测试保证名单里的都有标签）。
+export const KNOWN_POS = [
   "n",
   "v",
   "adj",
@@ -33,15 +35,89 @@ const KNOWN_POS = [
   "abbr",
 ] as const;
 
-export const posSchema = z.enum(KNOWN_POS).catch("n");
+const POS_ALIASES: Record<string, string> = {
+  noun: "n",
+  verb: "v",
+  adjective: "adj",
+  adverb: "adv",
+  preposition: "prep",
+  conjunction: "conj",
+  pronoun: "pron",
+  numeral: "num",
+  number: "num",
+  phrase: "phr",
+  interjection: "interj",
+  auxiliary: "aux",
+  determiner: "det",
+  article: "art",
+  particle: "part",
+  abbreviation: "abbr",
+};
+
+/** 去空白、转小写，单个词性的尾点去掉（`adj.` → `adj`）；常见全称归到缩写：「N」「Adj.」「noun」都能认出来。
+ *  `n./v.` 这类复合写法不动，免得被削成 `n./v` */
+function normalizePos(value: string): string {
+  const trimmed = value.trim().toLowerCase();
+  const key = /^[a-z]+\.$/.test(trimmed) ? trimmed.slice(0, -1) : trimmed;
+  return Object.prototype.hasOwnProperty.call(POS_ALIASES, key) ? POS_ALIASES[key] : key;
+}
+
+export const posSchema = z
+  .string()
+  .transform(normalizePos)
+  .pipe(z.string().min(1).max(16))
+  .catch("other");
 
 export const sceneSchema = z
   .enum(["日常", "职场", "学术", "新闻", "法律", "技术", "旅行", "消费", "医疗", "教育", "口语", "网络", "娱乐", "商业"])
   .catch("日常");
 
+export const KNOWN_REGISTER = [
+  "neutral",
+  "formal",
+  "informal",
+  "technical",
+  "legal",
+  "slang",
+  "vulgar",
+  "colloquial",
+  "idiom",
+  "literary",
+] as const;
+
+/**
+ * 模型常把「粗俗」写成别的词。提示词里的语域名单只有 6 个、没有 vulgar，
+ * 不归一的话，一个骂人的词会因为被兜底成 neutral 而不带任何提醒。
+ * 按「整词」匹配：`very rude`、`offensive slur`、`vulgar slang` 都算；`prudent` 里的 rude 不算。
+ */
+const VULGAR_WORDS =
+  /\b(?:vulgar|offensive|profan\w*|obscen\w*|taboo|rude|crude|coarse|swear\w*|slur|derogator\w*|pejorat\w*|explicit|nsfw|impolite)\b/;
+
+/** 「没有特别语域」的各种写法：不画标签（原来兜底成 neutral 的就是这些） */
+const NEUTRAL_WORDS = new Set(["none", "standard", "general", "normal", "n/a", "na", "unmarked", "unknown", "default", "common"]);
+
+const REGISTER_ALIASES: Record<string, string> = {
+  casual: "informal",
+  colloquialism: "colloquial",
+};
+
+function normalizeRegister(value: string | null): string | null {
+  if (value === null) return null;
+  const key = value.trim().toLowerCase();
+  if (VULGAR_WORDS.test(key)) return "vulgar";
+  if (NEUTRAL_WORDS.has(key)) return "neutral";
+  return Object.prototype.hasOwnProperty.call(REGISTER_ALIASES, key) ? REGISTER_ALIASES[key] : key;
+}
+
+/**
+ * 语域名单外的值（archaic 之类）原样保留，界面直接显示；
+ * 只有根本不是字符串（或空串）时才当作 neutral，不画标签。KNOWN_REGISTER 里的都有中文标签。
+ */
 export const registerSchema = z
-  .enum(["neutral", "formal", "informal", "technical", "legal", "slang", "vulgar", "colloquial", "idiom", "literary"])
+  .string()
   .nullable()
+  .transform(normalizeRegister)
+  .pipe(z.string().min(1).max(16).nullable())
   .catch("neutral");
 
 export const exampleSchema = z.object({

@@ -1,27 +1,7 @@
 import { useMemo, useState } from "react";
 import type { Sense, WordEntry } from "../../lib/schema";
 import { cn } from "../../lib/cn";
-
-const POS_LABEL: Record<string, string> = {
-  n: "n.",
-  v: "v.",
-  adj: "adj.",
-  adv: "adv.",
-  prep: "prep.",
-  conj: "conj.",
-  pron: "pron.",
-  num: "num.",
-  phr: "phr.",
-};
-
-const REGISTER_LABEL: Record<string, string> = {
-  neutral: "",
-  formal: "书面",
-  informal: "口语",
-  technical: "技术",
-  legal: "法律",
-  slang: "俚语",
-};
+import { posLabel, registerLabel, sceneLine, WARN_REGISTER } from "./labels";
 
 const BAND_LABEL: Record<string, string> = {
   high: "高频",
@@ -46,7 +26,7 @@ export function SenseCard({
   const hidden = entry.senses.length - visible.length;
 
   const ipa = entry.pronunciation.ipa ?? entry.pronunciation.pinyin ?? "";
-  const posLine = entry.pos.map((item) => POS_LABEL[item] ?? item).join(" / ");
+  const posLine = entry.pos.map(posLabel).join(" / ");
   const band = entry.frequency.band ? BAND_LABEL[entry.frequency.band] ?? "" : "";
 
   return (
@@ -154,7 +134,8 @@ function SenseRow({
 }) {
   const example = sense.examples[0];
   const opacity = [1, 0.62, 0.38, 0.2][index] ?? 0.2;
-  const register = sense.register ? (REGISTER_LABEL[sense.register] ?? "") : "";
+  const register = sense.register ? registerLabel(sense.register) : "";
+  const warnRegister = sense.register ? WARN_REGISTER.has(sense.register) : false;
 
   return (
     <div
@@ -174,9 +155,14 @@ function SenseRow({
           <span className="font-mono text-[14px] text-subtle">{String(index + 1).padStart(2, "0")}</span>
           <span className="text-[21px] font-semibold leading-[1.4] text-paper">{sense.gloss_zh}</span>
           <small className="text-[14px] font-normal text-subtle">
-            {POS_LABEL[sense.pos] ?? sense.pos}
-            {register ? ` · ${register}` : ""}
+            {posLabel(sense.pos)}
+            {register && !warnRegister ? ` · ${register}` : ""}
           </small>
+          {warnRegister && (
+            <span className="rounded border border-[#d1a35d] px-2 py-0.5 text-[13px] font-semibold text-[#f0b45e]">
+              {register}
+            </span>
+          )}
           <span className="ml-auto shrink-0 font-mono text-[15px] text-muted">
             {Math.round(sense.share * 100)}%
           </span>
@@ -196,8 +182,7 @@ function SenseRow({
             <p className="mt-2 flex flex-wrap items-center gap-2.5 text-[16px] leading-[1.6] text-muted">
               <span>{example.translation}</span>
               <span className="rounded bg-[rgba(248,246,241,0.1)] px-2.5 py-1 text-[13.5px] tracking-[0.02em] text-[#d8d3ca]">
-                {example.scene}
-                {sense.domains[0] ? ` · ${sense.domains[0]}` : ""}
+                {sceneLine(example.scene, sense.domains[0])}
               </span>
             </p>
           </>

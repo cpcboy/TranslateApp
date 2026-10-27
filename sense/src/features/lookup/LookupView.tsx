@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { isLongText } from "../../lib/route";
 import { buildPreview } from "../../lib/schema";
 import { useLookup } from "../../lib/store";
 import { cn } from "../../lib/cn";
@@ -68,8 +69,8 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
   const submit = () => {
     const value = text.trim();
     if (!value) return;
-    // 超过一个词的长度就当长文翻译：查词那套 JSON 契约放不下整篇文章
-    if (value.length > 64) {
+    // 一句话以上就当长文翻译：查词那套 JSON 契约放不下句子和文章（规则见 route.ts）
+    if (isLongText(value)) {
       void runLong(value);
       setText("");
       return;
@@ -91,8 +92,14 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
             aria-label="查一个词，或粘贴一段长文"
             onChange={(event) => setText(event.currentTarget.value)}
             onKeyDown={(event) => {
-              // Enter 翻译，Shift+Enter 换行；输入法组字时不拦
-              if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+              // Enter 翻译，Shift+Enter 换行；输入法组字时不拦。
+              // WebKit 里组字结束的那一下 isComposing 已经是 false，keyCode 仍是 229（App.tsx 的 Esc 同理）
+              if (
+                event.key === "Enter" &&
+                !event.shiftKey &&
+                !event.nativeEvent.isComposing &&
+                event.nativeEvent.keyCode !== 229
+              ) {
                 event.preventDefault();
                 submit();
               }
@@ -143,7 +150,9 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
       {meta && (
         <footer className="mt-1 flex shrink-0 items-center justify-between border-t border-line pt-3 font-mono text-[13.5px] text-subtle">
           <span>
-            首义项 {formatMs(meta.firstSenseMs)} · 总计 {formatMs(meta.totalMs)}
+            {meta.source === "cache"
+              ? "本地缓存 · 0 ms"
+              : `首义项 ${formatMs(meta.firstSenseMs)} · 总计 ${formatMs(meta.totalMs)}`}
           </span>
           <span className={cn(meta.source === "cache" && "text-[#8fb07a]")}>
             {meta.source === "cache" ? "缓存命中 · 0 请求" : "网络"} · {meta.model}
