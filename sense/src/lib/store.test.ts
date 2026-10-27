@@ -61,6 +61,37 @@ describe("长文：失败与不完整必须明说", () => {
     expect(useLookup.getState().longIncomplete).toContain("内容策略");
   });
 
+  it("点停止：后端还没返回时就已经是「不完整」，语法检查据此不发", async () => {
+    let finish: (value: { text: string; truncated: boolean; incomplete: string | null }) => void = () => {};
+    mocks.translateText.mockImplementation(
+      () => new Promise((resolve) => (finish = resolve)),
+    );
+    const running = useLookup.getState().runLong("x".repeat(80));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(useLookup.getState().longBusy).toBe(true);
+
+    await useLookup.getState().cancelLong();
+    // 后端的 translate_text 还没返回：longBusy 已经 false，此刻必须已经标了「不完整」
+    expect(useLookup.getState().longBusy).toBe(false);
+    expect(useLookup.getState().longIncomplete).toBe("你点了停止");
+    expect(mocks.cancelTranslate).toHaveBeenCalledTimes(1);
+
+    finish({ text: "半篇", truncated: false, incomplete: "你点了停止" });
+    await running;
+    expect(useLookup.getState().longIncomplete).toBe("你点了停止");
+    expect(useLookup.getState().longText).toBe("半篇");
+  });
+
+  it("已经结束的译文：迟到的「停止」不能把它标成不完整", async () => {
+    mocks.translateText.mockResolvedValue({ text: "完整的译文", truncated: false, incomplete: null });
+    await useLookup.getState().runLong("x".repeat(80));
+    expect(useLookup.getState().longBusy).toBe(false);
+
+    await useLookup.getState().cancelLong(); // 按钮还没来得及消失就被点中
+    expect(useLookup.getState().longIncomplete).toBeNull();
+    expect(mocks.cancelTranslate).not.toHaveBeenCalled();
+  });
+
   it("离开阅读视图时，把还在生成的长文停掉", () => {
     useLookup.setState({ longBusy: true, longSource: "x" });
     useLookup.getState().reset();

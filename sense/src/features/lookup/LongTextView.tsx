@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, type GrammarIssue, type WordGloss } from "../../lib/ipc";
+import { lastBlockIsOpen, markedCount, shouldCheckGrammar, sliceAround, splitMarked } from "./reading";
 
 /** 复制到剪贴板：优先 Clipboard API，不行就退回 textarea + execCommand。 */
 async function copyText(value: string): Promise<boolean> {
@@ -21,6 +22,29 @@ async function copyText(value: string): Promise<boolean> {
       return false;
     }
   }
+}
+
+/**
+ * 选区所在段落里、以选中词为中心的上下文。
+ * 有语法标注时一个段落会被切成好几个文本节点，所以取最近的块级元素，再用 Range 算出准确偏移。
+ */
+function selectionContext(selection: Selection | null): string {
+  if (!selection || selection.rangeCount === 0) return "";
+  const range = selection.getRangeAt(0);
+  const container = range.startContainer;
+  // 起点落在元素节点上（比如从段落之间的空隙开始拖）时，startOffset 是子节点序号，不是字符偏移，
+  // 拿它去切文本会取到文档开头。这种情况没有可靠的上下文，只给选中的内容本身
+  if (container.nodeType === Node.ELEMENT_NODE && !(container as Element).closest("p, li, h3")) {
+    return range.toString().trim();
+  }
+  const element = container.nodeType === Node.ELEMENT_NODE ? (container as Element) : container.parentElement;
+  const block = element?.closest("p, li, h3");
+  if (!block) return sliceAround(container.textContent ?? "", range.startOffset, range.toString().length);
+
+  const before = document.createRange();
+  before.selectNodeContents(block);
+  before.setEnd(range.startContainer, range.startOffset);
+  return sliceAround(block.textContent ?? "", before.toString().length, range.toString().length);
 }
 
 type GlossState = { data: WordGloss | null; error: string | null; x: number; y: number } | null;
@@ -52,6 +76,9 @@ export function LongTextView({
   const [checking, setChecking] = useState(false);
   const [gloss, setGloss] = useState<GlossState>(null);
 
+  // 真正画出来的标记数，不是模型给的问题条数
+  const marks = useMemo(() => markedCount(source, issues), [source, issues]);
+
   const leftRef = useRef<HTMLDivElement>(null);
   const rightRef = useRef<HTMLDivElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
@@ -62,32 +89,65 @@ export function LongTextView({
     if (busy || ((error || incomplete) && text)) endRef.current?.scrollIntoView({ block: "end" });
   }, [text, busy, error, incomplete]);
 
+  // 原文换了（粘贴了另一篇）：上一篇的标记、还在路上的语法检查结果都作废。
+  // 输入框在阅读视图里一直可用，这个组件不会因此重新挂载；不清的话，上一篇的波浪线和
+  // 解释会画在新原文上。要排在下面那个检查 effect 之前
+  const grammarSeq = useRef(0);
+  useEffect(() => {
+    grammarSeq.current += 1;
+    // 「已经查过这一篇」的记号也要清：A → B（没写完 / 中文原文，没查）→ 再贴回 A 时，
+    // 不清的话会认为 A 查过了，A 的标记就再也出不来；开发模式下组件重挂载也靠它重新触发检查
+    checkedFor.current = "";
+    setIssues([]);
+    setChecking(false);
+  }, [source]);
+
   // 语法检查放在译文之后（B 方案：先出译文，波浪线后到）
   useEffect(() => {
-    if (busy || !text || !source || error) return;
-    if (checkedFor.current === source) return;
-
-    const latin = (source.match(/[a-zA-Z]/g) ?? []).length;
-    const cjk = (source.match(/[\u4e00-\u9fff]/g) ?? []).length;
-    if (latin < 40 || cjk * 2 >= latin) return; // 中文原文不查语法
+    // 没写完（出错、点了停止、服务端提前收工）不查，规则见 shouldCheckGrammar
+    if (!shouldCheckGrammar({ busy, text, source, error, incomplete, checkedFor: checkedFor.current })) return;
 
     checkedFor.current = source;
+    const my = grammarSeq.current;
     setChecking(true);
     void api
       .checkGrammar(source)
-      .then(setIssues)
-      .catch(() => setIssues([]))
-      .finally(() => setChecking(false));
-  }, [busy, text, source, error]);
+      .then((found) => {
+        if (my === grammarSeq.current) setIssues(found);
+      })
+      .catch(() => {
+        if (my === grammarSeq.current) setIssues([]);
+      })
+      .finally(() => {
+        if (my === grammarSeq.current) setChecking(false);
+      });
+  }, [busy, text, source, error, incomplete]);
+
+  // 划词请求的序号：连续选词时，先发的请求后返回，不能盖掉后选的那个词的浮层
+  const glossSeq = useRef(0);
+  // 同一个词 + 同一段上下文，再选一次直接用上次的答案，不再花一次请求
+  const glossCache = useRef(new Map<string, WordGloss>());
 
   /** 查一个词：鼠标划选后调用，键盘快捷键也走这里 */
   const explain = useCallback(async (term: string, context: string, x: number, y: number) => {
     if (!term || term.length > 60) return;
+    const my = ++glossSeq.current;
+    const cacheKey = `${term}\u0000${context}`;
+    const cached = glossCache.current.get(cacheKey);
+    if (cached) {
+      setGloss({ data: cached, error: null, x, y });
+      return;
+    }
     setGloss({ data: null, error: null, x, y });
     try {
       const data = await api.explainWord(term, context);
+      // 先缓存再看有没有被顶掉：钱已经花了，下次选同一个词就不用再付
+      if (glossCache.current.size >= 50) glossCache.current.clear();
+      glossCache.current.set(cacheKey, data);
+      if (my !== glossSeq.current) return;
       setGloss((current) => (current ? { ...current, data } : current));
     } catch (err) {
+      if (my !== glossSeq.current) return;
       setGloss((current) =>
         current ? { ...current, error: String(err).replace(/^Error:\s*/, "") } : current,
       );
@@ -99,8 +159,7 @@ export function LongTextView({
       const selection = window.getSelection();
       const term = selection?.toString().trim() ?? "";
       if (!term) return;
-      const context = selection?.anchorNode?.textContent?.slice(0, 400) ?? "";
-      void explain(term, context, event.clientX, event.clientY);
+      void explain(term, selectionContext(selection), event.clientX, event.clientY);
     },
     [explain],
   );
@@ -120,6 +179,7 @@ export function LongTextView({
         if (glossOpen.current && !event.isComposing && event.keyCode !== 229) {
           event.preventDefault();
           event.stopImmediatePropagation();
+          glossSeq.current += 1;
           setGloss(null);
         }
         return;
@@ -133,8 +193,7 @@ export function LongTextView({
       const rect = selection?.rangeCount
         ? selection.getRangeAt(0).getBoundingClientRect()
         : ({ left: 240, bottom: 240 } as DOMRect);
-      const context = selection?.anchorNode?.textContent?.slice(0, 400) ?? "";
-      void explain(term, context, rect.left, rect.bottom);
+      void explain(term, selectionContext(selection), rect.left, rect.bottom);
     };
 
     // 捕获阶段：保证排在 App 的冒泡监听之前，与挂载先后无关
@@ -144,7 +203,10 @@ export function LongTextView({
 
   // 点别处收起浮层（浮层内部的 mousedown 已 stopPropagation）
   useEffect(() => {
-    const close = () => setGloss(null);
+    const close = () => {
+      glossSeq.current += 1;
+      setGloss(null);
+    };
     window.addEventListener("mousedown", close);
     return () => window.removeEventListener("mousedown", close);
   }, []);
@@ -177,7 +239,7 @@ export function LongTextView({
     <div className="flex h-full min-h-0 gap-3">
       <Pane
         title="原文"
-        hint={checking ? "检查中…" : issues.length > 0 ? `${issues.length} 处标记` : `${source.length} 字符`}
+        hint={checking ? "检查中…" : issues.length > 0 && marks > 0 ? `${marks} 处标记` : `${source.length} 字符`}
         action={
           <div className="flex items-center gap-2">
             <button
@@ -226,7 +288,7 @@ export function LongTextView({
         onScroll={syncScroll("right")}
       >
         <div onMouseUp={onMouseUp}>
-          <Prose text={text} tone="target" />
+          <Prose text={text} tone="target" streaming={busy} />
         </div>
 
         {busy && <span className="ml-[1px] inline-block h-[1.1em] w-[2px] animate-pulse bg-acc align-middle" />}
@@ -358,9 +420,23 @@ function CopyButton({ label, onClick, disabled }: { label: string; onClick: () =
  * 按原文的结构渲染：空行 = 段落间隔，短行且无句末标点 = 小标题，`- `/`• ` = 列表。
  * 语法错误用虚线下划线 + 颜色双编码（不靠颜色单独表意），悬停看解释。
  */
-function Prose({ text, tone, issues = [] }: { text: string; tone: "source" | "target"; issues?: GrammarIssue[] }) {
+function Prose({
+  text,
+  tone,
+  issues = [],
+  streaming = false,
+}: {
+  text: string;
+  tone: "source" | "target";
+  issues?: GrammarIssue[];
+  /** 还在流式生成：最后一块没写完，不能先判成小标题 */
+  streaming?: boolean;
+}) {
   const color = tone === "source" ? "text-[#e6e1d8]" : "text-[#f6f3ed]";
   const blocks = text.split(/\n\s*\n/).filter((block) => block.trim().length > 0);
+  const openLast = lastBlockIsOpen(text, streaming);
+  // 每条语法问题只标一处：已经在前面的段落标过的，后面的段落不再标
+  const used = new Set<number>();
 
   return (
     <div className="space-y-3.5">
@@ -371,26 +447,30 @@ function Prose({ text, tone, issues = [] }: { text: string; tone: "source" | "ta
           return (
             <ul key={index} className={`list-disc space-y-1 pl-5 text-[15px] leading-[1.75] ${color}`}>
               {lines.map((line, item) => (
-                <li key={item}>{mark(line.replace(/^\s*[-*•]\s+/, ""), issues)}</li>
+                <li key={item}>{mark(line.replace(/^\s*[-*•]\s+/, ""), issues, used)}</li>
               ))}
             </ul>
           );
         }
 
         const trimmed = block.trim();
-        const isHeading = lines.length === 1 && trimmed.length <= 60 && !/[.!?。！？:：;；]$/.test(trimmed);
+        const isHeading =
+          lines.length === 1 &&
+          trimmed.length <= 60 &&
+          !/[.!?。！？:：;；]$/.test(trimmed) &&
+          !(openLast && index === blocks.length - 1);
 
         if (isHeading) {
           return (
             <h3 key={index} className="pt-1 font-serif text-[19px] font-semibold leading-snug text-paper">
-              {trimmed}
+              {mark(trimmed, issues, used)}
             </h3>
           );
         }
 
         return (
           <p key={index} className={`whitespace-pre-wrap text-[15px] leading-[1.75] ${color}`}>
-            {mark(block, issues)}
+            {mark(block, issues, used)}
           </p>
         );
       })}
@@ -398,41 +478,20 @@ function Prose({ text, tone, issues = [] }: { text: string; tone: "source" | "ta
   );
 }
 
-/** 把命中的错误片段包成虚线，其余原样输出。 */
-function mark(text: string, issues: GrammarIssue[]): React.ReactNode {
-  const hits = issues.filter((issue) => issue.fragment && text.includes(issue.fragment));
-  if (hits.length === 0) return text;
-
-  const nodes: React.ReactNode[] = [];
-  let rest = text;
-  let key = 0;
-
-  while (rest.length > 0) {
-    let at = -1;
-    let hit: GrammarIssue | null = null;
-    for (const issue of hits) {
-      const index = rest.indexOf(issue.fragment);
-      if (index >= 0 && (at < 0 || index < at)) {
-        at = index;
-        hit = issue;
-      }
-    }
-    if (!hit || at < 0) {
-      nodes.push(rest);
-      break;
-    }
-    if (at > 0) nodes.push(rest.slice(0, at));
-    nodes.push(
+/** 把命中的错误片段包成虚线，其余原样输出。命中规则见 reading.ts 的 splitMarked。 */
+function mark(text: string, issues: GrammarIssue[], used: Set<number>): React.ReactNode {
+  if (issues.length === 0) return text;
+  return splitMarked(text, issues, used).map((piece, key) =>
+    typeof piece === "string" ? (
+      piece
+    ) : (
       <span
-        key={`i${key++}`}
-        title={hit.explanation + (hit.replacement ? ` → ${hit.replacement}` : "")}
+        key={`i${key}`}
+        title={piece.issue.explanation + (piece.issue.replacement ? ` → ${piece.issue.replacement}` : "")}
         className="cursor-help underline decoration-[#ff6b4a] decoration-wavy decoration-2 underline-offset-[3px]"
       >
-        {hit.fragment}
-      </span>,
-    );
-    rest = rest.slice(at + hit.fragment.length);
-  }
-
-  return nodes;
+        {piece.text}
+      </span>
+    ),
+  );
 }

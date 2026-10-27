@@ -170,20 +170,22 @@ function ResizeGrip() {
     const handle = event.currentTarget;
     handle.setPointerCapture(event.pointerId);
 
-    const win = getCurrentWindow();
-    const [size, scale] = await Promise.all([win.innerSize(), win.scaleFactor()]);
-    const startWidth = size.width / scale;
-    const startHeight = size.height / scale;
     const startX = event.screenX;
     const startY = event.screenY;
 
+    // 监听器必须在 await 之前就挂上：量窗口尺寸是异步的，用户快速点一下就松手时，
+    // pointerup 发生在 await 期间——先 await 再挂监听的话，松手永远收不到，窗口会一直跟着鼠标走
+    let ended = false;
+    let measured: { width: number; height: number } | null = null;
     let frame = 0;
-    let nextWidth = startWidth;
-    let nextHeight = startHeight;
+    let nextWidth = 0;
+    let nextHeight = 0;
+    const win = getCurrentWindow();
 
     const onMove = (moveEvent: PointerEvent) => {
-      nextWidth = Math.max(MIN_WIDTH, Math.round(startWidth + moveEvent.screenX - startX));
-      nextHeight = Math.max(MIN_HEIGHT, Math.round(startHeight + moveEvent.screenY - startY));
+      if (!measured) return; // 还没量完起始尺寸，先不动
+      nextWidth = Math.max(MIN_WIDTH, Math.round(measured.width + moveEvent.screenX - startX));
+      nextHeight = Math.max(MIN_HEIGHT, Math.round(measured.height + moveEvent.screenY - startY));
       if (frame) return;
       frame = requestAnimationFrame(() => {
         frame = 0;
@@ -194,6 +196,7 @@ function ResizeGrip() {
     };
 
     const onEnd = () => {
+      ended = true;
       if (frame) cancelAnimationFrame(frame);
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onEnd);
@@ -206,6 +209,14 @@ function ResizeGrip() {
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onEnd);
     window.addEventListener("pointercancel", onEnd);
+
+    try {
+      const [size, scale] = await Promise.all([win.innerSize(), win.scaleFactor()]);
+      if (ended) return; // 量的时候已经松手了
+      measured = { width: size.width / scale, height: size.height / scale };
+    } catch {
+      onEnd(); // 量不出来就放弃这次拖动，别留着监听器
+    }
   };
 
   return (

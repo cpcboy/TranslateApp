@@ -141,8 +141,14 @@ export const useLookup = create<LookupState>((set, get) => ({
   },
 
   cancelLong: async () => {
+    // 已经结束了（「停止」按钮还没来得及消失就点中）：没什么可停的。
+    // 照常往下走会把一篇完整的译文标成「不完整」，还跳过语法检查
+    if (!get().longBusy) return;
+    // 先把「不完整」记上再通知后端：translate_text 要等后端看到取消位才返回，
+    // 这段空档里 longBusy 已经是 false。「不完整」没记上的话，界面会以为译文是完整的，
+    // 语法检查就会对着被放弃的译文白白发一次请求。后端返回的结果会覆盖它（同样是「你点了停止」）
+    set({ longBusy: false, longIncomplete: "你点了停止" });
     await api.cancelTranslate().catch(() => {});
-    set({ longBusy: false });
   },
 
   reset: () => {
