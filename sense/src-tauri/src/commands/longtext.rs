@@ -118,11 +118,12 @@ pub async fn translate_text(
 
     let emitter = app.clone();
     let rid = request_id.clone();
-    let outcome = openai_compat::stream_chat(
+    let outcome = openai_compat::stream_chat_adaptive(
         crate::client_for(&provider.base_url),
         &provider,
         key.as_deref(),
         &body,
+        reasoning.as_ref(),
         &mut move |delta: &str| {
             let _ = emitter.emit(
                 "sense://longtext-delta",

@@ -61,11 +61,12 @@ async fn ask(app: &AppHandle, system: &str, user: &str, max_tokens: u32) -> Resu
         max_tokens,
     );
 
-    let outcome = openai_compat::stream_chat(
+    let outcome = openai_compat::stream_chat_adaptive(
         crate::client_for(&provider.base_url),
         &provider,
         key.as_deref(),
         &body,
+        reasoning.as_ref(),
         &mut |_delta: &str| {},
         None,
     )

@@ -3,9 +3,6 @@
 //! 这里不解释模型输出、也不做字段校验——那是前端的 zod 的活。
 //! Rust 只负责：取 Key、发请求、转发增量、落缓存。
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -162,29 +159,13 @@ pub async fn lookup(
         reasoning.as_ref(),
         openai_compat::MAX_TOKENS,
     );
-    let plain_body = || {
-        openai_compat::build_body(
-            &provider.model,
-            system,
-            &user,
-            temperature,
-            None,
-            openai_compat::MAX_TOKENS,
-        )
-    };
-
     let request_id = req
         .request_id
         .unwrap_or_else(|| format!("req-{}", std::process::id()));
 
     let app_for_emit = app.clone();
     let request_for_emit = request_id.clone();
-    // 只要往前端推过一个字节，就不能再「去掉 reasoning 字段重发」——
-    // 重发的增量会接在同一段 buffer 后面，卡片里会出现两份义项。
-    let emitted = Arc::new(AtomicBool::new(false));
-    let emitted_for_delta = emitted.clone();
     let mut on_delta = move |chunk: &str| {
-        emitted_for_delta.store(true, Ordering::Relaxed);
         let _ = app_for_emit.emit(
             "sense://delta",
             DeltaEvent {
@@ -194,40 +175,22 @@ pub async fn lookup(
         );
     };
 
+    // 网关不认关思考字段（400）时，公共层会去掉字段重发，并记住这家不认
     let client = crate::client_for(&provider.base_url);
-    let outcome = match openai_compat::stream_chat(
+    let outcome = openai_compat::stream_chat_adaptive(
         client,
         &provider,
         api_key.as_deref(),
         &body,
+        reasoning.as_ref(),
         &mut on_delta,
         None,
     )
     .await
-    {
-        Ok(outcome) => outcome,
-        // 网关不认 reasoning 字段：去掉再来一次，别让用户看到 400。
-        // 前提是从没往前端吐过字，否则会把内容叠两遍。
-        Err(err)
-            if reasoning.is_some()
-                && !emitted.load(Ordering::Relaxed)
-                && openai_compat::is_bad_request(&err) =>
-        {
-            eprintln!("[sense] provider 不认关思考字段，去掉后重试");
-            openai_compat::stream_chat(
-                client,
-                &provider,
-                api_key.as_deref(),
-                &plain_body(),
-                &mut on_delta,
-                None,
-            )
-            .await
-            .map_err(|err| LookupError::from_chat(&err))?
-        }
-        Err(err) => return Err(LookupError::from_chat(&err)),
-    };
+    .map_err(|err| LookupError::from_chat(&err))?;
 
+    // 查过的词是用户内容：只在 debug 构建里打印，发布版的终端 / 日志里不留
+    #[cfg(debug_assertions)]
     println!(
         "[sense] lookup {word}: ttft={}ms total={}ms chars={} thinking={} finish={:?}",
         outcome.first_delta_ms,
@@ -244,22 +207,14 @@ pub async fn lookup(
             eprintln!("[sense] {err}");
         }
     } else {
-        // 记下长度与结尾：判断是「模型被中止」还是「解析丢了尾巴」
-        let tail: String = outcome
-            .text
-            .chars()
-            .rev()
-            .take(80)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        let line = format!(
-            "lookup {word}: len={} chunks={} finish={:?} tail={:?}",
-            outcome.text.chars().count(),
+        // 记下长度与结束原因：判断是「模型被中止」还是「解析丢了尾巴」。
+        // 词和输出结尾是用户内容，只有 debug 构建才写进去；发布版只留这些不含内容的数字
+        let line = incomplete_log_line(
+            &word,
+            &outcome.text,
             outcome.chunks,
-            outcome.finish_reason,
-            tail
+            outcome.finish_reason.as_deref(),
+            cfg!(debug_assertions),
         );
         eprintln!("[sense] 输出结构不完整 {line}");
         // 从访达启动时 stdout 看不到，落一份文件
@@ -284,6 +239,22 @@ pub async fn lookup(
         total_ms: outcome.total_ms,
         finish_reason: outcome.finish_reason,
     })
+}
+
+/// 输出不完整时写进 lookup.log 的那一行。`with_content` 为 false 时不含词和输出结尾。
+fn incomplete_log_line(
+    word: &str,
+    text: &str,
+    chunks: usize,
+    finish_reason: Option<&str>,
+    with_content: bool,
+) -> String {
+    let len = text.chars().count();
+    if !with_content {
+        return format!("lookup: len={len} chunks={chunks} finish={finish_reason:?}");
+    }
+    let tail: String = text.chars().rev().take(80).collect::<Vec<_>>().into_iter().rev().collect();
+    format!("lookup {word}: len={len} chunks={chunks} finish={finish_reason:?} tail={tail:?}")
 }
 
 /// Rust 侧只做最廉价的结构门：能解析成对象、九个顶层字段齐全、senses 非空。
@@ -354,6 +325,16 @@ mod tests {
 
         let full = r#"{"schema_version":1,"word":"charge","lang":"en","pronunciation":{"ipa":null,"pinyin":null},"pos":[],"frequency":{"zipf":null,"band":null},"senses":[{"rank":1}],"confusables":[],"notes":null}"#;
         assert!(looks_complete(full));
+    }
+
+    #[test]
+    fn release_log_line_carries_no_user_content() {
+        let line = incomplete_log_line("秘密词", "模型输出的结尾内容", 7, Some("length"), false);
+        assert!(!line.contains("秘密词") && !line.contains("结尾内容"), "{line}");
+        assert!(line.contains("len=") && line.contains("length"), "{line}");
+
+        let debug = incomplete_log_line("秘密词", "模型输出的结尾内容", 7, Some("length"), true);
+        assert!(debug.contains("秘密词") && debug.contains("结尾内容"), "{debug}");
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //!
 //! DeepSeek / Qwen / OpenRouter / Ollama 都吃这一套，差别只在 base_url 与 model。
 
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
@@ -89,12 +90,6 @@ impl ChatError {
             }
             ChatError::Empty => "模型返回了空内容。".to_string(),
         }
-    }
-
-    /// 只有限流和服务端错误值得重试。中途断开不算：那时增量已经推给前端，重来会叠两遍。
-    #[allow(dead_code)]
-    pub fn retryable(&self) -> bool {
-        matches!(self, ChatError::RateLimit | ChatError::Server(_) | ChatError::Timeout(_))
     }
 }
 
@@ -349,6 +344,97 @@ pub async fn stream_chat(
     })
 }
 
+/// 记住「这家网关不认关思考字段」的 (base_url, model)：之后直接不带，省掉每次一个 400 的往返。
+/// 只活在本次运行里——网关升级后重启应用就会重新试一次。
+static NO_REASONING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn reasoning_key(provider: &Provider) -> String {
+    format!("{}|{}", provider.base_url, provider.model)
+}
+
+fn reasoning_rejected_before(provider: &Provider) -> bool {
+    let key = reasoning_key(provider);
+    NO_REASONING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(&key)
+}
+
+fn remember_reasoning_rejected(provider: &Provider) {
+    let key = reasoning_key(provider);
+    let mut known = NO_REASONING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !known.contains(&key) {
+        known.push(key);
+    }
+}
+
+/// 把 body 顶层里「关思考」的那几个键拿掉。
+fn without_reasoning(body: &Value, reasoning: &Value) -> Value {
+    let mut plain = body.clone();
+    if let (Some(target), Some(fields)) = (plain.as_object_mut(), reasoning.as_object()) {
+        for key in fields.keys() {
+            target.remove(key);
+        }
+    }
+    plain
+}
+
+/// `stream_chat` + 「关思考」字段兜底，查词、长文、语法、划词、截屏都走这里。
+///
+/// 有的网关不认 `thinking` / `enable_thinking` / `reasoning` 之类的字段，会回 400。
+/// 这时去掉这些字段重发一次，而不是让用户看到 400。前提：
+/// - 只认真正的 HTTP 400。它在任何响应体之前到达，所以重发不会和已经推出去的增量叠成两份
+///   （流里的 error 事件是 `Server`，不会走到这里）；
+/// - 用户没在等待期间点「停止」；
+/// - 重发成功才记住「这家不认」。重发还是 400，说明问题不在这个字段上，下次照旧带上。
+///
+/// 已知不覆盖：回 422、或者在 200 的流里报「不认字段」的网关；以及与思考字段无关的 400
+/// （比如上下文太长）也会白白重发一次。
+pub async fn stream_chat_adaptive(
+    client: &reqwest::Client,
+    provider: &Provider,
+    api_key: Option<&str>,
+    body: &Value,
+    reasoning: Option<&Value>,
+    on_delta: &mut (dyn FnMut(&str) + Send),
+    cancel: Option<CancelCheck<'_>>,
+) -> Result<ChatOutcome, ChatError> {
+    let Some(extra) = reasoning else {
+        return stream_chat(client, provider, api_key, body, on_delta, cancel).await;
+    };
+
+    if reasoning_rejected_before(provider) {
+        let plain = without_reasoning(body, extra);
+        return stream_chat(client, provider, api_key, &plain, on_delta, cancel).await;
+    }
+
+    let first = stream_chat(client, provider, api_key, body, on_delta, cancel).await;
+    match first {
+        // 用户在这一来一回的 400 期间点了停止：不重发，也不报「请求被拒绝」，按「已停止」返回（和 stream_chat 的约定一致）
+        Err(err) if is_bad_request(&err) && cancel.is_some_and(|stopped| stopped()) => Ok(ChatOutcome {
+            text: String::new(),
+            first_delta_ms: 0,
+            total_ms: 0,
+            finish_reason: None,
+            chunks: 0,
+            done: false,
+            cancelled: true,
+        }),
+        Err(err) if is_bad_request(&err) => {
+            eprintln!("[sense] provider 不认关思考字段，去掉后重试");
+            let plain = without_reasoning(body, extra);
+            let retried = stream_chat(client, provider, api_key, &plain, on_delta, cancel).await;
+            if retried.is_ok() {
+                remember_reasoning_rejected(provider);
+            }
+            retried
+        }
+        other => other,
+    }
+}
+
 /// 把服务端返回的详情压成一行、限长：不把整页 HTML 塞进卡片。
 fn sanitize_detail(body: &str) -> String {
     body.split_whitespace()
@@ -451,11 +537,11 @@ mod tests {
     }
 
     #[test]
-    fn auth_errors_are_not_retryable() {
-        assert!(!map_status(401, "").retryable());
-        assert!(!map_status(403, "").retryable());
-        assert!(map_status(429, "").retryable());
-        assert!(map_status(503, "").retryable());
+    fn statuses_map_to_the_right_errors() {
+        assert!(matches!(map_status(401, ""), ChatError::Auth));
+        assert!(matches!(map_status(403, ""), ChatError::Auth));
+        assert!(matches!(map_status(429, ""), ChatError::RateLimit));
+        assert!(matches!(map_status(503, ""), ChatError::Server(_)));
     }
 
     #[test]
@@ -476,14 +562,15 @@ mod tests {
     }
 
     /// 把请求读完整（头 + Content-Length 指定的 body），否则关连接时会发 RST，测试会变得不稳。
-    fn read_request(socket: &mut std::net::TcpStream) {
+    /// 返回整个请求的文本，便于断言发了什么。
+    fn read_request_text(socket: &mut std::net::TcpStream) -> String {
         use std::io::Read;
         let mut data = Vec::new();
         let mut buf = [0u8; 4096];
         loop {
             let read = socket.read(&mut buf).unwrap_or(0);
             if read == 0 {
-                return;
+                break;
             }
             data.extend_from_slice(&buf[..read]);
             let Some(end) = data.windows(4).position(|window| window == b"\r\n\r\n") else {
@@ -496,9 +583,14 @@ mod tests {
                 .and_then(|value| value.trim().parse::<usize>().ok())
                 .unwrap_or(0);
             if data.len() >= end + 4 + length {
-                return;
+                break;
             }
         }
+        String::from_utf8_lossy(&data).into_owned()
+    }
+
+    fn read_request(socket: &mut std::net::TcpStream) {
+        let _ = read_request_text(socket);
     }
 
     /// 只服务一次的本地 SSE 服务（chunked 编码），按给定间隔逐条写出增量；
@@ -596,6 +688,114 @@ mod tests {
         assert!(matches!(err, ChatError::Interrupted), "应为 Interrupted，实际 {err:?}");
         assert!(err.message().starts_with("传输中途断开"), "{}", err.message());
         assert_eq!(seen, "ab", "断开前收到的增量照常推给前端");
+    }
+
+    /// 每个连接都读完整个请求并记下来；请求体里有 `reject` 就回 400，否则回一条正常的 SSE。
+    /// 全部回应都带 `Connection: close`，保证重发走新连接，服务端好区分。
+    fn serve_rejecting(reject: &'static str, connections: usize) -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定端口");
+        let port = listener.local_addr().expect("取端口").port();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        std::thread::spawn(move || {
+            for _ in 0..connections {
+                let Ok((mut socket, _)) = listener.accept() else { return };
+                let request = read_request_text(&mut socket);
+                let rejected = request.contains(reject);
+                recorded.lock().unwrap().push(request);
+                if rejected {
+                    let body = r#"{"error":{"message":"unknown field"}}"#;
+                    let _ = socket.write_all(
+                        format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    );
+                } else {
+                    let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+                    let _ = socket.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{payload}",
+                            payload.len()
+                        )
+                        .as_bytes(),
+                    );
+                }
+                let _ = socket.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}/v1"), seen)
+    }
+
+    fn thinking_off() -> Value {
+        json!({ "thinking": { "type": "disabled" } })
+    }
+
+    async fn ask_adaptive(base_url: &str) -> Result<ChatOutcome, ChatError> {
+        let client = reqwest::Client::builder().no_proxy().build().expect("构建客户端");
+        let extra = thinking_off();
+        let body = build_body("m", "sys", "user", 0.3, Some(&extra), 100);
+        stream_chat_adaptive(
+            &client,
+            &test_provider(base_url),
+            None,
+            &body,
+            Some(&extra),
+            &mut |_delta: &str| {},
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn rejected_reasoning_field_is_dropped_and_remembered() {
+        let (base_url, seen) = serve_rejecting("thinking", 3);
+
+        // 第一次：带字段 → 400 → 去掉字段重发 → 成功
+        let outcome = ask_adaptive(&base_url).await.expect("去掉字段后应该成功");
+        assert_eq!(outcome.text, "ok");
+        {
+            let requests = seen.lock().unwrap();
+            assert_eq!(requests.len(), 2, "400 之后重发一次");
+            assert!(requests[0].contains("thinking"));
+            assert!(!requests[1].contains("thinking"), "重发不能再带关思考字段");
+            assert!(requests[1].contains("\"max_tokens\":100"), "其余字段原样保留");
+        }
+
+        // 第二次：已经记住这家不认，直接不带，不再多吃一个 400
+        ask_adaptive(&base_url).await.expect("第二次直接成功");
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 3, "第二次只发了一个请求");
+        assert!(!requests[2].contains("thinking"));
+    }
+
+    #[tokio::test]
+    async fn a_400_that_is_not_about_reasoning_is_not_remembered() {
+        // 服务端对什么请求都回 400（rejected 命中 "model"）：问题不在 thinking 上
+        let (base_url, seen) = serve_rejecting("model", 4);
+
+        let err = ask_adaptive(&base_url).await.expect_err("两次都是 400");
+        assert!(matches!(err, ChatError::BadRequest(_)), "实际 {err:?}");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+
+        // 重发也失败，不能记成「这家不认关思考」：下次照旧带上字段
+        ask_adaptive(&base_url).await.expect_err("仍然是 400");
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[2].contains("thinking"), "没被记住，第三个请求应当仍带字段");
+    }
+
+    #[test]
+    fn without_reasoning_only_removes_those_keys() {
+        let extra = thinking_off();
+        let body = build_body("m", "sys", "user", 0.3, Some(&extra), 100);
+        let plain = without_reasoning(&body, &extra);
+        assert!(plain.get("thinking").is_none());
+        assert_eq!(plain["model"], json!("m"));
+        assert_eq!(plain["messages"], body["messages"]);
+        assert_eq!(body["thinking"]["type"], json!("disabled"), "原 body 不被改动");
     }
 
     #[test]
