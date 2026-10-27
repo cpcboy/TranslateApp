@@ -105,11 +105,23 @@ export function LongTextView({
     [explain],
   );
 
+  // Esc 处理器要知道浮层开没开，但不想每次开关都重新挂监听
+  const glossOpen = useRef(false);
+  useEffect(() => {
+    glossOpen.current = gloss !== null;
+  }, [gloss]);
+
   // 键盘可达：选中后 ⌘⇧D 查词（鼠标不是唯一入口）
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
-        setGloss(null);
+        // 浮层开着时这个 Esc 只关浮层：不能再传到 App，让它把整篇译文一起退掉。
+        // 输入法组字时的 Esc 是取消候选词，不拦。
+        if (glossOpen.current && !event.isComposing && event.keyCode !== 229) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          setGloss(null);
+        }
         return;
       }
       if (!(event.metaKey && event.shiftKey) || event.key.toLowerCase() !== "d") return;
@@ -125,8 +137,9 @@ export function LongTextView({
       void explain(term, context, rect.left, rect.bottom);
     };
 
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    // 捕获阶段：保证排在 App 的冒泡监听之前，与挂载先后无关
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
   }, [explain]);
 
   // 点别处收起浮层（浮层内部的 mousedown 已 stopPropagation）
