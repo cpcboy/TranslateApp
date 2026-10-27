@@ -53,8 +53,11 @@ export type OverlayBlock = {
   translated: boolean;
 };
 
-/** 覆盖层的全部内容：翻译失败时 error 给出原因，blocks 里是识别出的原文 */
-export type CaptureView = { blocks: OverlayBlock[]; error: string | null };
+/**
+ * 覆盖层的全部内容：翻译失败时 error 给出原因，blocks 里是识别出的原文；
+ * notice 是翻译成功时要补充的一句话（比如译文没能对准原文的位置）。
+ */
+export type CaptureView = { blocks: OverlayBlock[]; error: string | null; notice: string | null };
 
 export type LookupArgs = {
   word: string;
@@ -89,9 +92,6 @@ export const api = {
   setHotkey: (kind: string, spec: string) =>
     invoke<HotkeyView>("set_hotkey", { kind, spec }),
   startCapture: () => invoke<void>("start_capture"),
-  cancelCapture: () => invoke<void>("cancel_capture"),
-  finishCapture: (x: number, y: number, w: number, h: number) =>
-    invoke<number>("finish_capture", { x, y, w, h }),
   captureBlocks: () => invoke<CaptureView>("capture_blocks"),
   closeOverlay: () => invoke<void>("close_overlay"),
   translateText: (text: string, requestId: string) =>
