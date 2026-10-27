@@ -3,7 +3,7 @@
 //! 不切块。切块会让第二段丢失第一段的指代和术语，译文与原文意思偏；
 //! 代价是输出更长，所以上限放到 8192，并全程流式。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -15,20 +15,50 @@ use crate::secrets;
 /// 长文的输出上限。一篇 3000 词的文章译文约 8000 token。
 const LONG_MAX_TOKENS: u32 = 8192;
 
-/// 当前这次长文翻译是否被用户取消。全局只有一个长文请求，够用。
-static CANCELLED: AtomicBool = AtomicBool::new(false);
+/// 每次长文翻译领一个编号；「停止」把当前及更早的编号都标成取消。
+///
+/// 以前是一个全局布尔：下一次翻译一开始就把它复位，上一条流可能再也停不下来，
+/// 而长文的时限现在有十几分钟，孤儿流会一直计费。
+static LATEST: AtomicU64 = AtomicU64::new(0);
+static CANCELLED_UPTO: AtomicU64 = AtomicU64::new(0);
 
-/// 用户点「停止」。
-#[tauri::command]
-pub fn cancel_translate() {
-    CANCELLED.store(true, Ordering::Relaxed);
+fn begin() -> u64 {
+    LATEST.fetch_add(1, Ordering::SeqCst) + 1
 }
 
-/// 长文结果：除了译文，还要告诉前端有没有被输出上限截断。
+fn is_cancelled(id: u64) -> bool {
+    CANCELLED_UPTO.load(Ordering::SeqCst) >= id
+}
+
+/// 用户点「停止」，或离开阅读视图、开始新的查询。
+#[tauri::command]
+pub fn cancel_translate() {
+    CANCELLED_UPTO.store(LATEST.load(Ordering::SeqCst), Ordering::SeqCst);
+}
+
+/// 长文结果：除了译文，还要告诉前端它是不是完整的。
 #[derive(Clone, Serialize)]
 pub struct LongTextResult {
     pub text: String,
+    /// 撞到输出上限（finish_reason = length）。
     pub truncated: bool,
+    /// 其它没有正常写完的原因：被停止、被内容策略中止、没收到结束标记……正常结束为 None。
+    pub incomplete: Option<String>,
+}
+
+/// 结束方式 → 「译文不完整」的原因。正常结束（stop，或只收到 [DONE]）返回 None；
+/// length 由 `truncated` 单独提示，这里不重复。
+fn incomplete_reason(finish_reason: Option<&str>, done: bool, cancelled: bool) -> Option<String> {
+    if cancelled {
+        return Some("你点了停止".to_string());
+    }
+    match finish_reason {
+        Some("stop") | Some("length") => None,
+        Some("content_filter") => Some("模型服务以「内容策略」中止了输出".to_string()),
+        Some(other) => Some(format!("模型服务以「{other}」结束了输出")),
+        None if done => None,
+        None => Some("没有收到结束标记，连接可能提前关闭了".to_string()),
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -54,6 +84,10 @@ pub async fn translate_text(
     if source.is_empty() {
         return Err("还没有内容".to_string());
     }
+
+    // 编号要在读钥匙串之前领：用户在等钥匙串时点的「停止」，也得算到这一条头上
+    let id = begin();
+    let stopped = move || is_cancelled(id);
 
     let provider = provider_registry::active(&app)?;
     let key = if provider.requires_key {
@@ -82,8 +116,6 @@ pub async fn translate_text(
         LONG_MAX_TOKENS,
     );
 
-    CANCELLED.store(false, Ordering::Relaxed);
-
     let emitter = app.clone();
     let rid = request_id.clone();
     let outcome = openai_compat::stream_chat(
@@ -100,26 +132,46 @@ pub async fn translate_text(
                 },
             );
         },
-        Some(&CANCELLED),
+        Some(&stopped),
     )
     .await
     .map_err(|err| err.message())?;
 
-    let truncated = outcome
-        .finish_reason
-        .as_deref()
-        .map(|reason| reason == "length")
-        .unwrap_or(false);
-
+    let finish_reason = outcome.finish_reason.as_deref();
     Ok(LongTextResult {
+        truncated: finish_reason == Some("length"),
+        incomplete: incomplete_reason(finish_reason, outcome.done, outcome.cancelled),
         text: outcome.text,
-        truncated,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_abnormal_ending_is_reported() {
+        assert_eq!(incomplete_reason(Some("stop"), true, false), None);
+        assert_eq!(incomplete_reason(None, true, false), None, "只有 [DONE] 也算正常结束");
+        assert_eq!(incomplete_reason(Some("length"), false, false), None, "length 另有 truncated");
+        let filtered = incomplete_reason(Some("content_filter"), true, false).expect("要提示");
+        assert!(filtered.contains("内容策略"), "{filtered}");
+        let other = incomplete_reason(Some("insufficient_system_resource"), true, false).expect("要提示");
+        assert!(other.contains("insufficient_system_resource"), "{other}");
+        let eof = incomplete_reason(None, false, false).expect("要提示");
+        assert!(eof.contains("结束标记"), "{eof}");
+        let stopped = incomplete_reason(Some("stop"), true, true).expect("要提示");
+        assert!(stopped.contains("停止"), "{stopped}");
+    }
+
+    #[test]
+    fn stop_only_cancels_requests_already_started() {
+        let first = begin();
+        cancel_translate();
+        let second = begin();
+        assert!(is_cancelled(first), "点停止之前开始的那条要停");
+        assert!(!is_cancelled(second), "之后开始的新翻译不受影响");
+    }
 
     #[test]
     fn target_language_follows_source() {

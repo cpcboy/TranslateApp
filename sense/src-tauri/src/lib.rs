@@ -54,6 +54,7 @@ pub fn client_for(base_url: &str) -> &'static reqwest::Client {
         reqwest::Client::builder()
             .no_proxy()
             .connect_timeout(Duration::from_secs(5))
+            // 同 http_client：只管非流式请求，流式请求单独放宽
             .timeout(Duration::from_secs(180))
             .pool_idle_timeout(Duration::from_secs(60))
             .build()
@@ -64,7 +65,8 @@ pub fn client_for(base_url: &str) -> &'static reqwest::Client {
 pub fn http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
-            // 连接要快，整条流给足时间；卡住由 openai_compat 里的分片超时兜底。
+            // 连接要快。180 秒总时限只管非流式请求（/models 等）：reqwest 的 timeout 管到
+            // 响应体读完，流式请求会按 max_tokens 单独放宽，见 openai_compat::stream_deadline。
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(180))
             // 查词是一次一次来的，连接必须留着复用：每次重新握手要多 100–300ms。

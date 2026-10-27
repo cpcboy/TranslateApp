@@ -10,10 +10,31 @@ use serde_json::{json, Value};
 use crate::providers::Provider;
 use crate::stream::sse::SseDecoder;
 
-/// 首字节超时：模型 8 秒不吐字就认为卡住。
+/// 首字节超时：开始收流后 8 秒还没吐出第一段内容，就认为卡住。
 const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(8);
-/// 整条流的兜底超时。
-const STREAM_TIMEOUT: Duration = Duration::from_secs(90);
+/// 分片之间的空闲超时：流已经开始后，连续这么久没有新分片就认为卡住。
+/// 它不是整条流的时限，整条流的上限见 `stream_deadline`。
+const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// 等服务端开始响应（返回响应头）的时限，和以前客户端上的总时限一致。
+const HEADERS_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// 整条流式请求的时限。
+///
+/// 不能沿用客户端上的 180 秒总时限：reqwest 的 `timeout` 管到响应体读完，
+/// 长文 8192 token 按 30–60 token/s 要生成 140–270 秒，会被拦腰掐断。
+/// 查词、截屏、语法、划词（max_tokens ≤ 4096）仍是 180 秒，与以前一致；
+/// 只有更长的输出按最慢 10 token/s 估算、再留 60 秒。卡住的流由首字节与空闲超时兜底。
+pub fn stream_deadline(max_tokens: u64) -> Duration {
+    if max_tokens <= u64::from(MAX_TOKENS) {
+        Duration::from_secs(180)
+    } else {
+        Duration::from_secs(max_tokens / 10 + 60)
+    }
+}
+
+/// 取消检查：返回 true 表示用户点了「停止」。每收到一片就问一次。
+pub type CancelCheck<'a> = &'a (dyn Fn() -> bool + Sync);
 
 #[derive(Debug, Clone)]
 pub struct ChatOutcome {
@@ -24,6 +45,10 @@ pub struct ChatOutcome {
     pub finish_reason: Option<String>,
     /// 收到的 SSE 分片数。用来区分「服务端只发了这么多」和「我们解析丢了」。
     pub chunks: usize,
+    /// 收到了 `[DONE]`。没有 finish_reason 也没有它，说明连接是提前关的。
+    pub done: bool,
+    /// 因为用户点了「停止」才结束。
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -37,10 +62,13 @@ pub enum ChatError {
     BadRequest(String),
     /// 服务端错误（5xx）或其它非 2xx。
     Server(String),
-    /// 首字节超时。
-    Timeout,
-    /// 网络不可达。
+    /// 超时。附带是哪一段超时，直接进文案（以前一律写「8 秒没回」，连接超时也这么说）。
+    Timeout(String),
+    /// 网络不可达（还没开始收流）。
     Network(String),
+    /// 已经开始收流、中途断开。和「连不上」分开：长文据此提示「译文不完整」。
+    /// 底层原因在出错处直接打进日志，这里不再携带。
+    Interrupted,
     /// 流里没有拿到任何内容。
     Empty,
 }
@@ -53,16 +81,20 @@ impl ChatError {
             ChatError::RateLimit => "请求太频繁，歇几秒再试。".to_string(),
             ChatError::BadRequest(detail) => format!("请求被模型服务拒绝（HTTP 400）：{detail}"),
             ChatError::Server(detail) => format!("模型服务出错了：{detail}"),
-            ChatError::Timeout => "模型 8 秒没回。检查网络，或换个模型。".to_string(),
+            ChatError::Timeout(stage) => format!("模型响应超时：{stage}。检查网络，或换个模型。"),
             ChatError::Network(detail) => format!("连不上模型服务：{detail}"),
+            // 底层原因（hyper 的英文报错）只进日志，用户看不懂也帮不上忙
+            ChatError::Interrupted => {
+                "传输中途断开，连接在回复写完前断了（可能是网络抖动或服务端掐断）".to_string()
+            }
             ChatError::Empty => "模型返回了空内容。".to_string(),
         }
     }
 
-    /// 只有限流和服务端错误值得重试。
+    /// 只有限流和服务端错误值得重试。中途断开不算：那时增量已经推给前端，重来会叠两遍。
     #[allow(dead_code)]
     pub fn retryable(&self) -> bool {
-        matches!(self, ChatError::RateLimit | ChatError::Server(_) | ChatError::Timeout)
+        matches!(self, ChatError::RateLimit | ChatError::Server(_) | ChatError::Timeout(_))
     }
 }
 
@@ -139,26 +171,38 @@ pub async fn stream_chat(
     api_key: Option<&str>,
     body: &Value,
     on_delta: &mut (dyn FnMut(&str) + Send),
-    cancel: Option<&std::sync::atomic::AtomicBool>,
+    cancel: Option<CancelCheck<'_>>,
 ) -> Result<ChatOutcome, ChatError> {
     let url = format!(
         "{}/chat/completions",
         provider.base_url.trim_end_matches('/')
     );
 
-    let mut request = client.post(&url).json(body);
+    // 按本次的 max_tokens 单独设时限，覆盖客户端上那个只适合非流式请求的 180 秒
+    let max_tokens = body
+        .get("max_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::from(MAX_TOKENS));
+    let deadline = stream_deadline(max_tokens);
+    let mut request = client.post(&url).json(body).timeout(deadline);
     if let Some(key) = api_key {
         request = request.bearer_auth(key);
     }
 
     let started = Instant::now();
-    let response = request.send().await.map_err(|err| {
-        if err.is_timeout() {
-            ChatError::Timeout
-        } else {
-            ChatError::Network(err.to_string())
-        }
-    })?;
+    // 等响应头单独限 180 秒：长文的整条时限放宽到十几分钟，不能让「服务端一直不响应」也等那么久
+    let response = tokio::time::timeout(HEADERS_TIMEOUT, request.send())
+        .await
+        .map_err(|_| {
+            ChatError::Timeout(format!("{} 秒内服务端没有开始响应", HEADERS_TIMEOUT.as_secs()))
+        })?
+        .map_err(|err| {
+            if err.is_timeout() {
+                ChatError::Timeout("建立连接或等待服务端响应超时".to_string())
+            } else {
+                ChatError::Network(err.to_string())
+            }
+        })?;
 
     let status = response.status();
     if !status.is_success() {
@@ -172,29 +216,48 @@ pub async fn stream_chat(
     let mut first_delta_ms: Option<u128> = None;
     let mut finish_reason: Option<String> = None;
     let mut chunks = 0usize;
+    let mut done = false;
+    let mut cancelled = false;
 
     loop {
         let next = if first_delta_ms.is_none() {
             tokio::time::timeout(FIRST_BYTE_TIMEOUT, stream.next())
                 .await
-                .map_err(|_| ChatError::Timeout)?
+                .map_err(|_| {
+                    ChatError::Timeout(format!(
+                        "{} 秒内没有收到第一段内容",
+                        FIRST_BYTE_TIMEOUT.as_secs()
+                    ))
+                })?
         } else {
-            tokio::time::timeout(STREAM_TIMEOUT, stream.next())
+            tokio::time::timeout(IDLE_TIMEOUT, stream.next())
                 .await
-                .map_err(|_| ChatError::Timeout)?
+                .map_err(|_| {
+                    ChatError::Timeout(format!("连续 {} 秒没有新内容", IDLE_TIMEOUT.as_secs()))
+                })?
         };
 
         // 用户点了「停止」：保留已经收到的部分，不再等后续分片
-        if cancel.map(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) == Some(true) {
+        if cancel.is_some_and(|stopped| stopped()) {
+            cancelled = true;
             break;
         }
 
         let Some(chunk) = next else { break };
-        let chunk = chunk.map_err(|err| ChatError::Network(err.to_string()))?;
+        let chunk = chunk.map_err(|err| {
+            if err.is_timeout() {
+                ChatError::Timeout(format!("整条回复超过 {} 秒", deadline.as_secs()))
+            } else {
+                // 已经开始收流，这时出错不是「连不上」，是中途断开；原始原因留在日志里
+                eprintln!("[sense] 流中途断开：{err:?}");
+                ChatError::Interrupted
+            }
+        })?;
 
         for payload in decoder.push(&chunk) {
             chunks += 1;
             if payload.trim() == "[DONE]" {
+                done = true;
                 continue;
             }
             let Ok(value) = serde_json::from_str::<Value>(&payload) else {
@@ -242,7 +305,17 @@ pub async fn stream_chat(
     }
 
     for payload in decoder.finish() {
+        if payload.trim() == "[DONE]" {
+            done = true;
+            continue;
+        }
         if let Ok(value) = serde_json::from_str::<Value>(&payload) {
+            if let Some(reason) = value
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+            {
+                finish_reason = Some(reason.to_string());
+            }
             if let Some(delta) = value
                 .pointer("/choices/0/delta/content")
                 .and_then(Value::as_str)
@@ -254,8 +327,15 @@ pub async fn stream_chat(
         }
     }
 
-    if text.trim().is_empty() {
-        return Err(ChatError::Empty);
+    // 用户在第一个字之前就点了停止：这是「已停止」，不是「模型返回了空内容」
+    if text.trim().is_empty() && !cancelled {
+        // 一个字都没有，但服务端给了结束原因（比如 content_filter）：把原因说出来
+        return Err(match finish_reason.as_deref() {
+            Some(reason) if reason != "stop" => {
+                ChatError::Server(format!("没有输出任何内容就结束了（{reason}）"))
+            }
+            _ => ChatError::Empty,
+        });
     }
 
     Ok(ChatOutcome {
@@ -264,6 +344,8 @@ pub async fn stream_chat(
         total_ms: started.elapsed().as_millis(),
         finish_reason,
         chunks,
+        done,
+        cancelled,
     })
 }
 
@@ -374,6 +456,146 @@ mod tests {
         assert!(!map_status(403, "").retryable());
         assert!(map_status(429, "").retryable());
         assert!(map_status(503, "").retryable());
+    }
+
+    #[test]
+    fn stream_deadline_only_extends_long_outputs() {
+        assert_eq!(stream_deadline(600), Duration::from_secs(180), "划词与以前一致");
+        assert_eq!(stream_deadline(4096), Duration::from_secs(180), "查词、截屏与以前一致");
+        assert_eq!(stream_deadline(8192), Duration::from_secs(879), "长文要给足十几分钟");
+    }
+
+    fn test_provider(base_url: &str) -> Provider {
+        Provider {
+            id: "test".into(),
+            label: "test".into(),
+            base_url: base_url.into(),
+            model: "m".into(),
+            requires_key: false,
+        }
+    }
+
+    /// 把请求读完整（头 + Content-Length 指定的 body），否则关连接时会发 RST，测试会变得不稳。
+    fn read_request(socket: &mut std::net::TcpStream) {
+        use std::io::Read;
+        let mut data = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let read = socket.read(&mut buf).unwrap_or(0);
+            if read == 0 {
+                return;
+            }
+            data.extend_from_slice(&buf[..read]);
+            let Some(end) = data.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&data[..end]).to_ascii_lowercase();
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if data.len() >= end + 4 + length {
+                return;
+            }
+        }
+    }
+
+    /// 只服务一次的本地 SSE 服务（chunked 编码），按给定间隔逐条写出增量；
+    /// 事件写成 `[DONE]` 时原样发出结束标记。
+    /// `finish` 为 false 时不写结束分片就断开，模拟流被中途掐断。
+    fn serve_sse(events: Vec<&'static str>, gap: Duration, finish: bool) -> String {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定端口");
+        let port = listener.local_addr().expect("取端口").port();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("接受连接");
+            read_request(&mut socket);
+            let _ = socket.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+            );
+            for event in events {
+                let payload = if event == "[DONE]" {
+                    "data: [DONE]\n\n".to_string()
+                } else {
+                    format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{event}\"}}}}]}}\n\n")
+                };
+                let _ = socket.write_all(format!("{:x}\r\n{payload}\r\n", payload.len()).as_bytes());
+                let _ = socket.flush();
+                std::thread::sleep(gap);
+            }
+            if finish {
+                let _ = socket.write_all(b"0\r\n\r\n");
+            }
+        });
+        format!("http://127.0.0.1:{port}/v1")
+    }
+
+    #[tokio::test]
+    async fn stream_is_not_cut_by_client_total_timeout() {
+        // 客户端总时限 400ms，整条流要 ~900ms：修之前就是在这里被拦腰掐断
+        let base_url = serve_sse(vec!["a", "b", "c", "d", "e", "f"], Duration::from_millis(150), true);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(400))
+            .build()
+            .expect("构建客户端");
+        let body = build_body("m", "sys", "user", 0.3, None, 100);
+        let mut seen = String::new();
+        let outcome = stream_chat(
+            &client,
+            &test_provider(&base_url),
+            None,
+            &body,
+            &mut |delta: &str| seen.push_str(delta),
+            None,
+        )
+        .await
+        .expect("流式请求要用自己的时限，不能被客户端的总时限掐断");
+        assert_eq!(outcome.text, "abcdef");
+        assert_eq!(seen, "abcdef");
+        assert!(!outcome.done, "没发 [DONE] 就不能算收到了结束标记");
+        assert!(!outcome.cancelled);
+    }
+
+    #[tokio::test]
+    async fn done_marker_is_recorded() {
+        let base_url = serve_sse(vec!["a", "[DONE]"], Duration::from_millis(10), true);
+        let client = reqwest::Client::builder().no_proxy().build().expect("构建客户端");
+        let body = build_body("m", "sys", "user", 0.3, None, 100);
+        let outcome = stream_chat(
+            &client,
+            &test_provider(&base_url),
+            None,
+            &body,
+            &mut |_delta: &str| {},
+            None,
+        )
+        .await
+        .expect("正常结束");
+        assert!(outcome.done);
+        assert_eq!(outcome.text, "a");
+    }
+
+    #[tokio::test]
+    async fn dropped_stream_is_interrupted_not_unreachable() {
+        let base_url = serve_sse(vec!["a", "b"], Duration::from_millis(20), false);
+        let client = reqwest::Client::builder().no_proxy().build().expect("构建客户端");
+        let body = build_body("m", "sys", "user", 0.3, None, 100);
+        let mut seen = String::new();
+        let err = stream_chat(
+            &client,
+            &test_provider(&base_url),
+            None,
+            &body,
+            &mut |delta: &str| seen.push_str(delta),
+            None,
+        )
+        .await
+        .expect_err("中途断开必须报错，不能当成正常结束");
+        assert!(matches!(err, ChatError::Interrupted), "应为 Interrupted，实际 {err:?}");
+        assert!(err.message().starts_with("传输中途断开"), "{}", err.message());
+        assert_eq!(seen, "ab", "断开前收到的增量照常推给前端");
     }
 
     #[test]

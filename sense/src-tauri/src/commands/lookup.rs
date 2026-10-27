@@ -65,8 +65,10 @@ impl LookupError {
             ChatError::Auth => ("auth", err.message()),
             ChatError::RateLimit => ("rate_limit", err.message()),
             ChatError::Server(_) | ChatError::BadRequest(_) => ("server", err.message()),
-            ChatError::Timeout => ("timeout", err.message()),
+            ChatError::Timeout(_) => ("timeout", err.message()),
             ChatError::Network(_) => ("network", err.message()),
+            // 单独一个 code：卡片标题不能写「连不上」，明明已经连上、只是中途断了
+            ChatError::Interrupted => ("interrupted", err.message()),
             ChatError::Empty => ("empty", err.message()),
         };
         Self::new(code, message)
@@ -361,6 +363,13 @@ mod tests {
             LookupError::from_chat(&ChatError::RateLimit).code,
             "rate_limit"
         );
-        assert_eq!(LookupError::from_chat(&ChatError::Timeout).code, "timeout");
+        assert_eq!(
+            LookupError::from_chat(&ChatError::Timeout("连续 90 秒没有新内容".into())).code,
+            "timeout"
+        );
+        assert_eq!(
+            LookupError::from_chat(&ChatError::Interrupted).code,
+            "interrupted"
+        );
     }
 }

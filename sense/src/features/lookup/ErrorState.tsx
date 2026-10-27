@@ -6,6 +6,7 @@ const TITLES: Record<string, string> = {
   rate_limit: "请求太频繁",
   timeout: "模型没回",
   network: "连不上",
+  interrupted: "传输中断",
   server: "模型服务出错",
   empty: "模型返回空内容",
   invalid_json: "返回格式不对",
