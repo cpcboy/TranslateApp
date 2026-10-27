@@ -84,7 +84,10 @@ export const api = {
   captureBlocks: () => invoke<OverlayBlock[]>("capture_blocks"),
   closeOverlay: () => invoke<void>("close_overlay"),
   translateText: (text: string, requestId: string) =>
-    invoke<{ text: string; truncated: boolean }>("translate_text", { text, requestId }),
+    invoke<{ text: string; truncated: boolean; incomplete: string | null }>("translate_text", {
+      text,
+      requestId,
+    }),
   cancelTranslate: () => invoke<void>("cancel_translate"),
   checkGrammar: (text: string) => invoke<GrammarIssue[]>("check_grammar", { text }),
   explainWord: (term: string, context: string) =>

@@ -30,6 +30,7 @@ export function LongTextView({
   text,
   busy,
   truncated,
+  incomplete,
   error,
   onStop,
   onRetry,
@@ -39,6 +40,8 @@ export function LongTextView({
   text: string;
   busy: boolean;
   truncated: boolean;
+  /** 没有正常写完的原因（被停止、内容策略、没收到结束标记……）；完整时为 null */
+  incomplete: string | null;
   error: string | null;
   onStop: () => void;
   onRetry: () => void;
@@ -54,10 +57,10 @@ export function LongTextView({
   const endRef = useRef<HTMLDivElement>(null);
   const checkedFor = useRef<string>("");
 
-  // 流式时右栏自动跟到底
+  // 流式时右栏自动跟到底；没写完时也滚到底，让「不完整」提示一眼可见
   useEffect(() => {
-    if (busy) endRef.current?.scrollIntoView({ block: "end" });
-  }, [text, busy]);
+    if (busy || ((error || incomplete) && text)) endRef.current?.scrollIntoView({ block: "end" });
+  }, [text, busy, error, incomplete]);
 
   // 语法检查放在译文之后（B 方案：先出译文，波浪线后到）
   useEffect(() => {
@@ -187,7 +190,7 @@ export function LongTextView({
 
       <Pane
         title="译文"
-        hint={busy ? "生成中…" : text ? `${text.length} 字符` : ""}
+        hint={busy ? "生成中…" : text ? `${error || incomplete ? "不完整 · " : ""}${text.length} 字符` : ""}
         action={
           <div className="flex items-center gap-2">
             <CopyButton
@@ -215,15 +218,40 @@ export function LongTextView({
 
         {busy && <span className="ml-[1px] inline-block h-[1.1em] w-[2px] animate-pulse bg-acc align-middle" />}
 
-        {!busy && error && !text && (
-          <div className="rounded-lg border border-[rgba(255,82,48,0.35)] bg-[rgba(255,82,48,0.08)] px-4 py-3">
-            <p className="text-[13.5px] leading-relaxed text-[#f6b09b]">{error}</p>
+        {/* 有半篇译文时也必须报错：不许把中途断掉的结果当成完整译文 */}
+        {!busy && error && (
+          <div
+            role="alert"
+            className={`rounded-lg border border-[rgba(255,82,48,0.35)] bg-[rgba(255,82,48,0.08)] px-4 py-3 ${text ? "mt-3" : ""}`}
+          >
+            <p className="text-[13.5px] leading-relaxed text-[#f6b09b]">
+              {text ? `译文不完整：${error.replace(/[。.\s]+$/, "")}。上面只是已经收到的部分。` : error}
+            </p>
             <button
               type="button"
               onClick={onRetry}
               className="mt-2 rounded-md border border-line-strong px-3 py-1.5 text-[13px] text-paper hover:bg-[rgba(248,246,241,0.06)]"
             >
-              重试
+              {text ? "重新翻译" : "重试"}
+            </button>
+          </div>
+        )}
+
+        {/* 没报错、但也没正常写完（停止、内容策略、连接提前关闭）：同样要明说 */}
+        {!busy && !error && incomplete && (
+          <div
+            role="status"
+            className={`rounded-lg border border-[rgba(240,180,94,0.35)] bg-[rgba(240,180,94,0.08)] px-4 py-3 ${text ? "mt-3" : ""}`}
+          >
+            <p className="text-[13.5px] leading-relaxed text-[#f0b45e]">
+              {text ? `译文不完整：${incomplete}。上面只是已经收到的部分。` : `没有译文：${incomplete}。`}
+            </p>
+            <button
+              type="button"
+              onClick={onRetry}
+              className="mt-2 rounded-md border border-line-strong px-3 py-1.5 text-[13px] text-paper hover:bg-[rgba(248,246,241,0.06)]"
+            >
+              重新翻译
             </button>
           </div>
         )}

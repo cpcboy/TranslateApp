@@ -23,6 +23,7 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
     longText,
     longBusy,
     longTruncated,
+    longIncomplete,
     run,
     runLong,
     cancelLong,
@@ -116,6 +117,7 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
             text={longText}
             busy={longBusy}
             truncated={longTruncated}
+            incomplete={longIncomplete}
             error={error ? error.message : null}
             onStop={() => void cancelLong()}
             onRetry={() => void runLong(longSource)}

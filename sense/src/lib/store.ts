@@ -30,6 +30,8 @@ type LookupState = {
   longText: string;
   longBusy: boolean;
   longTruncated: boolean;
+  /** 译文没有正常写完的原因（被停止、内容策略、没收到结束标记……）；完整时为 null */
+  longIncomplete: string | null;
   run: (word: string) => Promise<void>;
   runLong: (text: string) => Promise<void>;
   cancelLong: () => Promise<void>;
@@ -49,6 +51,7 @@ const empty = {
   longText: "",
   longBusy: false,
   longTruncated: false,
+  longIncomplete: null,
 };
 
 /**
@@ -57,13 +60,23 @@ const empty = {
  */
 let epoch = 0;
 
-export const useLookup = create<LookupState>((set) => ({
+/**
+ * 离开阅读视图、开始新查询时，把还在生成的长文停掉。
+ * 前端丢弃增量不等于后端停了：不停的话，那条流会一直生成、一直计费。
+ */
+function stopLongIfBusy(busy: boolean): Promise<void> {
+  return busy ? api.cancelTranslate().catch(() => {}) : Promise.resolve();
+}
+
+export const useLookup = create<LookupState>((set, get) => ({
   ...empty,
 
   runLong: async (raw: string) => {
     const text = raw.trim();
     if (!text) return;
 
+    // 先停掉上一条，再开新的：取消按请求编号算，等它生效后再领新编号
+    await stopLongIfBusy(get().longBusy);
     const my = ++epoch;
     const requestId = `long-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     set({
@@ -79,7 +92,8 @@ export const useLookup = create<LookupState>((set) => ({
     let pending: ReturnType<typeof setTimeout> | null = null;
     const flush = () => {
       pending = null;
-      if (!buffer) return;
+      // 旧请求的定时器可能在新请求开始后才触发，不能把旧片段写进新状态
+      if (my !== epoch || !buffer) return;
       const chunk = buffer;
       buffer = "";
       set((state) => ({ longText: state.longText + chunk, status: "streaming" }));
@@ -104,10 +118,13 @@ export const useLookup = create<LookupState>((set) => ({
         status: "done",
         longText: result.text,
         longTruncated: result.truncated,
+        longIncomplete: result.incomplete,
         longBusy: false,
       });
     } catch (err) {
       if (my !== epoch) return;
+      // 断流前已收到、还在合流缓冲里的部分也要上屏；界面会把它标成「不完整」
+      flush();
       set({
         status: "error",
         longBusy: false,
@@ -125,6 +142,7 @@ export const useLookup = create<LookupState>((set) => ({
   },
 
   reset: () => {
+    void stopLongIfBusy(get().longBusy);
     epoch += 1;
     set({ ...empty });
   },
@@ -133,6 +151,7 @@ export const useLookup = create<LookupState>((set) => ({
     const word = rawWord.trim();
     if (!word) return;
 
+    void stopLongIfBusy(get().longBusy);
     const my = ++epoch;
     const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     set({ ...empty, status: "loading", query: word });
