@@ -2,6 +2,7 @@ import Ajv2020 from "ajv/dist/2020";
 import { describe, expect, it } from "vitest";
 import { buildPreview, detectLang, parseWordEntry, wordEntrySchema } from "./schema";
 import { parseFinal, tryParsePartial } from "./stream";
+import { LIMITS } from "./normalize";
 import specSchema from "../../src-tauri/resources/schema/word-entry.json";
 
 export const CHARGE = {
@@ -166,7 +167,191 @@ describe("parseWordEntry 的降级策略", () => {
   });
 });
 
+describe("展示上限整形：只是多给了一点，不让整张卡作废", () => {
+  const withSenses = (count: number) => {
+    const entry = structuredClone(CHARGE) as typeof CHARGE;
+    entry.senses = Array.from({ length: count }, (_, index) => ({
+      ...structuredClone(CHARGE.senses[0]),
+      rank: Math.min(index + 1, 6),
+    }));
+    return entry;
+  };
+  const trimWarning = (warnings: string[]) => warnings.find((item) => item.includes("超出展示上限"));
+
+  it("round 这类词有 5 个词性：保留前 4 个，并明说截断了", () => {
+    const entry = structuredClone(CHARGE) as typeof CHARGE;
+    entry.pos = ["adj", "n", "prep", "adv", "v"];
+    const parsed = parseWordEntry(entry);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.entry.pos).toEqual(["adj", "n", "prep", "adv"]);
+      expect(trimWarning(parsed.warnings)).toContain("词性 5→4");
+      expect(parsed.degraded).toBe(false);
+    }
+  });
+
+  it("7 个义项保留前 6 个", () => {
+    const parsed = parseWordEntry(withSenses(7));
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.entry.senses).toHaveLength(6);
+      expect(trimWarning(parsed.warnings)).toContain("义项 7→6");
+    }
+  });
+
+  it("近义词、例句、易混词超量都截断，不丢义项", () => {
+    const entry = structuredClone(CHARGE) as typeof CHARGE;
+    for (const sense of entry.senses) {
+      sense.synonyms = ["a", "b", "c", "d"];
+      sense.examples = [sense.examples[0], sense.examples[0], sense.examples[0]];
+    }
+    entry.confusables = [1, 2, 3, 4].map((index) => ({ word: `w${index}`, difference: "区别" }));
+    const parsed = parseWordEntry(entry);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.entry.senses).toHaveLength(3);
+      expect(parsed.entry.senses.every((sense) => sense.synonyms.length === 3)).toBe(true);
+      expect(parsed.entry.senses.every((sense) => sense.examples.length === 2)).toBe(true);
+      expect(parsed.entry.confusables).toHaveLength(3);
+      const warning = trimWarning(parsed.warnings) ?? "";
+      expect(warning).toContain("近义词 4→3");
+      expect(warning).toContain("例句 3→2");
+      expect(warning).toContain("易混词 4→3");
+    }
+  });
+
+  it("超长文字截到上限并以省略号结尾", () => {
+    const entry = structuredClone(CHARGE) as typeof CHARGE;
+    (entry as { notes: string | null }).notes = "注".repeat(201);
+    entry.confusables = [{ word: "cost", difference: "差".repeat(121) }];
+    entry.senses[0].domains = ["Information Technology"];
+    const parsed = parseWordEntry(entry);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.entry.notes).toHaveLength(200);
+      expect(parsed.entry.notes?.endsWith("…")).toBe(true);
+      expect(parsed.entry.confusables[0].difference).toHaveLength(120);
+      expect(parsed.entry.senses[0].domains[0]).toHaveLength(12);
+      expect(trimWarning(parsed.warnings)).toContain("备注过长");
+    }
+  });
+
+  it("截断不会把 emoji 的代理对切成两半", () => {
+    const entry = structuredClone(CHARGE) as typeof CHARGE;
+    (entry as { notes: string | null }).notes = "注".repeat(198) + "😀😀";
+    const parsed = parseWordEntry(entry);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(/[\ud800-\udbff](?![\udc00-\udfff])/.test(parsed.entry.notes ?? "")).toBe(false);
+    }
+  });
+
+  it("不认识的词频档位当未知，不作废、不提示", () => {
+    const entry = structuredClone(CHARGE) as typeof CHARGE;
+    (entry.frequency as { band: string | null }).band = "very high";
+    entry.frequency.zipf = 8.4;
+    const parsed = parseWordEntry(entry);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.entry.frequency).toEqual({ zipf: null, band: null });
+      expect(trimWarning(parsed.warnings)).toBeUndefined();
+    }
+  });
+
+  it("结构性问题仍然判失败，原因是中文且带字段路径", () => {
+    const parsed = parseWordEntry({ ...CHARGE, lang: "ja" });
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) expect(parsed.error).toBe("lang：取值不在允许范围内");
+
+    const missing = parseWordEntry({ ...CHARGE, senses: undefined });
+    expect(missing.ok).toBe(false);
+    if (!missing.ok) expect(missing.error).toBe("senses：缺少这个字段");
+  });
+
+  it("整形不改动传进来的对象", () => {
+    const entry = structuredClone(CHARGE) as typeof CHARGE;
+    entry.pos = ["adj", "n", "prep", "adv", "v"];
+    parseWordEntry(entry);
+    expect(entry.pos).toHaveLength(5);
+  });
+
+  it("合法输入没有截断提示", () => {
+    const parsed = parseWordEntry(CHARGE);
+    expect(parsed.ok && trimWarning(parsed.warnings)).toBeFalsy();
+  });
+
+  it("先救再截：前面一条坏义项不会连累后面合法的", () => {
+    const ranks = [7, 1, 2, 3, 4, 5, 6]; // 第一条 rank 越界，其余 6 条合法
+    const entry = structuredClone(CHARGE) as typeof CHARGE;
+    entry.senses = ranks.map((rank) => ({ ...structuredClone(CHARGE.senses[0]), rank }));
+    const parsed = parseWordEntry(entry);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) expect(parsed.entry.senses.map((sense) => sense.rank)).toEqual([1, 2, 3, 4, 5, 6]);
+  });
+
+  it("词频写成了别的类型也当未知", () => {
+    const entry = structuredClone(CHARGE) as unknown as { frequency: { zipf: unknown; band: unknown } };
+    entry.frequency = { zipf: "5.6", band: 3 };
+    const parsed = parseWordEntry(entry);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) expect(parsed.entry.frequency).toEqual({ zipf: null, band: null });
+  });
+
+  it("LIMITS 与 spec 的 maxItems / maxLength 一一对应", () => {
+    const top = specSchema.properties;
+    const sense = specSchema.$defs.sense.properties;
+    const example = specSchema.$defs.example.properties;
+    const confusable = top.confusables.items.properties;
+    expect([LIMITS.pos, LIMITS.senses, LIMITS.confusables, LIMITS.notes]).toEqual([
+      top.pos.maxItems,
+      top.senses.maxItems,
+      top.confusables.maxItems,
+      top.notes.maxLength,
+    ]);
+    expect(LIMITS.pronunciation).toBe(top.pronunciation.properties.ipa.maxLength);
+    expect([LIMITS.confusableWord, LIMITS.difference]).toEqual([
+      confusable.word.maxLength,
+      confusable.difference.maxLength,
+    ]);
+    expect([
+      LIMITS.glossZh,
+      LIMITS.glossEn,
+      LIMITS.domains,
+      LIMITS.domain,
+      LIMITS.collocations,
+      LIMITS.collocation,
+      LIMITS.examples,
+      LIMITS.pitfall,
+      LIMITS.synonyms,
+      LIMITS.synonym,
+    ]).toEqual([
+      sense.gloss_zh.maxLength,
+      sense.gloss_en.maxLength,
+      sense.domains.maxItems,
+      sense.domains.items.maxLength,
+      sense.collocations.maxItems,
+      sense.collocations.items.maxLength,
+      sense.examples.maxItems,
+      sense.pitfall.maxLength,
+      sense.synonyms.maxItems,
+      sense.synonyms.items.maxLength,
+    ]);
+    expect([LIMITS.exampleText, LIMITS.translation, LIMITS.targetSpan]).toEqual([
+      example.text.maxLength,
+      example.translation.maxLength,
+      example.target_span.maxLength,
+    ]);
+  });
+});
+
 describe("buildPreview", () => {
+  it("流式预览里，多一个近义词的义项也照常显示", () => {
+    const sense = { ...structuredClone(CHARGE.senses[0]), synonyms: ["a", "b", "c", "d"] };
+    const preview = buildPreview({ word: "charge", senses: [sense] }, "charge");
+    expect(preview?.senses).toHaveLength(1);
+    expect(preview?.senses[0].synonyms).toHaveLength(3);
+  });
+
   it("只保留结构完整的义项", () => {
     const preview = buildPreview(
       {

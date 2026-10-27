@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { LIMITS, normalizeEntry } from "./normalize";
 
 /**
  * `SENSE-v1.0/spec/word-entry.schema.json` 的 zod 镜像。
@@ -113,10 +114,24 @@ const SHARE_MAX = 1.05;
 /**
  * 校验模型输出。
  *
- * 策略：先整包校验；整包不过就逐个义项救援，能救几个救几个。
+ * 策略：先按 spec 上限截掉「多给的一点」（见 normalize.ts，截断要明说）；
+ * 再整包校验，整包不过就逐个义项救援，能救几个救几个。
  * 一个义项都不合法才算失败——那时才需要重试。
  */
 export function parseWordEntry(raw: unknown): ParseResult {
+  const { value, trimmed } = normalizeEntry(raw);
+  const result = parseStrict(value, trimmed);
+  if (result.ok && trimmed.length > 0) {
+    result.warnings.push(`部分内容超出展示上限，已截断：${trimmed.join("、")}`);
+  }
+  return result;
+}
+
+/**
+ * 整形之后按 zod 镜像校验（展示类枚举的兜底仍在上面的 schema 里），这里不再额外放宽。
+ * 义项超过 6 条时在救援之后再截，截掉的条数记进 trimmed。
+ */
+function parseStrict(raw: unknown, trimmed: string[]): ParseResult {
   const whole = wordEntrySchema.safeParse(raw);
   if (whole.success) {
     const warnings: string[] = [];
@@ -143,6 +158,12 @@ export function parseWordEntry(raw: unknown): ParseResult {
 
   if (kept.length === 0) {
     return { ok: false, error: firstIssue(whole.error) };
+  }
+
+  // 先救再截：模型按常用度排序，留前 6 条合法的
+  if (kept.length > LIMITS.senses) {
+    trimmed.push(`义项 ${kept.length}→${LIMITS.senses}`);
+    kept.length = LIMITS.senses;
   }
 
   const shell = wordEntrySchema.safeParse({
@@ -205,7 +226,8 @@ export function detectLang(text: string): "en" | "zh" {
  * 不假装它是完整结果（调用方会额外显示「还在加载」）。
  */
 export function buildPreview(partial: unknown, fallbackWord: string): WordEntry | null {
-  const draft = partial as Record<string, unknown> | null;
+  // 预览也先整形：多一个近义词的义项不该在流式阶段消失（截断提示交给最终卡片）
+  const draft = normalizeEntry(partial).value as Record<string, unknown> | null;
   if (!draft || !Array.isArray(draft.senses)) return null;
 
   const senses: Sense[] = [];
@@ -231,7 +253,8 @@ export function buildPreview(partial: unknown, fallbackWord: string): WordEntry 
       zipf: typeof frequency.zipf === "number" ? frequency.zipf : null,
       band: null,
     },
-    senses,
+    // 与最终卡片一致：先逐条校验，再留前 6 条
+    senses: senses.slice(0, LIMITS.senses),
     confusables: [],
     notes: null,
   });
