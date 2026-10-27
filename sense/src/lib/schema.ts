@@ -169,7 +169,28 @@ function firstIssue(error: z.ZodError): string {
   const issue = error.issues[0];
   if (!issue) return "格式不符合契约";
   const path = issue.path.join(".");
-  return path ? `${path}: ${issue.message}` : issue.message;
+  const what = describeIssue(issue);
+  return path ? `${path}：${what}` : what;
+}
+
+/** zod 的英文原因换成中文：这句话会直接出现在错误卡片上。 */
+function describeIssue(issue: z.core.$ZodIssue): string {
+  switch (issue.code) {
+    case "invalid_type":
+      return issue.message.includes("received undefined") ? "缺少这个字段" : `类型不对，应为 ${issue.expected}`;
+    case "too_big":
+      if (issue.origin === "string") return `超过 ${issue.maximum} 个字符`;
+      if (issue.origin === "array") return `超过 ${issue.maximum} 项`;
+      return `大于上限 ${issue.maximum}`;
+    case "too_small":
+      if (issue.origin === "string") return `少于 ${issue.minimum} 个字符`;
+      if (issue.origin === "array") return `少于 ${issue.minimum} 项`;
+      return `小于下限 ${issue.minimum}`;
+    case "invalid_value":
+      return "取值不在允许范围内";
+    default:
+      return issue.message;
+  }
 }
 
 /** 判断查询语言：含中日韩统一表意文字就当中文。 */

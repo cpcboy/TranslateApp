@@ -220,19 +220,10 @@ export const useLookup = create<LookupState>((set, get) => ({
 
         parsed = validate(second.raw, second);
         if (!parsed.ok) {
-          // 把模型的原文露出来：多数情况是它没按词典格式回答（比如自己拒答了），
-          // 这时候藏着只会让人以为是应用屏蔽了词。
-          const snippet = second.raw.trim().replace(/\s+/g, " ").slice(0, 180);
-          const reason = second.finish_reason;
-          const message =
-            reason === "content_filter"
-              ? "模型服务在输出途中以「内容策略」中止了这次请求，与应用无关——应用不做任何词语过滤。换一个 provider 或模型再试。"
-              : reason === "length"
-                ? "模型输出撞到长度上限被截断（这次不是格式问题）。可以重试，或换个输出上限更大的模型。"
-                : snippet
-                  ? `流被提前中断了（不是格式问题）。已收到的内容：「${snippet}…」`
-                  : "模型返回了空内容，已自动重试一次。";
-          set({ status: "error", error: { code: "invalid_json", message } });
+          set({
+            status: "error",
+            error: { code: "invalid_json", message: describeFailure(second, parsed.reason) },
+          });
           return;
         }
       }
@@ -259,17 +250,18 @@ export const useLookup = create<LookupState>((set, get) => ({
 
 type Validated =
   | { ok: true; entry: WordEntry; warnings: string[]; meta: LookupMeta }
-  | { ok: false };
+  /** reason 是具体哪一处不合格，会原样进错误提示 */
+  | { ok: false; reason: string };
 
 function validate(
   raw: string,
   result: { source: string; model: string; first_delta_ms: number; total_ms: number },
 ): Validated {
   const final = parseFinal(raw);
-  if (!final) return { ok: false };
+  if (!final) return { ok: false, reason: "不是合法的 JSON" };
 
   const parsed = parseWordEntry(final.value);
-  if (!parsed.ok) return { ok: false };
+  if (!parsed.ok) return { ok: false, reason: parsed.error };
 
   const warnings = [...parsed.warnings];
   if (final.repaired) {
@@ -289,6 +281,41 @@ function validate(
       totalMs: result.total_ms,
     },
   };
+}
+
+/**
+ * 重试后仍然校验失败时给用户看的说明。
+ *
+ * finish_reason 是模型服务自己报的结束原因：`stop` 表示它正常写完了，
+ * 问题出在内容不符合词典格式，绝不能说成「流被中断」——
+ * interj 那次就是被这句话误导，把契约问题当成了网络问题去查。
+ * 只有拿不到结束原因时，才说「可能在中途被截断」。
+ */
+export function describeFailure(
+  result: { raw: string; finish_reason?: string | null },
+  reason: string,
+): string {
+  if (result.finish_reason === "content_filter") {
+    return "模型服务在输出途中以「内容策略」中止了这次请求，与应用无关——应用不做任何词语过滤。换一个 provider 或模型再试。";
+  }
+  if (result.finish_reason === "length") {
+    return "模型输出撞到长度上限被截断（这次不是格式问题）。可以重试，或换个输出上限更大的模型。";
+  }
+
+  // 把模型的原文露出来：多数情况是它没按词典格式回答（比如自己拒答了），
+  // 这时候藏着只会让人以为是应用屏蔽了词。
+  const flat = result.raw.trim().replace(/\s+/g, " ");
+  if (!flat) return "模型返回了空内容，已自动重试一次。";
+  const snippet = flat.length > 180 ? `${flat.slice(0, 180)}…` : flat;
+
+  if (result.finish_reason === "stop") {
+    return `模型输出不符合词典格式（${reason}）。已收到的内容：「${snippet}」`;
+  }
+  if (!result.finish_reason) {
+    return `没有收到结束标记，输出可能在中途被截断（${reason}）。已收到的内容：「${snippet}」`;
+  }
+  // 其它结束原因（如 insufficient_system_resource）：是服务端提前收工，不是格式问题
+  return `模型服务以「${result.finish_reason}」结束了输出，内容不完整（${reason}）。已收到的内容：「${snippet}」`;
 }
 
 function toLookupError(err: unknown): LookupError {
