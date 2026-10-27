@@ -5,6 +5,10 @@
  * 它说的是真协议：GET /v1/models、POST /v1/chat/completions（SSE 分片）。
  * 应用走的代码路径与连真实模型时完全一致，区别只是数据是固定的。
  *
+ * 按 system 提示词里的标记认请求类型（见 MARKERS）：查词 / 截屏翻译 / 长文翻译 / 语法检查 / 划词解析。
+ * 提示词一改、标记对不上，`npm test` 里的 mockProvider.test.ts 会红——
+ * 以前截屏提示词改成「你是一位翻译」后这里悄悄认不出了，无 Key 端到端验证对两条链路已经失效却没人发现。
+ *
  * 用法：
  *   node tools/mock-provider.mjs            # 监听 11434，对应 Ollama 预设
  *   BAD=1 node tools/mock-provider.mjs      # 故意返回残缺包，测降级
@@ -13,13 +17,18 @@
  * 每个请求都会追加到 LOG 文件，用来证明「第二次查询 0 请求」。
  */
 import { createServer } from "node:http";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
-const PORT = Number(process.env.PORT ?? 11434);
-const DELAY = Number(process.env.DELAY ?? 35);
+/** 各类请求的 system 提示词里一定出现的一句话；与 Rust 里的提示词逐字对应。 */
+export const MARKERS = {
+  capture: "你是一位翻译，正在翻译屏幕上一段连续的文字", // capture.rs
+  longText: "你是翻译引擎。把 user 给的整篇文本翻译成", // commands/longtext.rs
+  grammar: "你是英语语法检查器", // commands/reading.rs
+  explain: "你是词典。根据上下文解释", // commands/reading.rs
+};
+
 const CHUNK = 150;
-const LOG = process.env.LOG ?? "/tmp/sense-mock-requests.log";
-const BAD = process.env.BAD === "1";
 
 const sense = (rank, pos, gloss_zh, gloss_en, share, register, domains, collocations, text, translation, span, scene, pitfall, synonyms) => ({
   rank, pos, gloss_zh, gloss_en, share, register, domains, collocations,
@@ -27,9 +36,10 @@ const sense = (rank, pos, gloss_zh, gloss_en, share, register, domains, collocat
   pitfall, synonyms,
 });
 
-const entry = {
+const makeEntry = (word, bad) => {
+  const entry = {
   schema_version: 1,
-  word: "charge",
+  word,
   lang: "en",
   pronunciation: { ipa: "/tʃɑːdʒ/", pinyin: null },
   pos: ["v", "n"],
@@ -58,23 +68,66 @@ const entry = {
   ],
   confusables: [{ word: "cost", difference: "cost 是主语自身花费，charge 是向别人收取。" }],
   notes: null,
+  };
+  if (bad) {
+    entry.senses = entry.senses.slice(0, 1).map((item) => ({ rank: item.rank, pos: item.pos }));
+  }
+  return entry;
 };
 
-if (BAD) {
-  entry.senses = entry.senses.slice(0, 1).map((item) => ({ rank: item.rank, pos: item.pos }));
-}
-
-const payload = JSON.stringify(entry);
-
-function log(line) {
+const parseJson = (text, fallback) => {
   try {
-    appendFileSync(LOG, `${new Date().toISOString()} ${line}\n`);
+    return JSON.parse(text);
   } catch {
-    /* 日志写不了不影响服务 */
+    return fallback;
   }
+};
+
+/** 按请求类型算出整段要回的文本 */
+function answerFor(body, bad) {
+  const system = body.messages?.[0]?.content ?? "";
+  const user = body.messages?.[1]?.content ?? "";
+
+  if (system.includes(MARKERS.capture)) {
+    // 截屏翻译：user 是字符串数组，回等长的译文数组
+    const items = parseJson(user, []);
+    return JSON.stringify(items.map((text, index) => `译文${index + 1} ${String(text).slice(0, 6)}`));
+  }
+  if (system.includes(MARKERS.longText)) {
+    // 长文翻译：user 就是整篇原文，保留分段，回纯文本
+    return String(user)
+      .split("\n")
+      .map((line) => (line.trim() ? `【译】${line}` : line))
+      .join("\n");
+  }
+  if (system.includes(MARKERS.grammar)) {
+    return JSON.stringify(
+      String(user).includes("He go ")
+        ? [{ fragment: "He go", replacement: "He goes", explanation: "主语是第三人称单数，动词要加 -es" }]
+        : [],
+    );
+  }
+  if (system.includes(MARKERS.explain)) {
+    const { term = "" } = parseJson(user, {});
+    return JSON.stringify({ gloss: `（mock）「${term}」在这句话里的意思`, pos: "n.", note: "mock 数据，不是真实讲解" });
+  }
+  // 其余都当查词：把请求的词填进卡片
+  const { word = "charge" } = parseJson(user, {});
+  return JSON.stringify(makeEntry(word, bad));
 }
 
-const server = createServer((req, res) => {
+/** 造一个 mock 服务（还没开始监听）。 */
+export function createMock({ delay = 35, bad = false, log: logFile = "/tmp/sense-mock-requests.log" } = {}) {
+  const log = (line) => {
+    if (!logFile) return;
+    try {
+      appendFileSync(logFile, `${new Date().toISOString()} ${line}\n`);
+    } catch {
+      /* 日志写不了不影响服务 */
+    }
+  };
+
+  return createServer((req, res) => {
   log(`${req.method} ${req.url}`);
 
   if (req.method === "GET" && req.url?.endsWith("/models")) {
@@ -89,29 +142,18 @@ const server = createServer((req, res) => {
     req.resume();
     req.on("end", () => {
       // 把请求体的关键开关记下来：验证「关思考」到底有没有发出去
-      let source = payload;
-      try {
-        const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      let source = "";
+      const body = parseJson(Buffer.concat(chunks).toString("utf8"), null);
+      if (body) {
         const thinking =
           body.thinking ?? body.enable_thinking ?? body.reasoning ?? body.reasoning_effort ?? null;
         log(
           `  > model=${body.model} max_tokens=${body.max_tokens ?? "-"} temperature=${body.temperature ?? "-"} thinking=${JSON.stringify(thinking)}`,
         );
-
-        // 截图翻译走同一个 provider：按 system 里的标记回一个等长译文数组
-        const system = body.messages?.[0]?.content ?? "";
-        if (system.includes("翻译引擎")) {
-          let items = [];
-          try {
-            items = JSON.parse(body.messages?.[1]?.content ?? "[]");
-          } catch {
-            items = [];
-          }
-          source = JSON.stringify(items.map((text, index) => `译文${index + 1} ${String(text).slice(0, 6)}`));
-          log(`  > 翻译请求：${items.length} 段`);
-        }
-      } catch {
+        source = answerFor(body, bad);
+      } else {
         log("  > body 解析失败");
+        source = answerFor({}, bad);
       }
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
@@ -130,7 +172,7 @@ const server = createServer((req, res) => {
         const piece = source.slice(cursor, cursor + CHUNK);
         cursor += CHUNK;
         res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: piece } }] })}\n\n`);
-      }, DELAY);
+      }, delay);
 
       // 只在客户端断开（res 关闭）时收尾；req 的 close 会在请求体读完就触发。
       res.on("close", () => clearInterval(timer));
@@ -141,7 +183,22 @@ const server = createServer((req, res) => {
   res.writeHead(404, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ error: { message: "not found" } }));
 });
+}
 
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(`[mock] listening on http://127.0.0.1:${PORT}/v1  (bad=${BAD}, delay=${DELAY}ms)`);
-});
+// 直接 `node tools/mock-provider.mjs` 运行时才监听；被测试 import 时只导出工厂
+// 两边都取真实路径：经符号链接启动时 argv[1] 和 import.meta.url 的写法不同，直接比会静默不监听
+const isMain = (() => {
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+})();
+if (isMain) {
+  const port = Number(process.env.PORT ?? 11434);
+  const delay = Number(process.env.DELAY ?? 35);
+  const bad = process.env.BAD === "1";
+  createMock({ delay, bad, log: process.env.LOG ?? "/tmp/sense-mock-requests.log" }).listen(port, "127.0.0.1", () => {
+    console.log(`[mock] listening on http://127.0.0.1:${port}/v1  (bad=${bad}, delay=${delay}ms)`);
+  });
+}

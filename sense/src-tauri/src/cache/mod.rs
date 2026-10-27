@@ -13,6 +13,9 @@ use sha2::{Digest, Sha256};
 /// 与前端 `src/lib/schema.ts` 的常量保持一致；改契约/改 prompt 都会让旧缓存失效。
 pub const SCHEMA_VERSION: i64 = 1;
 
+/// 缓存条目上限。单条约几 KB，5000 条也就十几 MB；超出时先淘汰最没价值的。
+pub const MAX_ENTRIES: i64 = 5000;
+
 pub struct Cache {
     conn: Mutex<Connection>,
 }
@@ -78,14 +81,15 @@ impl Cache {
             .map(|duration| duration.as_secs() as i64)
             .unwrap_or(0);
 
-        self.lock()
-            .execute(
-                "INSERT INTO entries (key, word, lang, model, schema_ver, prompt_ver, payload, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                 ON CONFLICT(key) DO UPDATE SET payload = excluded.payload, stale = 0",
-                params![key, word, lang, model, SCHEMA_VERSION, 1, payload, created_at],
-            )
-            .map_err(|err| format!("写缓存失败: {err}"))?;
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO entries (key, word, lang, model, schema_ver, prompt_ver, payload, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(key) DO UPDATE SET payload = excluded.payload, stale = 0",
+            params![key, word, lang, model, SCHEMA_VERSION, 1, payload, created_at],
+        )
+        .map_err(|err| format!("写缓存失败: {err}"))?;
+        evict_over(&conn, MAX_ENTRIES, key).map_err(|err| format!("淘汰旧缓存失败: {err}"))?;
         Ok(())
     }
 
@@ -97,12 +101,27 @@ impl Cache {
         Ok(())
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn count(&self) -> Result<i64, String> {
         self.lock()
             .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
             .map_err(|err| format!("统计缓存失败: {err}"))
     }
+}
+
+/// 超过上限时删掉最没价值的条目：先删已标过期的，再删命中次数最少的，同样少就删最旧的。
+/// `keep` 是刚写入的那条，**不参与淘汰**：新写入的命中次数是 0，缓存里的旧条目都命中过时，
+/// 不排除它的话，新词一写进去就会因为「命中最少」被立刻删掉，缓存满了之后再也存不进新词。
+fn evict_over(conn: &Connection, limit: i64, keep: &str) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM entries WHERE key IN (
+             SELECT key FROM entries
+             WHERE key != ?2
+             ORDER BY stale DESC, hit_count ASC, created_at ASC
+             LIMIT MAX(0, (SELECT COUNT(*) FROM entries) - ?1)
+         )",
+        params![limit, keep],
+    )
 }
 
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -120,6 +139,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             stale          INTEGER DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_entries_word ON entries(word, lang);
+        -- clicks 目前没有任何读写（预留给义项点击统计）。按「只加不删」的约定保留，不 DROP。
         CREATE TABLE IF NOT EXISTS clicks (
             word TEXT, sense_rank INTEGER, gloss TEXT,
             views INTEGER DEFAULT 0, clicks INTEGER DEFAULT 0,
@@ -183,6 +203,77 @@ mod tests {
             .expect("写");
         assert_eq!(cache.get(&key).expect("查").as_deref(), Some("{\"ok\":1}"));
         assert_eq!(cache.count().expect("计数"), 1);
+    }
+
+    #[test]
+    fn eviction_drops_stale_then_least_hit_then_oldest() {
+        let cache = Cache::in_memory().expect("内存库");
+        let conn = cache.lock();
+        for (key, hits, stale, created) in [
+            ("hot", 9, 0, 1),
+            ("cold-old", 0, 0, 1),
+            ("cold-new", 0, 0, 5),
+            ("stale", 7, 1, 9),
+        ] {
+            conn.execute(
+                "INSERT INTO entries (key, word, lang, model, schema_ver, prompt_ver, payload, created_at, hit_count, stale)
+                 VALUES (?1, 'w', 'en', 'm', 1, 1, 'p', ?2, ?3, ?4)",
+                params![key, created, hits, stale],
+            )
+            .expect("插入");
+        }
+
+        // 上限 3：只该删一条，且是过期的那条（哪怕它命中最多、最新）
+        assert_eq!(evict_over(&conn, 3, "").expect("淘汰"), 1);
+        let left: Vec<String> = conn
+            .prepare("SELECT key FROM entries ORDER BY key")
+            .expect("准备")
+            .query_map([], |row| row.get(0))
+            .expect("查询")
+            .map(|row| row.expect("行"))
+            .collect();
+        assert_eq!(left, vec!["cold-new", "cold-old", "hot"]);
+
+        // 上限 2：没有过期的了，删命中最少里最旧的
+        assert_eq!(evict_over(&conn, 2, "").expect("淘汰"), 1);
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM entries WHERE key = 'cold-old'", [], |row| row.get(0)).expect("计数");
+        assert_eq!(count, 0, "命中 0 次且最旧的先走");
+
+        // 没超上限：什么都不删
+        assert_eq!(evict_over(&conn, 10, "").expect("淘汰"), 0);
+    }
+
+    #[test]
+    fn a_new_word_survives_in_a_full_cache_of_hit_entries() {
+        let cache = Cache::in_memory().expect("内存库");
+        {
+            let conn = cache.lock();
+            for index in 0..MAX_ENTRIES {
+                conn.execute(
+                    "INSERT INTO entries (key, word, lang, model, schema_ver, prompt_ver, payload, created_at, hit_count)
+                     VALUES (?1, 'w', 'en', 'm', 1, 1, 'p', 1, 5)",
+                    params![format!("old{index}")],
+                )
+                .expect("插入");
+            }
+        }
+        // 缓存满了，而且每条旧的都命中过（hit_count=5）；新写入的 hit_count=0
+        cache.put("fresh", "w", "en", "m", "new").expect("写");
+        assert_eq!(cache.get("fresh").expect("查").as_deref(), Some("new"), "新词不能被立刻淘汰");
+        assert_eq!(cache.count().expect("计数"), MAX_ENTRIES, "总数仍在上限内");
+    }
+
+    #[test]
+    fn put_stays_under_the_cap() {
+        let cache = Cache::in_memory().expect("内存库");
+        for index in 0..(MAX_ENTRIES + 25) {
+            let key = format!("k{index}");
+            cache.put(&key, "w", "en", "m", "p").expect("写");
+        }
+        assert_eq!(cache.count().expect("计数"), MAX_ENTRIES);
+        // 最新写入的永远还在
+        let newest = format!("k{}", MAX_ENTRIES + 24);
+        assert!(cache.get(&newest).expect("查").is_some());
     }
 
     #[test]
