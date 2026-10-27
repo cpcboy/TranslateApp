@@ -31,7 +31,8 @@ export type LookupError = { code: string; message: string };
 
 export type DeltaEvent = { request_id: string; text: string };
 
-export type HotkeyView = { kind: "lookup" | "capture"; display: string };
+/** active 为 false：配置里写了这个键，但没注册上（多半被别的 App 占了），它并不生效 */
+export type HotkeyView = { kind: "lookup" | "capture"; display: string; active: boolean };
 
 export type GrammarIssue = {
   fragment: string;
@@ -72,7 +73,14 @@ export const api = {
   setActiveProvider: (id: string) => invoke<void>("set_active_provider", { id }),
   setApiKey: (id: string, key: string) => invoke<string>("set_api_key", { id, key }),
   clearApiKey: (id: string) => invoke<void>("clear_api_key", { id }),
-  testConnection: (id: string) => invoke<TestResult>("test_connection", { id }),
+  /** 测的是表单里当前的值（都不落盘）；key 只在这一次请求里用，空串当没填 */
+  testConnection: (id: string, form: { baseUrl: string; model: string; key?: string }) =>
+    invoke<TestResult>("test_connection", {
+      id,
+      baseUrl: form.baseUrl,
+      model: form.model,
+      key: form.key || null,
+    }),
   lookup: (args: LookupArgs) => invoke<LookupResult>("lookup", { req: { ...args } }),
   hotkeyHint: () => invoke<string>("hotkey_hint"),
   hideWindow: () => invoke<void>("hide_window"),
@@ -98,6 +106,11 @@ export const api = {
   invalidateLookup: (word: string, lang: string, context?: string) =>
     invoke<void>("invalidate_lookup", { word, lang, context }),
 };
+
+/** 改键成功（或旧键装不回去）后，Rust 发这个事件；标题栏的键帽据此重新取 */
+export function onHotkeyChanged(handler: () => void): Promise<UnlistenFn> {
+  return listen("sense://hotkey-changed", () => handler());
+}
 
 export function onDelta(handler: (event: DeltaEvent) => void): Promise<UnlistenFn> {
   return listen<DeltaEvent>("sense://delta", (event) => handler(event.payload));

@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { LookupView } from "./features/lookup/LookupView";
 import { SettingsView } from "./features/settings/SettingsView";
-import { api } from "./lib/ipc";
+import { api, onHotkeyChanged } from "./lib/ipc";
 import { useLookup } from "./lib/store";
 
 const isTauri = "__TAURI_INTERNALS__" in window;
@@ -25,12 +25,27 @@ export default function App() {
 
   useEffect(() => {
     if (!isTauri) return;
-    void api
-      .hotkeyHint()
-      .then(setHint)
-      .catch(() => {
-        /* 取不到就不显示键帽 */
-      });
+    const refresh = () =>
+      void api
+        .hotkeyHint()
+        .then(setHint)
+        .catch(() => {
+          /* 取不到就不显示键帽 */
+        });
+    refresh();
+    // 在设置里改了查词键，标题栏的键帽要跟着变，不用等重启
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    void onHotkeyChanged(refresh)
+      .then((fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, []);
 
   // 仅 debug 构建：自动化验证时用环境变量触发一次查询。

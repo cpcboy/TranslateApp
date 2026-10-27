@@ -1,7 +1,7 @@
 //! SENSE 主进程。
 //!
-//! D1 范围只有窗口：无边框、置顶、失焦隐藏、⌃⌥⌘Space（可配置）显隐。
-//! 模型请求、密钥、缓存都在后面的日子进来，且一律留在 Rust 侧。
+//! 应用装配：无边框置顶窗口、失焦隐藏、全局快捷键（⌃⌥⌘Space 查词 / ⌃⌥⌘X 截屏，均可配置）。
+//! 模型请求、密钥（钥匙串）、SQLite 缓存、截屏翻译都在 Rust 侧，前端不接触 Key 也不直连模型。
 
 mod cache;
 mod capture;
@@ -31,18 +31,18 @@ static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 /// 转给代理，本地模型直接不可用，报错还很难懂。
 static LOOPBACK_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
-fn is_loopback(base_url: &str) -> bool {
-    let rest = base_url.split("://").nth(1).unwrap_or_default();
-    let authority = rest.split('/').next().unwrap_or_default();
-    // 去掉 user:pass@：不然 split(':') 会先把用户名当成 host
-    let authority = authority.rsplit('@').next().unwrap_or(authority);
-    let host = if let Some(stripped) = authority.strip_prefix('[') {
-        // IPv6 字面量：[::1]:11434
-        stripped.split(']').next().unwrap_or_default()
-    } else {
-        authority.split(':').next().unwrap_or_default()
+/// 这个地址是不是本机。保存与「测试连接」的 https 规则、客户端选择共用它。
+///
+/// 用 reqwest 自己的 URL 解析器取主机：它才是真正决定请求发到哪里的那一个。
+/// 以前自己按 `/` 切、按 `:` 取主机，`http://evil.example?@localhost/v1`、`...#@localhost`、
+/// `...\@localhost` 这些写法会被当成本地（解析器认为主机是 evil.example），Key 就明文发了出去。
+/// 解析不了的一律不算本地（宁可多要求 https）。
+pub(crate) fn is_loopback(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
     };
-    matches!(host, "127.0.0.1" | "localhost" | "::1")
+    // host_str 已经小写；IPv6 带方括号；`127.1` 这类简写会被规整成 127.0.0.1
+    matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
 }
 
 /// 按目标地址挑客户端：本地直连，远端才走系统代理。
@@ -78,11 +78,6 @@ pub fn http_client() -> &'static reqwest::Client {
             .build()
             .expect("构建 HTTP 客户端失败")
     })
-}
-
-/// 注册一个全局快捷键。抽出来是为了注册失败时能换默认值再试一次。
-fn register_shortcut(app: &tauri::AppHandle, shortcut: Shortcut) -> Result<(), String> {
-    register_hotkey(app, "lookup", shortcut)
 }
 
 /// 按用途注册：查词是显隐窗口，截屏是拉选区。
@@ -143,7 +138,6 @@ pub fn run() {
             window::hotkey_list,
             window::set_hotkey,
             capture::start_capture,
-            capture::cancel_capture,
             capture::close_overlay,
             capture::capture_blocks,
         ])
@@ -185,58 +179,60 @@ pub fn run() {
             app.manage(cache);
 
             // 快捷键：注册成功才对外宣称它生效，避免界面显示一个按不出来的键。
-            let (hotkey, source) = window::load_hotkey(app.handle());
-            match register_shortcut(app.handle(), hotkey.shortcut) {
-                Ok(()) => {
-                    println!(
-                        "[sense] hotkey registered: {}；来源：{}",
-                        hotkey.display, source
-                    );
-                    window::set_active_display(Some(hotkey.display));
-                    app.state::<window::HotkeyState>()
-                        .remember("lookup", hotkey.shortcut);
-                }
-                Err(err) => {
-                    eprintln!("[sense] hotkey register FAILED ({}): {err}", hotkey.display);
-                    let fallback = window::default_hotkey();
-                    match register_shortcut(app.handle(), fallback.shortcut) {
-                        Ok(()) => {
-                            eprintln!("[sense] 已回退到默认 {}", fallback.display);
-                            window::set_active_display(Some(fallback.display));
-                        }
-                        Err(second) => {
-                            eprintln!("[sense] 默认键也无法注册: {second}");
-                            window::set_active_display(None);
-                        }
+            {
+                let state = app.state::<window::HotkeyState>();
+                let (hotkey, source) = window::load_hotkey(app.handle());
+                let configured = hotkey.display.clone();
+                let startup = window::register_with_fallback(
+                    &state,
+                    "lookup",
+                    hotkey,
+                    Some(window::default_hotkey()),
+                    |shortcut| register_hotkey(app.handle(), "lookup", shortcut),
+                );
+                match (&startup.active, startup.fell_back) {
+                    (Some(display), false) => {
+                        println!("[sense] hotkey registered: {display}；来源：{source}");
                     }
-                    // 热键是唯一入口：注册不上还躲着不露脸，用户会以为应用坏了。
+                    (Some(display), true) => {
+                        let reason = startup.errors.first().map(String::as_str).unwrap_or_default();
+                        eprintln!("[sense] hotkey register FAILED ({configured}): {reason}");
+                        eprintln!("[sense] 已回退到默认 {display}");
+                    }
+                    (None, _) => {
+                        for err in &startup.errors {
+                            eprintln!("[sense] hotkey register FAILED ({configured}): {err}");
+                        }
+                        eprintln!("[sense] 没有任何可用的查词快捷键");
+                    }
+                }
+                // 热键是唯一入口：注册不上还躲着不露脸，用户会以为应用坏了。
+                if startup.active.is_none() || startup.fell_back {
                     window::show(app.handle());
                 }
             }
 
             // 截屏翻译的快捷键。注册不上不影响查词，只打日志并让用户在设置里改。
             {
+                let state = app.state::<window::HotkeyState>();
                 let (hotkey, source) = window::load_capture_hotkey(app.handle());
-                match register_hotkey(app.handle(), "capture", hotkey.shortcut) {
-                    Ok(()) => {
-                        println!(
-                            "[sense] capture hotkey registered: {}；来源：{}",
-                            hotkey.display, source
-                        );
-                        app.state::<window::HotkeyState>()
-                            .remember("capture", hotkey.shortcut);
+                let configured = hotkey.display.clone();
+                let startup = window::register_with_fallback(&state, "capture", hotkey, None, |shortcut| {
+                    register_hotkey(app.handle(), "capture", shortcut)
+                });
+                match startup.active {
+                    Some(display) => {
+                        println!("[sense] capture hotkey registered: {display}；来源：{source}");
                     }
-                    Err(err) => {
-                        eprintln!(
-                            "[sense] capture hotkey FAILED ({}): {err}；可在设置里改",
-                            hotkey.display
-                        );
+                    None => {
+                        let reason = startup.errors.first().map(String::as_str).unwrap_or_default();
+                        eprintln!("[sense] capture hotkey FAILED ({configured}): {reason}；可在设置里改");
                     }
                 }
             }
 
             // 仅供自动化验证：直接拉起选区窗口（模拟按快捷键）
-            if std::env::var_os("SENSE_DEV_SELECT").is_some() {
+            if window::dev_flag("SENSE_DEV_SELECT") {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(1200)).await;
@@ -261,7 +257,8 @@ pub fn run() {
                 });
             }
 
-            // 仅供本机验证：不设这个变量时，启动后窗口保持隐藏（产品行为）。
+            // 仅供本机验证（debug 构建）：窗口本来就是启动即显示（tauri.conf.json 里 visible: true），
+            // 这个开关只是 600ms 后再走一遍 show（居中、抢焦点、刷新失焦宽限期），复现快捷键呼出的路径。
             if window::dev_flag("SENSE_SHOW_ON_START") {
                 let handle = app.handle().clone();
                 std::thread::spawn(move || {
@@ -287,7 +284,7 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
-            // 点 Dock 图标时把窗口叫回来（窗口默认是隐藏的）。
+            // 点 Dock 图标时把窗口叫回来（失焦或按 Esc 之后窗口是隐藏的）。
             if let tauri::RunEvent::Reopen { .. } = event {
                 window::show(app);
             }
@@ -306,5 +303,21 @@ mod tests {
         assert!(!is_loopback("https://api.deepseek.com/v1"));
         // 域名里带 localhost 不算本地，别把远端请求也绕开代理
         assert!(!is_loopback("https://localhost.example.com/v1"));
+        // userinfo 里写 localhost 骗不过它：真正的主机是 @ 后面的
+        assert!(!is_loopback("http://localhost:80@evil.example/v1"));
+        assert!(!is_loopback("http://127.0.0.1:1@evil.example/v1"));
+        // 用 ? # \\ 把「@localhost」藏进查询串 / 片段 / 路径：URL 解析器认为主机仍是 evil.example
+        for sneaky in [
+            "http://evil.example?@localhost/v1",
+            "http://evil.example#@localhost/v1",
+            "http://evil.example\\@localhost/v1",
+            "http://evil.example:80?@127.0.0.1/v1",
+        ] {
+            assert!(!is_loopback(sneaky), "{sneaky} 的真实主机是 evil.example，不能算本地");
+        }
+        // 解析不了的不算本地
+        assert!(!is_loopback("localhost:11434/v1"));
+        // 主机名不分大小写
+        assert!(is_loopback("http://LocalHost:11434/v1"));
     }
 }

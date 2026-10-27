@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type HotkeyView, type ProviderView } from "../../lib/ipc";
+import { isUnsavedForm } from "./form";
 
 export function SettingsView({ onBack }: { onBack: () => void }) {
   const [providers, setProviders] = useState<ProviderView[]>([]);
@@ -61,7 +62,14 @@ export function SettingsView({ onBack }: { onBack: () => void }) {
           setCapturing(null);
           setHotkeyError(null);
         })
-        .catch((err) => setHotkeyError(String(err).replace(/^Error:\s*/, "")));
+        .catch((err) => {
+          setHotkeyError(String(err).replace(/^Error:\s*/, ""));
+          // 失败时 Rust 可能已经装不回旧键（它会把旧键忘掉）：重新取一次，行上才会标「未生效」
+          void api
+            .hotkeyList()
+            .then(setHotkeys)
+            .catch(() => {});
+        });
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
@@ -226,12 +234,17 @@ export function SettingsView({ onBack }: { onBack: () => void }) {
             disabled={busy !== null}
             onClick={() =>
               guard("test", async () => {
-                const result = await api.testConnection(selected.id);
+                // 明文 Key 只在这一刻从输入框读出来、交给 Rust 用一次；不进 state，也不保存
+                const typedKey = keyRef.current?.value.trim() ?? "";
+                const result = await api.testConnection(selected.id, { baseUrl, model, key: typedKey });
+                // 测的是表单里的值：和已保存的不一样时要说清，免得用户以为测的是生效的那份
+                const unsaved = isUnsavedForm(selected, { baseUrl, model, key: typedKey });
                 setNotice({
                   ok: result.ok,
-                  text: result.ok
-                    ? `连接正常 · ${result.model} · ${result.latency_ms}ms`
-                    : result.message,
+                  text:
+                    (result.ok
+                      ? `连接正常 · ${result.model} · ${result.latency_ms}ms`
+                      : result.message) + (unsaved ? "（测的是表单里还没保存的值）" : ""),
                 });
               })
             }
@@ -295,6 +308,9 @@ export function SettingsView({ onBack }: { onBack: () => void }) {
                 >
                   {capturing === item.kind ? "按下新组合…" : item.display}
                 </kbd>
+                {!item.active && capturing !== item.kind && (
+                  <span className="text-[13px] text-[#f6b09b]">未生效 · 多半被别的 App 占了</span>
+                )}
                 <button
                   type="button"
                   onClick={() => {
@@ -334,13 +350,6 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
-const MODIFIER_LABEL: Record<string, string> = {
-  ctrl: "⌃",
-  alt: "⌥",
-  shift: "⇧",
-  cmd: "⌘",
-};
-
 /** 键盘事件 → 配置里那种 `ctrl+alt+cmd+x`；不合规就返回原因。 */
 function comboFrom(event: KeyboardEvent): { spec: string } | { error: string } {
   if (["Control", "Alt", "Shift", "Meta"].includes(event.key)) {
@@ -364,10 +373,4 @@ function comboFrom(event: KeyboardEvent): { spec: string } | { error: string } {
   else return { error: "只支持字母、数字、空格" };
 
   return { spec: [...modifiers, main].join("+") };
-}
-
-export function hotkeyLabel(spec: string): string {
-  const parts = spec.split("+");
-  const main = parts.pop() ?? "";
-  return parts.map((part) => MODIFIER_LABEL[part] ?? part).join("") + main.toUpperCase();
 }

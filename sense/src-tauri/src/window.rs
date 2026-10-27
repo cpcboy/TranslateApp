@@ -2,10 +2,10 @@
 //!
 //! 所有窗口操作都在 Rust 侧完成；前端只调 `hide_window`，不碰窗口权限。
 
-use std::sync::{Mutex, RwLock};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
 
 use crate::settings::{self, DEFAULT_HOTKEY_SPEC};
@@ -20,18 +20,24 @@ pub const DEFAULT_HOTKEY_DISPLAY: &str = "⌃⌥⌘Space";
 /// 选它的理由：不在 macOS 符号快捷键表里，也不与微信/QQ/系统截屏（⇧⌘4）冲突。
 pub const DEFAULT_CAPTURE_SPEC: &str = "ctrl+alt+cmd+x";
 
-/// 当前**已注册成功**的键帽。注册失败时保持 None，界面就不显示键帽。
-static ACTIVE_DISPLAY: RwLock<Option<String>> = RwLock::new(None);
+/// 一个**已经注册成功**的快捷键：键本身 + 给人看的键帽。
+#[derive(Clone)]
+struct ActiveKey {
+    shortcut: Shortcut,
+    display: String,
+}
 
-/// 已注册的两个快捷键。改键时要先 unregister 旧的、注册失败还要能回滚。
+/// 已注册的两个快捷键，也是「当前实际生效的是什么」唯一的来源。
+/// 改键时要先 unregister 旧的、注册失败还要能回滚；设置页、标题栏键帽都读这里，
+/// 不读配置文件——配置里写的键可能根本没注册上。
 #[derive(Default)]
 pub struct HotkeyState {
-    lookup: Mutex<Option<Shortcut>>,
-    capture: Mutex<Option<Shortcut>>,
+    lookup: Mutex<Option<ActiveKey>>,
+    capture: Mutex<Option<ActiveKey>>,
 }
 
 impl HotkeyState {
-    fn slot(&self, kind: &str) -> &Mutex<Option<Shortcut>> {
+    fn slot(&self, kind: &str) -> &Mutex<Option<ActiveKey>> {
         if kind == "capture" {
             &self.capture
         } else {
@@ -40,17 +46,91 @@ impl HotkeyState {
     }
 
     pub fn get(&self, kind: &str) -> Option<Shortcut> {
-        self.slot(kind).lock().ok().and_then(|slot| *slot)
+        self.slot(kind)
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|active| active.shortcut))
     }
 
-    pub fn remember(&self, kind: &str, shortcut: Shortcut) {
+    /// 实际生效的键帽；没注册上就是 None。
+    pub fn display(&self, kind: &str) -> Option<String> {
+        self.slot(kind)
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|active| active.display.clone()))
+    }
+
+    pub fn remember(&self, kind: &str, shortcut: Shortcut, display: &str) {
         if let Ok(mut slot) = self.slot(kind).lock() {
-            *slot = Some(shortcut);
+            *slot = Some(ActiveKey {
+                shortcut,
+                display: display.to_string(),
+            });
+        }
+    }
+
+    /// 旧键装不回去时用：别再宣称它生效。
+    pub fn forget(&self, kind: &str) {
+        if let Ok(mut slot) = self.slot(kind).lock() {
+            *slot = None;
         }
     }
 
     fn other(&self, kind: &str) -> Option<Shortcut> {
         self.get(if kind == "capture" { "lookup" } else { "capture" })
+    }
+}
+
+/// 启动时注册一个快捷键的结果。
+pub struct Startup {
+    /// 实际生效的键帽；两个都注册不上时为 None
+    pub active: Option<String>,
+    /// 配置的键没注册上，生效的是回退键
+    pub fell_back: bool,
+    /// 按先后顺序的失败原因，给日志用
+    pub errors: Vec<String>,
+}
+
+/// 启动时注册：配置的键注册不上就退回 `fallback`（可以没有）。
+///
+/// 成功注册的那个——无论哪一个——都记进 `HotkeyState`。以前回退成功后没记，
+/// 之后在设置里改键，`set_hotkey` 取不到旧键，回退键就一直占着，两个组合同时能呼出窗口。
+pub fn register_with_fallback(
+    state: &HotkeyState,
+    kind: &str,
+    configured: Hotkey,
+    fallback: Option<Hotkey>,
+    mut register: impl FnMut(Shortcut) -> Result<(), String>,
+) -> Startup {
+    let mut errors = Vec::new();
+    match register(configured.shortcut) {
+        Ok(()) => {
+            state.remember(kind, configured.shortcut, &configured.display);
+            return Startup {
+                active: Some(configured.display),
+                fell_back: false,
+                errors,
+            };
+        }
+        Err(err) => errors.push(err),
+    }
+    if let Some(fallback) = fallback {
+        match register(fallback.shortcut) {
+            Ok(()) => {
+                state.remember(kind, fallback.shortcut, &fallback.display);
+                return Startup {
+                    active: Some(fallback.display),
+                    fell_back: true,
+                    errors,
+                };
+            }
+            Err(err) => errors.push(err),
+        }
+    }
+    Startup {
+        active: None,
+        fell_back: false,
+        errors,
     }
 }
 
@@ -79,12 +159,17 @@ pub fn set_hotkey(
     let plugin = app.global_shortcut();
     let previous = state.get(&kind);
     if let Some(shortcut) = previous {
-        let _ = plugin.unregister(shortcut);
+        // 注销失败很少见，但失败了旧键就还占着：不能装作没事，至少留下日志
+        if let Err(err) = plugin.unregister(shortcut) {
+            eprintln!("[sense] 注销旧的 {kind} 快捷键失败：{err}");
+        }
     }
 
     match crate::register_hotkey(&app, &kind, parsed.shortcut) {
         Ok(()) => {
-            state.remember(&kind, parsed.shortcut);
+            state.remember(&kind, parsed.shortcut, &parsed.display);
+            // 标题栏的键帽只在启动时取过一次：告诉界面重新取
+            let _ = app.emit("sense://hotkey-changed", &kind);
             let key = if kind == "capture" {
                 "capture_hotkey"
             } else {
@@ -96,18 +181,20 @@ pub fn set_hotkey(
             })
             .map_err(|err| format!("键已生效，但写配置失败：{err}"))?;
 
-            if kind == "lookup" {
-                set_active_display(Some(parsed.display.clone()));
-            }
             println!("[sense] hotkey updated: {kind} → {}", parsed.display);
             Ok(HotkeyView {
                 kind,
                 display: parsed.display,
+                active: true,
             })
         }
         Err(err) => {
             if let Some(shortcut) = previous {
-                let _ = crate::register_hotkey(&app, &kind, shortcut);
+                // 旧键装不回去就别再说它生效
+                if crate::register_hotkey(&app, &kind, shortcut).is_err() {
+                    state.forget(&kind);
+                    let _ = app.emit("sense://hotkey-changed", &kind);
+                }
             }
             Err(format!("这个组合注册不上（可能被别的 App 占了）：{err}"))
         }
@@ -302,46 +389,46 @@ fn load_named(app: &AppHandle, key: &str, default_spec: &str) -> (Hotkey, String
     }
 }
 
-/// 改键结果：前端拿到新的键帽显示。
-#[derive(serde::Serialize)]
+/// 一个快捷键给界面看的样子。
+#[derive(serde::Serialize, Debug, PartialEq, Eq)]
 pub struct HotkeyView {
     pub kind: String,
     pub display: String,
+    /// 是否真的注册成功。false 时 `display` 是配置里写的键，它并不生效。
+    pub active: bool,
 }
 
-/// 当前两个快捷键的键帽，供设置页展示。
+fn view_of(state: &HotkeyState, kind: &str, configured_display: String) -> HotkeyView {
+    match state.display(kind) {
+        Some(display) => HotkeyView {
+            kind: kind.to_string(),
+            display,
+            active: true,
+        },
+        None => HotkeyView {
+            kind: kind.to_string(),
+            display: configured_display,
+            active: false,
+        },
+    }
+}
+
+/// 当前两个快捷键，供设置页展示。以注册状态为准，不是配置文件：
+/// 配置里写了、却被别的 App 占着没注册上的键，要标成「未生效」。
 #[tauri::command]
-pub fn hotkey_list(app: AppHandle) -> Vec<HotkeyView> {
+pub fn hotkey_list(app: AppHandle, state: tauri::State<'_, HotkeyState>) -> Vec<HotkeyView> {
     let (lookup, _) = load_named(&app, "hotkey", DEFAULT_HOTKEY_SPEC);
     let (capture, _) = load_named(&app, "capture_hotkey", DEFAULT_CAPTURE_SPEC);
     vec![
-        HotkeyView {
-            kind: "lookup".into(),
-            display: lookup.display,
-        },
-        HotkeyView {
-            kind: "capture".into(),
-            display: capture.display,
-        },
+        view_of(&state, "lookup", lookup.display),
+        view_of(&state, "capture", capture.display),
     ]
 }
 
-/// 记录「当前实际生效的键帽」。注册成功才调用；传 None 表示没有可用快捷键。
-pub fn set_active_display(display: Option<String>) {
-    let mut guard = ACTIVE_DISPLAY
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *guard = display;
-}
-
-/// 前端取键帽文案。没有可用快捷键时返回空串，界面会退化成只显示 Esc。
+/// 前端取查词键帽文案。没有可用快捷键时返回空串，界面会退化成只显示 Esc。
 #[tauri::command]
-pub fn hotkey_hint() -> String {
-    ACTIVE_DISPLAY
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
-        .unwrap_or_default()
+pub fn hotkey_hint(state: tauri::State<'_, HotkeyState>) -> String {
+    state.display("lookup").unwrap_or_default()
 }
 
 /// 记录窗口最近一次被显示的时刻，用于失焦宽限。
@@ -576,5 +663,101 @@ mod tests {
         ] {
             assert!(parse_hotkey(bad).is_err(), "`{bad}` 应当被拒绝");
         }
+    }
+
+    fn hotkey(spec: &str) -> Hotkey {
+        parse_hotkey(spec).expect("测试用快捷键必须可解析")
+    }
+
+    #[test]
+    fn fallback_registration_is_remembered_so_it_can_be_replaced_later() {
+        let state = HotkeyState::default();
+        let configured = hotkey("ctrl+alt+k");
+        let bad = configured.shortcut;
+        let default = default_hotkey();
+        let default_shortcut = default.shortcut;
+
+        // 配置的键被别的 App 占了，默认键能注册
+        let startup = register_with_fallback(&state, "lookup", configured, Some(default), |shortcut| {
+            if shortcut == bad {
+                Err("被占用".to_string())
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(startup.fell_back);
+        assert_eq!(startup.active.as_deref(), Some(DEFAULT_HOTKEY_DISPLAY));
+        assert_eq!(startup.errors, vec!["被占用".to_string()]);
+        // 关键：回退键必须记下来，否则 set_hotkey 的 previous 是 None，回退键永远不会被注销
+        assert_eq!(state.get("lookup"), Some(default_shortcut));
+        assert_eq!(state.display("lookup").as_deref(), Some(DEFAULT_HOTKEY_DISPLAY));
+    }
+
+    #[test]
+    fn configured_key_wins_when_it_registers() {
+        let state = HotkeyState::default();
+        let configured = hotkey("ctrl+alt+k");
+        let shortcut = configured.shortcut;
+        let mut attempts = 0;
+        let startup = register_with_fallback(&state, "lookup", configured, Some(default_hotkey()), |_| {
+            attempts += 1;
+            Ok(())
+        });
+        assert!(!startup.fell_back);
+        assert_eq!(attempts, 1, "配置的键能用就不去碰默认键");
+        assert_eq!(startup.active.as_deref(), Some("⌃⌥K"));
+        assert_eq!(state.get("lookup"), Some(shortcut));
+    }
+
+    #[test]
+    fn nothing_is_remembered_when_every_attempt_fails() {
+        let state = HotkeyState::default();
+        let startup = register_with_fallback(
+            &state,
+            "lookup",
+            hotkey("ctrl+alt+k"),
+            Some(default_hotkey()),
+            |_| Err("都被占了".to_string()),
+        );
+        assert!(startup.active.is_none());
+        assert_eq!(startup.errors.len(), 2);
+        assert!(state.get("lookup").is_none());
+        assert!(state.display("lookup").is_none());
+    }
+
+    #[test]
+    fn capture_key_has_no_fallback() {
+        let state = HotkeyState::default();
+        let startup = register_with_fallback(&state, "capture", hotkey("ctrl+alt+cmd+x"), None, |_| {
+            Err("被占用".to_string())
+        });
+        assert!(startup.active.is_none());
+        assert_eq!(startup.errors.len(), 1);
+        assert!(state.get("capture").is_none());
+        assert!(state.get("lookup").is_none(), "两个槽位互不影响");
+    }
+
+    #[test]
+    fn hotkey_view_follows_registration_not_config() {
+        let state = HotkeyState::default();
+        // 配置写了 ⌃⌥⌘X，但没注册上：必须标成未生效，而不是照着配置显示
+        let view = view_of(&state, "capture", "⌃⌥⌘X".to_string());
+        assert_eq!(
+            view,
+            HotkeyView { kind: "capture".into(), display: "⌃⌥⌘X".into(), active: false }
+        );
+
+        // 回退到默认键之后，显示的是实际生效的默认键
+        state.remember("lookup", default_hotkey().shortcut, DEFAULT_HOTKEY_DISPLAY);
+        let view = view_of(&state, "lookup", "⌃⌥K".to_string());
+        assert_eq!(
+            view,
+            HotkeyView { kind: "lookup".into(), display: DEFAULT_HOTKEY_DISPLAY.into(), active: true }
+        );
+
+        // 旧键装不回去：忘掉它，界面不再宣称生效
+        state.forget("lookup");
+        assert!(!view_of(&state, "lookup", "⌃⌥K".to_string()).active);
     }
 }

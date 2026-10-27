@@ -60,6 +60,27 @@ pub fn list_providers(app: AppHandle) -> Vec<ProviderView> {
         .collect()
 }
 
+/// 校验并规整一组 (base_url, model)：保存和「测试连接」用同一套规则，
+/// 不然会出现「测试通过、保存却被拒」或反过来。
+fn validate_endpoint(base_url: &str, model: &str) -> Result<(String, String), String> {
+    let base_url = base_url.trim().trim_end_matches('/').to_string();
+    let model = model.trim().to_string();
+    if base_url.is_empty() || model.is_empty() {
+        return Err("base_url 与 model 不能为空".to_string());
+    }
+    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+        return Err("base_url 必须以 http:// 或 https:// 开头".to_string());
+    }
+    // 明文 http 只允许本地模型（Ollama）；远端一律 https，别把 Key 裸奔发出去。
+    // 「是不是本地」和选客户端用同一个判断：以前这里自己按 ':' 切主机名，
+    // `http://localhost:80@evil.example` 会被当成本地放行（真正的主机是 @ 后面的），Key 就明文发给了 evil.example；
+    // `http://[::1]:11434` 这种合法的本地写法反而被拒
+    if base_url.starts_with("http://") && !crate::is_loopback(&base_url) {
+        return Err("远端地址请用 https://；明文 http 只允许本地模型".to_string());
+    }
+    Ok((base_url, model))
+}
+
 #[tauri::command]
 pub fn save_provider(
     app: AppHandle,
@@ -70,26 +91,7 @@ pub fn save_provider(
     if !providers::presets().iter().any(|preset| preset.id == id) {
         return Err(format!("未知的 provider：{id}"));
     }
-    let base_url = base_url.trim().trim_end_matches('/').to_string();
-    let model = model.trim().to_string();
-    if base_url.is_empty() || model.is_empty() {
-        return Err("base_url 与 model 不能为空".to_string());
-    }
-    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
-        return Err("base_url 必须以 http:// 或 https:// 开头".to_string());
-    }
-    // 明文 http 只允许本地模型（Ollama）；远端一律 https，别把 Key 裸奔发出去。
-    if base_url.starts_with("http://") {
-        let host = base_url
-            .trim_start_matches("http://")
-            .split(['/', ':'])
-            .next()
-            .unwrap_or_default();
-        let loopback = matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]");
-        if !loopback {
-            return Err("远端地址请用 https://；明文 http 只允许本地模型".to_string());
-        }
-    }
+    let (base_url, model) = validate_endpoint(&base_url, &model)?;
 
     // 逐字段合并：不能整个对象覆盖，否则会把 key_mask 冲掉。
     settings::update(&app, |map| {
@@ -181,28 +183,46 @@ pub fn dev_flags() -> serde_json::Value {
 }
 
 /// 测试连接：走 `/models`，免费且能拿到模型名与延迟。
+///
+/// 测的是**表单里当前的值**，不是已保存的：`base_url` / `model` / `key` 有值就用它们，
+/// 都不落盘。以前总是测已保存的配置，用户改了地址点「测试连接」，测的却是旧地址，
+/// 通过了保存后才发现新地址不通。`key` 只在这一次请求里用，不写钥匙串、不写日志。
 #[tauri::command]
-pub async fn test_connection(app: AppHandle, id: String) -> Result<TestResult, String> {
-    let provider = providers::resolve(&app, &id)?;
+pub async fn test_connection(
+    app: AppHandle,
+    id: String,
+    base_url: Option<String>,
+    model: Option<String>,
+    key: Option<String>,
+) -> Result<TestResult, String> {
+    let mut provider = providers::resolve(&app, &id)?;
+    if base_url.is_some() || model.is_some() {
+        let (url, name) = validate_endpoint(
+            base_url.as_deref().unwrap_or(&provider.base_url),
+            model.as_deref().unwrap_or(&provider.model),
+        )?;
+        provider.base_url = url;
+        provider.model = name;
+    }
 
-    let key = if provider.requires_key {
-        match secrets::get_key(&id)? {
-            Some(key) => Some(key),
-            None => {
-                return Ok(TestResult {
-                    ok: false,
-                    model: provider.model.clone(),
-                    latency_ms: 0,
-                    message: "还没填 API Key。去上面填一个，30 秒搞定。".to_string(),
-                });
-            }
-        }
-    } else {
-        None
+    let typed = key.as_deref().map(str::trim).filter(|item| !item.is_empty());
+    let key = match typed {
+        Some(typed) => Some(typed.to_string()),
+        None if provider.requires_key => secrets::get_key(&id)?,
+        None => None,
     };
+    if provider.requires_key && key.is_none() {
+        return Ok(TestResult {
+            ok: false,
+            model: provider.model.clone(),
+            latency_ms: 0,
+            message: "还没填 API Key。去上面填一个，30 秒搞定。".to_string(),
+        });
+    }
 
-    let client = crate::http_client();
-    match openai_compat::list_models(&client, &provider, key.as_deref()).await {
+    // 本地模型要绕开系统代理，和真正查词走同一条路，否则「测试通过、查词不通」
+    let client = crate::client_for(&provider.base_url);
+    match openai_compat::list_models(client, &provider, key.as_deref()).await {
         Ok((latency_ms, models)) => {
             if !models.is_empty() && !models.iter().any(|item| item == &provider.model) {
                 return Ok(TestResult {
@@ -229,5 +249,38 @@ pub async fn test_connection(app: AppHandle, id: String) -> Result<TestResult, S
             latency_ms: 0,
             message: err.message(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_is_trimmed_and_validated_like_save() {
+        assert_eq!(
+            validate_endpoint(" https://api.deepseek.com/v1/ ", " deepseek-chat ").unwrap(),
+            ("https://api.deepseek.com/v1".to_string(), "deepseek-chat".to_string())
+        );
+        assert!(validate_endpoint("http://127.0.0.1:11434/v1", "m").is_ok(), "本地明文 http 放行");
+        assert!(validate_endpoint("http://api.example.com/v1", "m").is_err(), "远端明文 http 拒绝");
+        assert!(validate_endpoint("http://[::1]:11434/v1", "m").is_ok(), "IPv6 本地地址放行");
+        assert!(validate_endpoint("http://LocalHost:11434/v1", "m").is_ok(), "主机名不分大小写");
+        assert!(
+            validate_endpoint("http://localhost:80@evil.example/v1", "m").is_err(),
+            "userinfo 里写 localhost 不能骗过本地判断：Key 会明文发给 @ 后面的主机"
+        );
+        assert!(validate_endpoint("http://127.0.0.1:1@evil.example/v1", "m").is_err());
+        for sneaky in [
+            "http://evil.example?@localhost/v1",
+            "http://evil.example#@localhost/v1",
+            "http://evil.example\\@localhost/v1",
+            "http://evil.example:80?@127.0.0.1/v1",
+        ] {
+            assert!(validate_endpoint(sneaky, "m").is_err(), "{sneaky}：真实主机是远端，明文 http 必须拒绝");
+        }
+        assert!(validate_endpoint("ftp://x", "m").is_err());
+        assert!(validate_endpoint("", "m").is_err());
+        assert!(validate_endpoint("https://a/v1", "  ").is_err());
     }
 }
