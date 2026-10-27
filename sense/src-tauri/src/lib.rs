@@ -247,6 +247,20 @@ pub fn run() {
                 });
             }
 
+            // 仅供自动化验证（debug 构建）：拿一张现成的 PNG 走 OCR → 翻译 → 覆盖层，
+            // 不需要屏幕录制权限，也不用人工拖框。
+            if let Some(png) = window::dev_value("SENSE_DEV_CAPTURE_PNG") {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(1200)).await;
+                    let state = handle.state::<capture::CaptureState>();
+                    match capture::dev_capture_png(&handle, &state, &png).await {
+                        Ok(count) => println!("[sense] dev capture: {count} 块"),
+                        Err(err) => eprintln!("[sense] dev capture 失败: {err}"),
+                    }
+                });
+            }
+
             // 仅供本机验证：不设这个变量时，启动后窗口保持隐藏（产品行为）。
             if window::dev_flag("SENSE_SHOW_ON_START") {
                 let handle = app.handle().clone();

@@ -50,6 +50,10 @@ use crate::secrets;
 pub const CAPTURE_WINDOW: &str = "capture";
 pub const OVERLAY_WINDOW: &str = "overlay";
 
+/// 覆盖层带失败提示时的最小尺寸（逻辑像素）：12.5px 的提示两三行刚好放下。
+const ALERT_MIN_WIDTH: f64 = 300.0;
+const ALERT_MIN_HEIGHT: f64 = 84.0;
+
 /// OCR 出来的一行（图片像素坐标，原点左上）。
 #[derive(Debug, Clone, Default, Deserialize)]
 struct OcrLine {
@@ -78,8 +82,17 @@ pub struct Block {
 #[derive(Default)]
 pub struct CaptureState {
     blocks: Mutex<Vec<Block>>,
+    /// 翻译这一步失败的原因。覆盖层必须把它说出来：只画原文，用户会以为「翻译过了」
+    error: Mutex<Option<String>>,
     /// 最近一次选区（逻辑像素，全局坐标），重试或调试用
     last_rect: Mutex<Option<(f64, f64, f64, f64)>>,
+}
+
+/// 覆盖层拿到的全部内容：识别块 + 翻译失败的原因（成功时为 None）。
+#[derive(Debug, Clone, Serialize)]
+pub struct CaptureView {
+    pub blocks: Vec<Block>,
+    pub error: Option<String>,
 }
 
 /// 记一行到 `~/Library/Application Support/com.sense.app/capture.log`。
@@ -117,8 +130,17 @@ pub fn close_overlay(app: AppHandle) {
 }
 
 #[tauri::command]
-pub fn capture_blocks(state: State<'_, CaptureState>) -> Vec<Block> {
-    state.blocks.lock().map(|items| items.clone()).unwrap_or_default()
+pub fn capture_blocks(app: AppHandle, state: State<'_, CaptureState>) -> CaptureView {
+    let view = CaptureView {
+        blocks: state.blocks.lock().map(|items| items.clone()).unwrap_or_default(),
+        error: state.error.lock().ok().and_then(|slot| slot.clone()),
+    };
+    // 覆盖层真的取到了什么，留一行日志：从访达启动时只能靠它复盘
+    trace(
+        &app,
+        format!("overlay fetched blocks={} error={:?}", view.blocks.len(), view.error),
+    );
+    view
 }
 
 /// 原生选区：调 `screencapture -i` 让系统画选框（拖动永远可靠），
@@ -253,26 +275,50 @@ pub async fn run_with_image(
     let scale = monitor_scale(app);
     let mut blocks = merge_lines(&lines, scale);
 
-    if let Some(target) = translate_target(&blocks) {
-        match translate_blocks(&app, &mut blocks, target).await {
-            Ok(()) => {}
-            Err(err) => {
-                // 翻译失败也把原文盖上去：至少让用户看到识别结果，而不是一片空白
+    // 翻译失败也把原文盖上去，至少让用户看到识别结果；
+    // 但失败原因必须一起交给覆盖层，不能让原文冒充译文。
+    let mut failure = None;
+    match translate_target(&blocks) {
+        Some(target) => {
+            if let Err(err) = translate_blocks(app, &mut blocks, target).await {
                 eprintln!("[sense] 截图翻译失败：{err}");
+                failure = Some(err);
             }
         }
+        // 只有日文假名、韩文、俄文或纯数字符号：没翻也要说一声
+        None => failure = Some("选区里没有中文或英文，目前只支持中英互译".to_string()),
+    }
+
+    // 有失败提示时，覆盖层至少要放得下这条提示：只框了一行字时选区太矮，提示会被截掉
+    let (w, h) = if failure.is_some() {
+        (w.max(ALERT_MIN_WIDTH), h.max(ALERT_MIN_HEIGHT))
+    } else {
+        (w, h)
+    };
+    // 放大后不能伸出屏幕（靠右下角框选时）：窗口往回挪，块的位置同步补偿，仍对准原文
+    let (shift_x, shift_y) = screen_bounds(app)
+        .map(|bounds| shift_into(x, y, w, h, bounds))
+        .unwrap_or((0.0, 0.0));
+    let (x, y) = (x - shift_x, y - shift_y);
+    for block in &mut blocks {
+        block.x += shift_x;
+        block.y += shift_y;
     }
 
     trace(
         app,
         format!(
-            "blocks={} translated={}",
+            "blocks={} translated={} error={:?}",
             blocks.len(),
-            blocks.iter().filter(|block| block.translated).count()
+            blocks.iter().filter(|block| block.translated).count(),
+            failure
         ),
     );
     if let Ok(mut slot) = state.blocks.lock() {
         *slot = blocks.clone();
+    }
+    if let Ok(mut slot) = state.error.lock() {
+        *slot = failure;
     }
 
     let overlay = WebviewWindowBuilder::new(app, OVERLAY_WINDOW, WebviewUrl::App("index.html".into()))
@@ -292,6 +338,55 @@ pub async fn run_with_image(
     let _ = overlay.set_focus();
 
     Ok(blocks.len())
+}
+
+/// 仅供自动化验证（`SENSE_DEV_CAPTURE_PNG`）：把一张现成的 PNG 当作选区截图，
+/// 跳过屏幕录制权限与手工拖框，走同一条 OCR → 翻译 → 覆盖层链路。
+pub async fn dev_capture_png(app: &AppHandle, state: &CaptureState, source: &str) -> Result<usize, String> {
+    // run_with_image 用完会删掉图片，先复制一份，别动调用方的文件
+    let png = std::env::temp_dir().join(format!("sense-dev-capture-{}.png", std::process::id()));
+    std::fs::copy(source, &png).map_err(|err| format!("复制测试图片失败：{err}"))?;
+    let (width, height) = png_size(&png)?;
+    let scale = monitor_scale(app);
+    run_with_image(
+        app,
+        state,
+        120.0,
+        120.0,
+        f64::from(width) / scale,
+        f64::from(height) / scale,
+        &png,
+    )
+    .await
+}
+
+/// 读 PNG 的宽高（IHDR 固定在第 16–24 字节，大端）。
+fn png_size(path: &Path) -> Result<(u32, u32), String> {
+    let bytes = std::fs::read(path).map_err(|err| format!("读取图片失败：{err}"))?;
+    if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" {
+        return Err("不是 PNG 图片".to_string());
+    }
+    let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    Ok((width, height))
+}
+
+/// 鼠标所在屏幕的逻辑坐标范围：(左, 上, 右, 下)。
+fn screen_bounds(app: &AppHandle) -> Option<(f64, f64, f64, f64)> {
+    let point = app.cursor_position().ok()?;
+    let monitor = app.monitor_from_point(point.x, point.y).ok().flatten()?;
+    let scale = monitor.scale_factor();
+    let origin = monitor.position().to_logical::<f64>(scale);
+    let size = monitor.size().to_logical::<f64>(scale);
+    Some((origin.x, origin.y, origin.x + size.width, origin.y + size.height))
+}
+
+/// 窗口 (x, y, w, h) 伸出屏幕右边或下边时，需要往左、往上挪多少；挪到贴住左上边为止。
+fn shift_into(x: f64, y: f64, w: f64, h: f64, bounds: (f64, f64, f64, f64)) -> (f64, f64) {
+    let (left, top, right, bottom) = bounds;
+    let shift_x = (x + w - right).max(0.0).min((x - left).max(0.0));
+    let shift_y = (y + h - bottom).max(0.0).min((y - top).max(0.0));
+    (shift_x, shift_y)
 }
 
 /// 取鼠标所在屏幕的缩放，用来把图片像素换算成逻辑像素。
@@ -419,7 +514,11 @@ fn translate_target(blocks: &[Block]) -> Option<&'static str> {
 async fn translate_blocks(app: &AppHandle, blocks: &mut [Block], target: &str) -> Result<(), String> {
     let provider = provider_registry::active(app)?;
     let key = if provider.requires_key {
-        secrets::get_key(&provider.id)?
+        match secrets::get_key(&provider.id)? {
+            Some(key) => Some(key),
+            // 没 Key 就别发请求：发出去只会拿到 401，提示会变成误导人的「Key 无效」
+            None => return Err("还没填 API Key，去「设置」里填一个".to_string()),
+        }
     } else {
         None
     };
@@ -516,6 +615,28 @@ mod tests {
         assert_eq!(blocks.len(), 2, "相邻两行应合成一段");
         assert_eq!(blocks[0].text, "The quick brown fox jumps over");
         assert!(blocks[0].h > 30.0, "高度要覆盖两行");
+    }
+
+    #[test]
+    fn enlarged_overlay_is_pulled_back_on_screen() {
+        let screen = (0.0, 0.0, 1920.0, 1080.0);
+        assert_eq!(shift_into(100.0, 100.0, 300.0, 84.0, screen), (0.0, 0.0), "放得下就不挪");
+        assert_eq!(shift_into(1800.0, 1050.0, 300.0, 84.0, screen), (180.0, 54.0), "右下角往回挪");
+        assert_eq!(shift_into(10.0, 10.0, 3000.0, 84.0, screen), (10.0, 0.0), "最多挪到贴住左边");
+    }
+
+    #[test]
+    fn png_size_reads_ihdr_and_rejects_other_files() {
+        let path = std::env::temp_dir().join(format!("sense-png-size-{}.png", std::process::id()));
+        let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        bytes.extend_from_slice(&277u32.to_be_bytes());
+        bytes.extend_from_slice(&104u32.to_be_bytes());
+        std::fs::write(&path, &bytes).expect("写测试文件");
+        assert_eq!(png_size(&path).expect("应能读出尺寸"), (277, 104));
+
+        std::fs::write(&path, b"not a png at all, just text").expect("写测试文件");
+        assert!(png_size(&path).is_err(), "非 PNG 必须报错");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

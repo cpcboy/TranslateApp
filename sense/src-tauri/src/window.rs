@@ -492,6 +492,16 @@ pub fn dev_flag(name: &str) -> bool {
     cfg!(debug_assertions) && std::env::var(name).is_ok()
 }
 
+/// 开发期取值：同 `dev_flag`，只在 debug 构建里读，空值当没设。
+pub fn dev_value(name: &str) -> Option<String> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -9,13 +9,21 @@ import { api, type OverlayBlock } from "../../lib/ipc";
  */
 export function TranslateOverlay() {
   const [blocks, setBlocks] = useState<OverlayBlock[] | null>(null);
+  // 翻译失败的原因。有它时下面画的是识别出的原文，必须明说，不能让原文冒充译文
+  const [error, setError] = useState<string | null>(null);
   const [hint, setHint] = useState(true);
 
   useEffect(() => {
     void api
       .captureBlocks()
-      .then(setBlocks)
-      .catch(() => setBlocks([]));
+      .then((view) => {
+        setBlocks(view.blocks);
+        setError(view.error);
+      })
+      .catch((err) => {
+        setBlocks([]);
+        setError(String(err).replace(/^Error:\s*/, ""));
+      });
 
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") void api.closeOverlay();
@@ -53,13 +61,23 @@ export function TranslateOverlay() {
         <BlockView key={`${block.x}-${block.y}-${index}`} block={block} />
       ))}
 
-      {blocks !== null && blocks.length === 0 && (
+      {blocks !== null && blocks.length === 0 && !error && (
         <div className="absolute left-2 top-2 rounded bg-[rgba(14,14,18,0.95)] px-3 py-2 text-[13px] text-[#f6f3ed]">
           没识别到文字
         </div>
       )}
 
-      {hint && blocks !== null && blocks.length > 0 && (
+      {error && (
+        <div
+          role="alert"
+          className="absolute inset-x-1 top-1 z-10 max-h-[calc(100%-8px)] overflow-y-auto rounded border border-[rgba(255,107,74,0.6)] bg-[rgba(48,14,10,0.97)] px-2.5 py-1.5 text-[12.5px] leading-snug text-[#ffd8cc]"
+        >
+          翻译失败：{error.replace(/[。.\s]+$/, "")}。
+          {blocks && blocks.length > 0 ? "下面是识别出的原文，" : ""}点击或 Esc 关闭。
+        </div>
+      )}
+
+      {hint && !error && blocks !== null && blocks.length > 0 && (
         <div className="pointer-events-none absolute right-2 top-2 rounded-full bg-[rgba(14,14,18,0.9)] px-3 py-1 text-[12px] text-[#b0aaa1]">
           Esc 关闭
         </div>

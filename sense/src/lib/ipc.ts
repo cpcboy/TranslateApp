@@ -52,6 +52,9 @@ export type OverlayBlock = {
   translated: boolean;
 };
 
+/** 覆盖层的全部内容：翻译失败时 error 给出原因，blocks 里是识别出的原文 */
+export type CaptureView = { blocks: OverlayBlock[]; error: string | null };
+
 export type LookupArgs = {
   word: string;
   lang?: "en" | "zh";
@@ -81,7 +84,7 @@ export const api = {
   cancelCapture: () => invoke<void>("cancel_capture"),
   finishCapture: (x: number, y: number, w: number, h: number) =>
     invoke<number>("finish_capture", { x, y, w, h }),
-  captureBlocks: () => invoke<OverlayBlock[]>("capture_blocks"),
+  captureBlocks: () => invoke<CaptureView>("capture_blocks"),
   closeOverlay: () => invoke<void>("close_overlay"),
   translateText: (text: string, requestId: string) =>
     invoke<{ text: string; truncated: boolean; incomplete: string | null }>("translate_text", {
