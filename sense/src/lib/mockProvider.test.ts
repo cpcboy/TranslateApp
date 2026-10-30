@@ -1,9 +1,11 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createMock, MARKERS, type MockServer } from "../../tools/mock-provider.mjs";
+import { createMock, MARKERS, ZH_SECTION, type MockServer } from "../../tools/mock-provider.mjs";
 // 用 Vite 的 ?raw 读 Rust 源码：不引入 Node 类型依赖
 import captureRs from "../../src-tauri/src/capture.rs?raw";
 import longtextRs from "../../src-tauri/src/commands/longtext.rs?raw";
 import readingRs from "../../src-tauri/src/commands/reading.rs?raw";
+import wordPrompt from "../../src-tauri/resources/prompts/system-word.txt?raw";
+import wordZhPrompt from "../../src-tauri/resources/prompts/system-word-zh.txt?raw";
 
 /**
  * mock 服务靠 system 提示词里的一句话认请求类型。Rust 里的提示词一改、这里没跟上，
@@ -16,6 +18,18 @@ describe("mock-provider 与 Rust 里的提示词保持同步", () => {
     expect(longtextRs).toContain(MARKERS.longText);
     expect(readingRs).toContain(MARKERS.grammar);
     expect(readingRs).toContain(MARKERS.explain);
+  });
+
+  it("中文输入那一节的标题：只在中文那份提示词里，英文那份没有（mock 靠它认「被要求先译成英文」）", () => {
+    expect(wordZhPrompt).toContain(ZH_SECTION);
+    expect(wordPrompt).not.toContain(ZH_SECTION);
+  });
+
+  it("查词提示词（含中文输入那一节）里没有别的请求类型的标记：mock 才会把它们当查词", () => {
+    for (const marker of Object.values(MARKERS)) {
+      expect(wordPrompt).not.toContain(marker);
+      expect(wordZhPrompt).not.toContain(marker);
+    }
   });
 });
 
@@ -84,5 +98,63 @@ describe("mock-provider 对每种请求都回对形状的数据", () => {
     const out = JSON.parse(await ask("# 角色\n词典", JSON.stringify({ word: "round", lang: "en", level: "B2", context: null })));
     expect(out.word).toBe("round");
     expect(out.senses.length).toBeGreaterThan(0);
+  });
+
+  it("查词（中文输入）：回译成英文的词条——词是英文、lang 是 en、不含汉字", async () => {
+    const out = JSON.parse(await ask(wordZhPrompt, JSON.stringify({ word: "充电", lang: "zh", level: "B2", context: null })));
+    expect(out.word).toBe("recharge");
+    expect(out.lang).toBe("en");
+    expect(out.word).not.toMatch(/[\u4e00-\u9fff]/);
+    expect(out.notes).toContain("charge");
+    expect(out.pronunciation.ipa).not.toBeNull();
+  });
+
+  it("查词（中文输入，system 里没有「中文输入」那一节）：模型没被要求先译成英文，回中文词条", async () => {
+    const out = JSON.parse(await ask("# 角色\n词典", JSON.stringify({ word: "充电", lang: "zh", level: "B2", context: null })));
+    expect(out.lang).toBe("zh");
+    expect(out.word).toBe("充电");
+  });
+
+  it("查词（中文输入，对照表里没有的词）：照样是英文词条", async () => {
+    const out = JSON.parse(await ask(wordZhPrompt, JSON.stringify({ word: "完全没见过的词", lang: "zh", level: "B2", context: null })));
+    expect(out.lang).toBe("en");
+    expect(out.word).not.toMatch(/[\u4e00-\u9fff]/);
+  });
+});
+
+describe("mock-provider 的 UNTRANSLATED 模式：模拟不听话的模型", () => {
+  it("中文输入仍回中文词条（lang 是 zh、词还是汉字）；英文输入不受影响", async () => {
+    const untranslated = createMock({ delay: 1, untranslated: true, log: null });
+    await new Promise<void>((resolve) => untranslated.listen(0, "127.0.0.1", resolve));
+    const address = untranslated.address();
+    const url = `http://127.0.0.1:${typeof address === "object" && address ? address.port : 0}/v1/chat/completions`;
+    const ask2 = async (word: string, lang: string) => {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "mock",
+          stream: true,
+          messages: [
+            { role: "system", content: wordZhPrompt },
+            { role: "user", content: JSON.stringify({ word, lang, level: "B2", context: null }) },
+          ],
+        }),
+      });
+      let text = "";
+      for (const line of (await response.text()).split("\n")) {
+        if (!line.startsWith("data: ") || line.includes("[DONE]")) continue;
+        text += JSON.parse(line.slice(6)).choices?.[0]?.delta?.content ?? "";
+      }
+      return JSON.parse(text);
+    };
+    try {
+      const zh = await ask2("充电", "zh");
+      expect(zh.lang).toBe("zh");
+      expect(zh.word).toBe("充电");
+      expect((await ask2("charge", "en")).word).toBe("charge");
+    } finally {
+      await new Promise<void>((resolve) => untranslated.close(() => resolve()));
+    }
   });
 });

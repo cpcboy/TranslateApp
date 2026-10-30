@@ -12,6 +12,7 @@
  * 用法：
  *   node tools/mock-provider.mjs            # 监听 11434，对应 Ollama 预设
  *   BAD=1 node tools/mock-provider.mjs      # 故意返回残缺包，测降级
+ *   UNTRANSLATED=1 node tools/mock-provider.mjs  # 中文输入仍回中文词条（模拟不听话的模型），测中译英的降级
  *   DELAY=120 PORT=11434 node tools/mock-provider.mjs
  *
  * 每个请求都会追加到 LOG 文件，用来证明「第二次查询 0 请求」。
@@ -28,6 +29,13 @@ export const MARKERS = {
   explain: "你是词典。根据上下文解释", // commands/reading.rs
 };
 
+/**
+ * 中文输入那一节提示词的标题（system-word-zh.txt 的第一行）。
+ * 模型是被提示词教会「先译成英文」的：mock 只有在 system 里看到这一节，才像听话的模型那样回英文词条；
+ * 看不到就按老办法回中文词条。这样 Rust 一侧要是忘了给中文输入发这一节，无 Key 的端到端会变红，而不是悄悄「成功」。
+ */
+export const ZH_SECTION = "# 中文输入";
+
 const CHUNK = 150;
 
 const sense = (rank, pos, gloss_zh, gloss_en, share, register, domains, collocations, text, translation, span, scene, pitfall, synonyms) => ({
@@ -36,7 +44,7 @@ const sense = (rank, pos, gloss_zh, gloss_en, share, register, domains, collocat
   pitfall, synonyms,
 });
 
-const makeEntry = (word, bad) => {
+const makeEntry = (word, bad, notes = null) => {
   const entry = {
   schema_version: 1,
   word,
@@ -67,7 +75,7 @@ const makeEntry = (word, bad) => {
       null, []),
   ],
   confusables: [{ word: "cost", difference: "cost 是主语自身花费，charge 是向别人收取。" }],
-  notes: null,
+  notes,
   };
   if (bad) {
     entry.senses = entry.senses.slice(0, 1).map((item) => ({ rank: item.rank, pos: item.pos }));
@@ -83,8 +91,26 @@ const parseJson = (text, fallback) => {
   }
 };
 
+/**
+ * 中文输入的查词：提示词要求先译成英文、再解析那个英文词。
+ * mock 不会翻译，查一张小表；表里没有的，用 charge 那张卡顶（词条不是重点，形状才是）。
+ */
+const ZH_TO_EN = {
+  充电: { word: "recharge", notes: "也可译 charge" },
+  落实: { word: "implement", notes: null },
+  交代: { word: "explain", notes: "也可译 confess、hand over" },
+  微信: { word: "WeChat", notes: null },
+};
+
+/** 一个没按提示词来的模型：中文输入仍然给中文词条（以前的行为），用来验证降级路径 */
+const chineseEntry = (word, bad) => ({
+  ...makeEntry(word, bad),
+  lang: "zh",
+  pronunciation: { ipa: null, pinyin: "zhōng wén" },
+});
+
 /** 按请求类型算出整段要回的文本 */
-function answerFor(body, bad) {
+function answerFor(body, bad, untranslated = false) {
   const system = body.messages?.[0]?.content ?? "";
   const user = body.messages?.[1]?.content ?? "";
 
@@ -112,12 +138,17 @@ function answerFor(body, bad) {
     return JSON.stringify({ gloss: `（mock）「${term}」在这句话里的意思`, pos: "n.", note: "mock 数据，不是真实讲解" });
   }
   // 其余都当查词：把请求的词填进卡片
-  const { word = "charge" } = parseJson(user, {});
+  const { word = "charge", lang = "en" } = parseJson(user, {});
+  if (lang === "zh") {
+    if (untranslated || !system.includes(ZH_SECTION)) return JSON.stringify(chineseEntry(word, bad));
+    const english = ZH_TO_EN[word] ?? { word: "charge", notes: null };
+    return JSON.stringify(makeEntry(english.word, bad, english.notes));
+  }
   return JSON.stringify(makeEntry(word, bad));
 }
 
 /** 造一个 mock 服务（还没开始监听）。 */
-export function createMock({ delay = 35, bad = false, log: logFile = "/tmp/sense-mock-requests.log" } = {}) {
+export function createMock({ delay = 35, bad = false, untranslated = false, log: logFile = "/tmp/sense-mock-requests.log" } = {}) {
   const log = (line) => {
     if (!logFile) return;
     try {
@@ -150,10 +181,10 @@ export function createMock({ delay = 35, bad = false, log: logFile = "/tmp/sense
         log(
           `  > model=${body.model} max_tokens=${body.max_tokens ?? "-"} temperature=${body.temperature ?? "-"} thinking=${JSON.stringify(thinking)}`,
         );
-        source = answerFor(body, bad);
+        source = answerFor(body, bad, untranslated);
       } else {
         log("  > body 解析失败");
-        source = answerFor({}, bad);
+        source = answerFor({}, bad, untranslated);
       }
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
@@ -198,7 +229,8 @@ if (isMain) {
   const port = Number(process.env.PORT ?? 11434);
   const delay = Number(process.env.DELAY ?? 35);
   const bad = process.env.BAD === "1";
-  createMock({ delay, bad, log: process.env.LOG ?? "/tmp/sense-mock-requests.log" }).listen(port, "127.0.0.1", () => {
-    console.log(`[mock] listening on http://127.0.0.1:${port}/v1  (bad=${bad}, delay=${delay}ms)`);
+  const untranslated = process.env.UNTRANSLATED === "1";
+  createMock({ delay, bad, untranslated, log: process.env.LOG ?? "/tmp/sense-mock-requests.log" }).listen(port, "127.0.0.1", () => {
+    console.log(`[mock] listening on http://127.0.0.1:${port}/v1  (bad=${bad}, untranslated=${untranslated}, delay=${delay}ms)`);
   });
 }

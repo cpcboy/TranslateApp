@@ -12,9 +12,12 @@ const BAND_LABEL: Record<string, string> = {
 export function SenseCard({
   entry,
   warnings = [],
+  from = null,
 }: {
   entry: WordEntry;
   warnings?: string[];
+  /** 中文输入先译成英文时，用户输入的那个中文词；卡片是译出来的英文词的解析，标题上方说明来由 */
+  from?: string | null;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [openSense, setOpenSense] = useState<number | null>(null);
@@ -33,7 +36,20 @@ export function SenseCard({
     <article className="flex flex-col rounded-2xl border border-line bg-panel px-7 pb-5 pt-6">
       <header className="flex items-start justify-between gap-6 border-b border-line pb-5">
         <div className="min-w-0">
-          <h1 className="truncate font-serif text-[46px] font-semibold leading-[1.08] tracking-[-0.01em] text-paper">
+          {from && (
+            <p className="mb-2 flex items-center gap-2 text-[14px] text-subtle">
+              <span className="max-w-[16em] truncate text-muted">{from}</span>
+              <span aria-hidden="true" className="font-mono text-acc">
+                →
+              </span>
+              <span className="sr-only">译成</span>
+              <span>英文</span>
+            </p>
+          )}
+          <h1
+            title={entry.word}
+            className="truncate font-serif text-[46px] font-semibold leading-[1.08] tracking-[-0.01em] text-paper"
+          >
             {entry.word}
           </h1>
           <p className="mt-2 font-mono text-[15px] tracking-[0.01em] text-muted">

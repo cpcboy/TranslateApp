@@ -72,6 +72,28 @@ impl LookupError {
     }
 }
 
+/// 发给模型的两条消息：system 按输入语言取提示词（中文输入追加「先译成英文」一节），user 是一行 JSON。
+/// 单独成函数，是为了让「中文输入真的发了中文提示词」这条接线能被单测盯住。
+fn lookup_messages(word: &str, lang: &str, context: Option<&str>) -> (&'static str, String) {
+    (
+        prompts::word_system(lang),
+        prompts::user_message(word, lang, context),
+    )
+}
+
+/// 查词缓存的 key。`lookup` 写缓存、`invalidate_lookup` 标过期必须算出同一个 key，
+/// 所以只此一处：提示词指纹按输入语言取（中文输入的提示词和英文的不同）。
+fn lookup_key(word: &str, lang: &str, provider: &provider_registry::Provider, context: Option<&str>) -> String {
+    entry_key(
+        word,
+        lang,
+        &provider.model,
+        &provider.base_url,
+        context,
+        prompts::word_prompt_hash(lang),
+    )
+}
+
 fn detect_lang(word: &str) -> &'static str {
     if word
         .chars()
@@ -104,14 +126,7 @@ pub async fn lookup(
         .map_err(|err| LookupError::new("no_provider", err))?;
     let lang = req.lang.unwrap_or_else(|| detect_lang(&word).to_string());
 
-    let key = entry_key(
-        &word,
-        &lang,
-        &provider.model,
-        &provider.base_url,
-        req.context.as_deref(),
-        prompts::word_prompt_hash(),
-    );
+    let key = lookup_key(&word, &lang, &provider, req.context.as_deref());
 
     // 命中缓存：直接返回，一个字节都不发出去。
     let bypass = req.bypass_cache.unwrap_or(false);
@@ -145,8 +160,8 @@ pub async fn lookup(
         None
     };
 
-    let system = prompts::word_system();
-    let user = prompts::user_message(&word, &lang, req.context.as_deref());
+    // 中文输入：提示词要求先译成英文、再解析那个英文词（词条里的 word 是英文）
+    let (system, user) = lookup_messages(&word, &lang, req.context.as_deref());
     let temperature = req.temperature.unwrap_or(0.3);
     // 关掉思考：DeepSeek V4 默认开着 thinking（effort=high），
     // 一次查词光思维链就要几秒，卡片等于转圈。
@@ -293,15 +308,18 @@ pub fn invalidate_lookup(
     context: Option<String>,
 ) -> Result<(), String> {
     let provider = provider_registry::active(&app)?;
-    let key = entry_key(
-        &word,
-        &lang,
-        &provider.model,
-        &provider.base_url,
-        context.as_deref(),
-        prompts::word_prompt_hash(),
-    );
-    cache.mark_stale(&key)
+    invalidate(&cache, &provider, &word, &lang, context.as_deref())
+}
+
+/// 把一条查词缓存标成过期。单独成函数，key 的算法（必须与写缓存时同一个）才能被单测盯住。
+fn invalidate(
+    cache: &Cache,
+    provider: &provider_registry::Provider,
+    word: &str,
+    lang: &str,
+    context: Option<&str>,
+) -> Result<(), String> {
+    cache.mark_stale(&lookup_key(word, lang, provider, context))
 }
 
 #[cfg(test)]
@@ -313,6 +331,78 @@ mod tests {
         assert_eq!(detect_lang("charge"), "en");
         assert_eq!(detect_lang("落实"), "zh");
         assert_eq!(detect_lang("AI 助手"), "zh");
+    }
+
+    fn provider() -> provider_registry::Provider {
+        provider_registry::Provider {
+            id: "p".into(),
+            label: "P".into(),
+            base_url: "https://a/v1".into(),
+            model: "m".into(),
+            requires_key: false,
+        }
+    }
+
+    #[test]
+    fn cache_key_follows_the_prompt_of_the_input_language() {
+        let p = provider();
+        // 同一个词，中文输入和英文输入用的提示词不同，key 必须不同
+        assert_ne!(
+            lookup_key("charge", "en", &p, None),
+            lookup_key("charge", "zh", &p, None)
+        );
+        // 英文输入的 key 与改动前一致：就是用英文提示词的指纹算的，已缓存的英文词条继续有效
+        assert_eq!(
+            lookup_key("charge", "en", &p, None),
+            entry_key("charge", "en", "m", "https://a/v1", None, prompts::word_prompt_hash("en"))
+        );
+        assert_eq!(
+            lookup_key("充电", "zh", &p, None),
+            entry_key("充电", "zh", "m", "https://a/v1", None, prompts::word_prompt_hash("zh"))
+        );
+        // 带上下文的另算
+        assert_ne!(
+            lookup_key("charge", "en", &p, Some("ctx")),
+            lookup_key("charge", "en", &p, None)
+        );
+    }
+
+    #[test]
+    fn request_messages_carry_the_prompt_of_the_input_language() {
+        // 中文输入：system 带「先译成英文」那一节，user 里 lang 是 zh
+        let (system, user) = lookup_messages("充电", "zh", None);
+        assert!(system.contains("# 中文输入"), "中文输入必须发中文那一节");
+        let value: serde_json::Value = serde_json::from_str(&user).expect("user 必须是合法 JSON");
+        assert_eq!(value["word"], "充电");
+        assert_eq!(value["lang"], "zh");
+
+        // 英文输入：原提示词，不带那一节
+        let (system, user) = lookup_messages("charge", "en", None);
+        assert!(!system.contains("# 中文输入"), "英文输入不能带中文那一节");
+        let value: serde_json::Value = serde_json::from_str(&user).expect("user 必须是合法 JSON");
+        assert_eq!(value["lang"], "en");
+    }
+
+    #[test]
+    fn invalidate_hits_the_same_row_that_lookup_wrote() {
+        let cache = Cache::in_memory().expect("内存库");
+        let p = provider();
+        // lookup 写缓存用的 key：中文输入、英文输入各一条
+        let zh_key = lookup_key("充电", "zh", &p, None);
+        let en_key = lookup_key("charge", "en", &p, None);
+        cache.put(&zh_key, "充电", "zh", "m", "{\"zh\":1}").expect("写");
+        cache.put(&en_key, "charge", "en", "m", "{\"en\":1}").expect("写");
+
+        invalidate(&cache, &p, "充电", "zh", None).expect("标过期");
+
+        assert!(cache.get(&zh_key).expect("查").is_none(), "中文那条必须被标废");
+        assert!(cache.get(&en_key).expect("查").is_some(), "英文那条不能被牵连");
+
+        // 语言写错就标不到：key 里的提示词指纹随语言变
+        let other = lookup_key("充电", "en", &p, None);
+        cache.put(&other, "充电", "en", "m", "{\"x\":1}").expect("写");
+        invalidate(&cache, &p, "充电", "zh", None).expect("标过期");
+        assert!(cache.get(&other).expect("查").is_some(), "按 zh 标废不该动 en 的 key");
     }
 
     #[test]

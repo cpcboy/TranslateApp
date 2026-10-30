@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { api, onDelta, type LookupError } from "./ipc";
 import { detectLang, parseWordEntry, type WordEntry } from "./schema";
 import { parseFinal, tryParsePartial, type PartialEntry } from "./stream";
+import { asEnglishEntry, translationProblem } from "./translated";
 
 export type LookupStatus = "idle" | "loading" | "streaming" | "done" | "error";
 
@@ -23,6 +24,8 @@ type LookupState = {
   partial: PartialEntry | null;
   entry: WordEntry | null;
   warnings: string[];
+  /** 中文输入没能译成英文，卡片是降级展示的中文词条（界面在卡片上方明说） */
+  untranslated: boolean;
   error: LookupError | null;
   meta: LookupMeta | null;
   /** 长文模式：原文、流式译文、是否还在生成 */
@@ -45,6 +48,7 @@ const empty = {
   partial: null,
   entry: null,
   warnings: [] as string[],
+  untranslated: false,
   error: null,
   meta: null,
   longSource: null,
@@ -202,7 +206,7 @@ export const useLookup = create<LookupState>((set, get) => ({
       const first = await api.lookup({ word, requestId, temperature: 0.3 });
       if (my !== epoch) return;
 
-      let parsed = validate(first.raw, first);
+      let parsed = validate(first.raw, first, word);
 
       if (!parsed.ok) {
         // 校验失败：先停掉上一轮的合流（否则它会把 attempt-1 的半截写回去），
@@ -230,7 +234,7 @@ export const useLookup = create<LookupState>((set, get) => ({
         });
         if (my !== epoch) return;
 
-        parsed = validate(second.raw, second);
+        parsed = validate(second.raw, second, word, true);
         if (!parsed.ok) {
           // 重试写进库的也是坏数据（Rust 只做结构门）：不标废的话，
           // 以后每查一次这个词都是「命中坏缓存 + 一次必然失败的请求」
@@ -242,12 +246,18 @@ export const useLookup = create<LookupState>((set, get) => ({
           });
           return;
         }
+        if (parsed.untranslated) {
+          // 降级展示的中文词条也不留在缓存里：下次查同一个中文词应该重新问模型，而不是直接拿到它
+          await api.invalidateLookup(word, detectLang(word)).catch(() => {});
+          if (my !== epoch) return;
+        }
       }
 
       set({
         status: "done",
         entry: parsed.entry,
         warnings: parsed.warnings,
+        untranslated: parsed.untranslated,
         error: null,
         buffer: "",
         partial: null,
@@ -265,13 +275,23 @@ export const useLookup = create<LookupState>((set, get) => ({
 }));
 
 type Validated =
-  | { ok: true; entry: WordEntry; warnings: string[]; meta: LookupMeta }
+  /** untranslated：中文输入没能译成英文，这张卡是降级展示的中文词条（界面据此在卡片上方明说） */
+  | { ok: true; entry: WordEntry; warnings: string[]; meta: LookupMeta; untranslated: boolean }
   /** reason 是具体哪一处不合格，会原样进错误提示 */
   | { ok: false; reason: string };
 
+/**
+ * 校验一次模型输出。
+ *
+ * `query` 是用户输入：中文输入必须拿回译成英文的词条（见 translated.ts）。
+ * 第一次拿回的不是，就当校验失败去重试；`lastAttempt`（重试那次）还不是，
+ * 就降级展示拿到的中文词条并在卡片上明说，不把它当成正常结果。
+ */
 function validate(
   raw: string,
   result: { source: string; model: string; first_delta_ms: number; total_ms: number },
+  query: string,
+  lastAttempt = false,
 ): Validated {
   const final = parseFinal(raw);
   if (!final) return { ok: false, reason: "不是合法的 JSON" };
@@ -285,10 +305,17 @@ function validate(
   }
   if (parsed.degraded) warnings.push("部分义项格式不合法，已略过");
 
+  const untranslated = translationProblem(query, parsed.entry) !== null;
+  if (untranslated && !lastAttempt) {
+    return { ok: false, reason: "中文输入应当先译成英文再解析，但模型给的词条里的词仍是中文" };
+  }
+
   return {
     ok: true,
-    entry: parsed.entry,
+    // 词是英文、lang 却照抄成了 zh：内容是对的，lang 归一成 en，不为此重试
+    entry: asEnglishEntry(query, parsed.entry),
     warnings,
+    untranslated,
     meta: {
       source: result.source === "cache" ? "cache" : "network",
       model: result.model,

@@ -30,6 +30,7 @@ vi.mock("./ipc", () => ({
 }));
 
 import { describeFailure, useLookup } from "./store";
+import { makeEntry } from "./testing";
 
 const emitLong = (requestId: string, text: string) =>
   mocks.handlers.get("sense://longtext-delta")?.({ payload: { request_id: requestId, text } });
@@ -154,6 +155,197 @@ describe("查词：重试后仍不合格", () => {
     expect(ids).toHaveLength(2);
     expect(ids[1]).not.toBe(ids[0]);
     expect(useLookup.getState().buffer).not.toContain("迟到的旧增量");
+  });
+});
+
+/** 最小的合法词条 JSON：只关心 word / lang */
+const rawEntry = (word: string, lang: "en" | "zh" = "en") => JSON.stringify(makeEntry(word, lang));
+
+const reply = (raw: string, source: "cache" | "network" = "network") => ({
+  raw,
+  source,
+  model: "m",
+  first_delta_ms: 1,
+  total_ms: 2,
+  finish_reason: "stop",
+});
+
+describe("查词：中文输入先译成英文，再解析那个英文词", () => {
+  it("拿回英文词条：一次就成，卡片是英文词，没有警告", async () => {
+    mocks.lookup.mockResolvedValue(reply(rawEntry("recharge")));
+    await useLookup.getState().run("充电");
+    const state = useLookup.getState();
+    expect(mocks.lookup).toHaveBeenCalledTimes(1);
+    expect(state.status).toBe("done");
+    expect(state.entry?.word).toBe("recharge");
+    expect(state.entry?.lang).toBe("en");
+    expect(state.query).toBe("充电"); // 界面据此显示「充电 → 英文」
+    expect(state.warnings).toEqual([]);
+    expect(state.untranslated).toBe(false);
+    expect(mocks.invalidateLookup).not.toHaveBeenCalled();
+  });
+
+  it("命中缓存的英文词条同样直接用，不重试", async () => {
+    mocks.lookup.mockResolvedValue(reply(rawEntry("implement"), "cache"));
+    await useLookup.getState().run("落实");
+    expect(mocks.lookup).toHaveBeenCalledTimes(1);
+    expect(useLookup.getState().meta?.source).toBe("cache");
+  });
+
+  it("第一次模型还是给了中文词条：当校验失败，0.2 重试并跳过缓存，拿到英文就用英文", async () => {
+    mocks.lookup
+      .mockResolvedValueOnce(reply(rawEntry("充电", "zh")))
+      .mockResolvedValueOnce(reply(rawEntry("recharge")));
+    await useLookup.getState().run("充电");
+    const state = useLookup.getState();
+
+    expect(mocks.lookup).toHaveBeenCalledTimes(2);
+    expect(mocks.lookup.mock.calls[0][0]).toMatchObject({ word: "充电", temperature: 0.3 });
+    expect(mocks.lookup.mock.calls[1][0]).toMatchObject({ word: "充电", temperature: 0.2, bypassCache: true });
+    // 第一次那个中文词条已经被 Rust 写进缓存了：必须标废
+    expect(mocks.invalidateLookup).toHaveBeenCalledWith("充电", "zh");
+    expect(state.status).toBe("done");
+    expect(state.entry?.word).toBe("recharge");
+    expect(state.warnings).toEqual([]);
+    expect(state.untranslated).toBe(false);
+  });
+
+  it("重试还是中文词条：降级展示，明说没译成英文，不当成正常结果，也不留在缓存里", async () => {
+    mocks.lookup.mockResolvedValue(reply(rawEntry("充电", "zh")));
+    await useLookup.getState().run("充电");
+    const state = useLookup.getState();
+
+    expect(mocks.lookup).toHaveBeenCalledTimes(2);
+    expect(state.status).toBe("done"); // 有内容可看，不是错误页
+    expect(state.entry?.word).toBe("充电");
+    expect(state.untranslated).toBe(true); // 界面据此在卡片上方明说没译成
+    // 重试之前一次，接受降级结果之后一次：下次再查要重新问模型，而不是直接拿到这张降级卡
+    expect(mocks.invalidateLookup).toHaveBeenCalledTimes(2);
+    expect(mocks.invalidateLookup).toHaveBeenLastCalledWith("充电", "zh");
+  });
+
+  it("词的语言写对了、词本身还是汉字（lang: en, word: 充电）：同样算没译成", async () => {
+    mocks.lookup.mockResolvedValue(reply(rawEntry("充电", "en")));
+    await useLookup.getState().run("充电");
+    expect(mocks.lookup).toHaveBeenCalledTimes(2);
+    expect(useLookup.getState().untranslated).toBe(true);
+  });
+
+  it("词是英文、lang 却照抄成了 zh：一次就成，不重试，lang 归一成 en，没有降级标志", async () => {
+    mocks.lookup.mockResolvedValue(reply(rawEntry("recharge", "zh")));
+    await useLookup.getState().run("充电");
+    const state = useLookup.getState();
+    expect(mocks.lookup).toHaveBeenCalledTimes(1);
+    expect(state.status).toBe("done");
+    expect(state.entry?.word).toBe("recharge");
+    expect(state.entry?.lang).toBe("en");
+    expect(state.untranslated).toBe(false);
+    expect(mocks.invalidateLookup).not.toHaveBeenCalled();
+  });
+
+  it("词里带着中文（WeChat (微信)）：当没译成，重试后降级", async () => {
+    mocks.lookup.mockResolvedValue(reply(rawEntry("WeChat (微信)", "en")));
+    await useLookup.getState().run("微信");
+    expect(mocks.lookup).toHaveBeenCalledTimes(2);
+    expect(useLookup.getState().untranslated).toBe(true);
+  });
+
+  it("降级路径里等「标废」的时候用户改查了别的词：旧结果不能覆盖新查询", async () => {
+    mocks.lookup.mockImplementation(async (args: { word: string }) =>
+      args.word === "充电" ? reply(rawEntry("充电", "zh")) : reply(rawEntry("charge")),
+    );
+    let calls = 0;
+    let release: () => void = () => {};
+    mocks.invalidateLookup.mockImplementation(async () => {
+      calls += 1;
+      if (calls === 2) await new Promise<void>((resolve) => (release = resolve)); // 降级后的那次标废卡住
+    });
+
+    const first = useLookup.getState().run("充电");
+    await vi.waitFor(() => expect(calls).toBe(2));
+    await useLookup.getState().run("charge"); // 用户改查别的词
+    release();
+    await first;
+
+    const state = useLookup.getState();
+    expect(state.query).toBe("charge");
+    expect(state.entry?.word).toBe("charge");
+    expect(state.untranslated).toBe(false);
+  });
+
+  it("降级之后再查英文词、再查一个会失败的词：untranslated 都不残留", async () => {
+    mocks.lookup.mockResolvedValue(reply(rawEntry("充电", "zh")));
+    await useLookup.getState().run("充电");
+    expect(useLookup.getState().untranslated).toBe(true);
+
+    mocks.lookup.mockResolvedValue(reply(rawEntry("charge")));
+    await useLookup.getState().run("charge");
+    expect(useLookup.getState().untranslated).toBe(false);
+
+    mocks.lookup.mockResolvedValue(reply("抱歉"));
+    await useLookup.getState().run("refuse");
+    expect(useLookup.getState().status).toBe("error");
+    expect(useLookup.getState().untranslated).toBe(false);
+  });
+
+  it("缓存里留着没标废的中文词条（上一轮中途被打断）：照样重试，不当正常结果", async () => {
+    mocks.lookup
+      .mockResolvedValueOnce(reply(rawEntry("充电", "zh"), "cache"))
+      .mockResolvedValueOnce(reply(rawEntry("recharge")));
+    await useLookup.getState().run("充电");
+    const state = useLookup.getState();
+    expect(mocks.lookup).toHaveBeenCalledTimes(2);
+    expect(state.entry?.word).toBe("recharge");
+    expect(state.meta?.source).toBe("network");
+    expect(state.untranslated).toBe(false);
+  });
+
+  it("重试那次请求失败（网络断了）：进错误态，不展示第一次的中文词条，也不带降级标志", async () => {
+    mocks.lookup
+      .mockResolvedValueOnce(reply(rawEntry("充电", "zh")))
+      .mockRejectedValueOnce({ code: "network", message: "连不上" });
+    await useLookup.getState().run("充电");
+    const state = useLookup.getState();
+    expect(state.status).toBe("error");
+    expect(state.entry).toBeNull();
+    expect(state.untranslated).toBe(false);
+    expect(state.error?.code).toBe("network");
+  });
+
+  it("降级之后重置：untranslated 立刻清掉，不留到下一次", async () => {
+    mocks.lookup.mockResolvedValue(reply(rawEntry("充电", "zh")));
+    await useLookup.getState().run("充电");
+    expect(useLookup.getState().untranslated).toBe(true);
+
+    useLookup.getState().reset();
+    expect(useLookup.getState().untranslated).toBe(false);
+    expect(useLookup.getState().entry).toBeNull();
+  });
+
+  it("降级之后再查别的词：新查询一开始（还在加载）就清掉降级标志", async () => {
+    mocks.lookup.mockResolvedValue(reply(rawEntry("充电", "zh")));
+    await useLookup.getState().run("充电");
+    expect(useLookup.getState().untranslated).toBe(true);
+
+    let release: (value: ReturnType<typeof reply>) => void = () => {};
+    mocks.lookup.mockImplementation(() => new Promise((resolve) => (release = resolve)));
+    const next = useLookup.getState().run("charge");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(useLookup.getState().status).toBe("loading");
+    expect(useLookup.getState().untranslated).toBe(false);
+
+    release(reply(rawEntry("charge")));
+    await next;
+    expect(useLookup.getState().untranslated).toBe(false);
+    expect(useLookup.getState().entry?.word).toBe("charge");
+  });
+
+  it("英文输入不受影响：词条怎么回都不触发中译英的重试", async () => {
+    mocks.lookup.mockResolvedValue(reply(rawEntry("charge")));
+    await useLookup.getState().run("charge");
+    expect(mocks.lookup).toHaveBeenCalledTimes(1);
+    expect(useLookup.getState().warnings).toEqual([]);
+    expect(useLookup.getState().untranslated).toBe(false);
   });
 });
 

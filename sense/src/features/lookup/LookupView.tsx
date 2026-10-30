@@ -3,6 +3,8 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { isLongText } from "../../lib/route";
 import { buildPreview } from "../../lib/schema";
 import { useLookup } from "../../lib/store";
+import type { WordEntry } from "../../lib/schema";
+import { previewForDisplay, translatedFrom, untranslatedNotice } from "../../lib/translated";
 import { cn } from "../../lib/cn";
 import { ErrorState } from "./ErrorState";
 import { LongTextView } from "./LongTextView";
@@ -18,6 +20,7 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
     entry,
     partial,
     warnings,
+    untranslated,
     error,
     meta,
     longSource,
@@ -62,7 +65,7 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
   }, []);
 
   const preview = useMemo(
-    () => (partial && !entry ? buildPreview(partial, query) : null),
+    () => previewForDisplay(query, partial && !entry ? buildPreview(partial, query) : null),
     [partial, entry, query],
   );
 
@@ -109,7 +112,7 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
           {/* 自绘占位符：WKWebView 里 input 的 placeholder 渲染不出中文 */}
           {text.length === 0 && (
             <span aria-hidden="true" className="pointer-events-none absolute inset-y-0 left-0 flex items-center text-[18px] text-subtle">
-              查一个词，比如 charge
+              查一个词（中文会先译成英文）
             </span>
           )}
         </div>
@@ -136,11 +139,17 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
             onRetry={() => void run(query)}
             onOpenSettings={onOpenSettings}
           />
-        ) : entry ? (
-          <SenseCard entry={entry} warnings={warnings} />
-        ) : preview ? (
-          <SenseCard entry={preview} warnings={["还在加载，先显示已经完整的义项"]} />
-        ) : status === "loading" ? (
+        ) : entry || preview ? (
+          <ResultCard
+            query={query}
+            entry={entry}
+            preview={preview}
+            warnings={warnings}
+            untranslated={untranslated}
+          />
+        ) : busy ? (
+          // 还没有能画的卡（正在连接、第一个义项还没到、中文输入的预览被挡住）：骨架屏。
+          // 以前只在 loading 时画骨架，streaming 却没有预览时会闪一下首页
           <Skeleton />
         ) : (
           <Empty onPick={(word) => { setText(word); void run(word); }} />
@@ -163,12 +172,56 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
   );
 }
 
+/** 流式预览出现在最终卡片同一个位置，过渡时 SenseCard 必须是同一个实例——否则用户已经点开的义项会合上 */
+const PREVIEW_WARNINGS = ["还在加载，先显示已经完整的义项"];
+
+/**
+ * 查词结果卡。没有 hook，纯按入参出树：预览与最终结果两种状态得到的树形（Fragment → [横幅位, SenseCard]）一致，
+ * React 才会复用同一个 SenseCard；单测盯着这一点（LookupView.test.tsx）。
+ */
+export function ResultCard({
+  query,
+  entry,
+  preview,
+  warnings,
+  untranslated,
+}: {
+  query: string;
+  entry: WordEntry | null;
+  preview: WordEntry | null;
+  warnings: string[];
+  untranslated: boolean;
+}) {
+  const card = entry ?? preview;
+  if (!card) return null;
+  return (
+    <>
+      {/* 中文输入没能译成英文：这张卡不是译好的结果，不能让人当成译好的，所以说在卡片上方 */}
+      {entry && untranslated && (
+        <p
+          role="status"
+          className="mb-2.5 rounded-lg border border-[rgba(209,163,93,0.45)] bg-[rgba(240,180,94,0.08)] px-4 py-3 text-[14.5px] leading-relaxed text-[#f0b45e]"
+        >
+          {untranslatedNotice(query)}
+        </p>
+      )}
+      <SenseCard
+        entry={card}
+        warnings={entry ? warnings : PREVIEW_WARNINGS}
+        from={translatedFrom(query, card)}
+      />
+    </>
+  );
+}
+
 function Empty({ onPick }: { onPick: (word: string) => void }) {
   return (
     <div className="flex h-full flex-col items-center justify-center px-6 text-center">
       <p className="text-[19px] text-[#e6e1d8]">查一个词，给它一张完整的义项卡。</p>
       <p className="mt-3 text-[16px] leading-relaxed text-muted">
         音标、按常用度排序的义项、每个义项的例句和场景。
+        <br />
+        输入中文，会先译成英文，再解析那个英文词。
         <br />
         查过的词会存本地，第二次不再走网络。
       </p>
