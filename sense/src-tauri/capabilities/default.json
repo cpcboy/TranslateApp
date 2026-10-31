@@ -1,14 +1,13 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "主窗口、译文窗口：只开核心权限，前端不直接碰网络与文件系统",
+  "description": "主窗口、译文窗口：只开核心权限，前端不直接碰网络与文件系统。改窗口大小 / 位置、放大还原、退出都走 Rust 命令（window.rs），不给前端开窗口写权限",
   "windows": [
     "main",
     "overlay"
   ],
   "permissions": [
     "core:default",
-    "core:window:allow-start-dragging",
-    "core:window:allow-set-size"
+    "core:window:allow-start-dragging"
   ]
 }

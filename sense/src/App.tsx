@@ -1,17 +1,13 @@
 import { useEffect, useRef, useState } from "react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
-import { LogicalSize } from "@tauri-apps/api/dpi";
 import { LookupView } from "./features/lookup/LookupView";
 import { SettingsView } from "./features/settings/SettingsView";
+import { ResizeHandles } from "./features/window/ResizeHandles";
+import { WindowControls } from "./features/window/WindowControls";
 import { api, onHotkeyChanged } from "./lib/ipc";
 import { useLookup } from "./lib/store";
 
 const isTauri = "__TAURI_INTERNALS__" in window;
-
-/** 与 tauri.conf.json 的 minWidth / minHeight 保持一致，拖拽时先夹一次。 */
-const MIN_WIDTH = 760;
-const MIN_HEIGHT = 720;
 
 type View = "lookup" | "settings";
 
@@ -105,22 +101,25 @@ export default function App() {
             但按钮/输入框仍优先响应点击（Tauri 会在 clickable 元素上短路）。 */}
         <header
           data-tauri-drag-region="deep"
-          className="flex shrink-0 items-center justify-between border-b border-line px-7 py-4"
+          className="flex shrink-0 items-center justify-between gap-4 border-b border-line py-4 pl-5 pr-7"
         >
-          <div className="flex items-baseline gap-4">
-            <span className="font-serif text-[22px] font-semibold tracking-[0.16em] text-paper">
-              SENSE
-            </span>
-            <nav className="flex items-center gap-1">
-              <Tab active={view === "lookup"} onClick={() => setView("lookup")}>
-                查词
-              </Tab>
-              <Tab active={view === "settings"} onClick={() => setView("settings")}>
-                设置
-              </Tab>
-            </nav>
+          <div className="flex shrink-0 items-center gap-5">
+            {isTauri && <WindowControls />}
+            <div className="flex items-baseline gap-4">
+              <span className="font-serif text-[22px] font-semibold tracking-[0.16em] text-paper">
+                SENSE
+              </span>
+              <nav className="flex items-center gap-1">
+                <Tab active={view === "lookup"} onClick={() => setView("lookup")}>
+                  查词
+                </Tab>
+                <Tab active={view === "settings"} onClick={() => setView("settings")}>
+                  设置
+                </Tab>
+              </nav>
+            </div>
           </div>
-          <span className="font-mono text-[13.5px] text-subtle">
+          <span className="min-w-0 truncate font-mono text-[13.5px] text-subtle">
             {hint ? `${hint} 呼出 · Esc 隐藏` : "Esc 隐藏"}
           </span>
         </header>
@@ -149,87 +148,7 @@ export default function App() {
         </main>
       </div>
 
-      <ResizeGrip />
-    </div>
-  );
-}
-
-/**
- * 右下角的缩放把手。
- *
- * 注意：tao 0.37 在 macOS 上把 `drag_resize_window` 实现成直接返回
- * NotSupported，所以 Tauri 的 `startResizeDragging` 在这台机器上是静默无效的
- * （错误被 Rust 侧吞掉，前端 Promise 还会 resolve）。这里改成自己跟踪
- * pointermove，用 `setSize` 逐帧设置窗口尺寸——这是当前唯一真实可用的路径。
- */
-function ResizeGrip() {
-  if (!isTauri) return null;
-
-  const start = async (event: React.PointerEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    const handle = event.currentTarget;
-    handle.setPointerCapture(event.pointerId);
-
-    const startX = event.screenX;
-    const startY = event.screenY;
-
-    // 监听器必须在 await 之前就挂上：量窗口尺寸是异步的，用户快速点一下就松手时，
-    // pointerup 发生在 await 期间——先 await 再挂监听的话，松手永远收不到，窗口会一直跟着鼠标走
-    let ended = false;
-    let measured: { width: number; height: number } | null = null;
-    let frame = 0;
-    let nextWidth = 0;
-    let nextHeight = 0;
-    const win = getCurrentWindow();
-
-    const onMove = (moveEvent: PointerEvent) => {
-      if (!measured) return; // 还没量完起始尺寸，先不动
-      nextWidth = Math.max(MIN_WIDTH, Math.round(measured.width + moveEvent.screenX - startX));
-      nextHeight = Math.max(MIN_HEIGHT, Math.round(measured.height + moveEvent.screenY - startY));
-      if (frame) return;
-      frame = requestAnimationFrame(() => {
-        frame = 0;
-        void win.setSize(new LogicalSize(nextWidth, nextHeight)).catch(() => {
-          /* 窗口被关掉时会失败，忽略 */
-        });
-      });
-    };
-
-    const onEnd = () => {
-      ended = true;
-      if (frame) cancelAnimationFrame(frame);
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onEnd);
-      window.removeEventListener("pointercancel", onEnd);
-      if (handle.hasPointerCapture(event.pointerId)) {
-        handle.releasePointerCapture(event.pointerId);
-      }
-    };
-
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onEnd);
-    window.addEventListener("pointercancel", onEnd);
-
-    try {
-      const [size, scale] = await Promise.all([win.innerSize(), win.scaleFactor()]);
-      if (ended) return; // 量的时候已经松手了
-      measured = { width: size.width / scale, height: size.height / scale };
-    } catch {
-      onEnd(); // 量不出来就放弃这次拖动，别留着监听器
-    }
-  };
-
-  return (
-    <div
-      role="presentation"
-      aria-hidden="true"
-      title="拖动调整窗口大小"
-      onPointerDown={start}
-      className="group absolute bottom-0 right-0 z-10 flex h-6 w-6 cursor-nwse-resize items-end justify-end p-[3px]"
-    >
-      <svg width="12" height="12" viewBox="0 0 12 12" className="text-subtle group-hover:text-paper">
-        <path d="M11 4 L4 11 M11 8 L8 11" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
-      </svg>
+      {isTauri && <ResizeHandles />}
     </div>
   );
 }
@@ -249,8 +168,8 @@ function Tab({
       onClick={onClick}
       className={
         active
-          ? "rounded-md bg-[rgba(248,246,241,0.12)] px-3.5 py-2 text-[15px] font-medium text-paper"
-          : "rounded-md px-3.5 py-2 text-[15px] text-muted hover:text-paper"
+          ? "whitespace-nowrap rounded-md bg-[rgba(248,246,241,0.12)] px-3.5 py-2 text-[15px] font-medium text-paper"
+          : "whitespace-nowrap rounded-md px-3.5 py-2 text-[15px] text-muted hover:text-paper"
       }
     >
       {children}

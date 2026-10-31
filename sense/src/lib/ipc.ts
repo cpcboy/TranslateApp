@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { Frame } from "./windowFrame";
 
 export type ProviderView = {
   id: string;
@@ -87,6 +88,20 @@ export const api = {
   lookup: (args: LookupArgs) => invoke<LookupResult>("lookup", { req: { ...args } }),
   hotkeyHint: () => invoke<string>("hotkey_hint"),
   hideWindow: () => invoke<void>("hide_window"),
+  /** 红灯：退出应用 */
+  quitApp: () => invoke<void>("quit_app"),
+  /** 绿灯：放大到屏幕可用区域 / 还原；返回操作之后是不是放大状态 */
+  toggleZoom: () => invoke<boolean>("toggle_zoom"),
+  /** 主窗口现在的外框（逻辑像素），边缘拖拽缩放的起点 */
+  windowFrame: () => invoke<Frame>("get_window_frame"),
+  /** 一次设好位置和大小 */
+  setWindowFrame: (frame: Frame) =>
+    invoke<void>("set_window_frame", {
+      x: frame.x,
+      y: frame.y,
+      width: frame.width,
+      height: frame.height,
+    }),
   devFlags: () => invoke<{ dev_lookup: string | null }>("dev_flags"),
   hotkeyList: () => invoke<HotkeyView[]>("hotkey_list"),
   setHotkey: (kind: string, spec: string) =>

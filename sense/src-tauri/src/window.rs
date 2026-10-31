@@ -1,11 +1,12 @@
-//! 窗口生命周期：显隐切换、失焦隐藏、全局快捷键。
+//! 窗口生命周期：显隐切换、失焦隐藏、全局快捷键，以及红黄绿灯 / 边缘缩放要用的窗口命令。
 //!
-//! 所有窗口操作都在 Rust 侧完成；前端只调 `hide_window`，不碰窗口权限。
+//! 所有窗口操作都在 Rust 侧完成；前端只调这里的命令（`hide_window`、`quit_app`、`toggle_zoom`、
+//! `get_window_frame`、`set_window_frame`），不直接调窗口 API，所以也不需要窗口写权限。
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, WebviewWindow};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
 
 use crate::settings::{self, DEFAULT_HOTKEY_SPEC};
@@ -574,6 +575,165 @@ pub fn hide_window(app: AppHandle) {
     hide(&app);
 }
 
+/// 主窗口的最小尺寸：与 tauri.conf.json 的 minWidth / minHeight、前端 `windowFrame.ts` 保持一致
+/// （有测试对拍，改一处忘了另一处会红）。
+pub const MIN_WIDTH: f64 = 760.0;
+pub const MIN_HEIGHT: f64 = 720.0;
+/// 窗口一边的上限：macOS 的窗口服务器自己限在 10000，这里留余量，也挡掉前端传来的离谱数字。
+const MAX_SIDE: f64 = 8192.0;
+/// 坐标的上限：AppKit 在 |坐标| 逼近 2^31 时会抛未捕获的异常，整个进程 abort（异常出在主队列里，Rust 抓不到）。
+/// 真实的屏幕坐标远在这个范围里；前端传来离谱的值，夹住比崩溃强。
+const MAX_COORD: f64 = 100_000.0;
+
+/// 窗口外框，逻辑像素，原点在屏幕左上角（与前端 `screenX` / `screenY` 同一个坐标系）。
+/// 窗口无边框，外框就是内容区。
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct Frame {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// 校验前端给的窗口框：数必须是有限的；宽高夹进 [最小尺寸, 上限]，坐标夹进 ±MAX_COORD，都取整。
+pub fn sanitize_frame(frame: Frame) -> Result<Frame, String> {
+    let numbers = [frame.x, frame.y, frame.width, frame.height];
+    if !numbers.iter().all(|value| value.is_finite()) {
+        return Err("窗口尺寸不是有限的数".to_string());
+    }
+    Ok(Frame {
+        x: frame.x.clamp(-MAX_COORD, MAX_COORD).round(),
+        y: frame.y.clamp(-MAX_COORD, MAX_COORD).round(),
+        width: frame.width.clamp(MIN_WIDTH, MAX_SIDE).round(),
+        height: frame.height.clamp(MIN_HEIGHT, MAX_SIDE).round(),
+    })
+}
+
+/// 顶边不能高过屏幕可用区域的顶（菜单栏下沿）。
+///
+/// 实测（1920×1080，菜单栏 30px）：往上拖顶边拖进菜单栏，请求 y=10，系统把窗口按回 y=30，
+/// 高度却照给的那样，于是底边被顶着往下跑 20px。所以自己先夹：顶边到顶就别再长高，底边不动。
+pub fn keep_below_menu_bar(frame: Frame, top: f64) -> Frame {
+    if frame.y >= top {
+        return frame;
+    }
+    let lifted = top - frame.y;
+    Frame {
+        y: top,
+        height: (frame.height - lifted).max(MIN_HEIGHT),
+        ..frame
+    }
+}
+
+/// 窗口所在屏幕可用区域的顶边（逻辑像素）；取不到就不夹。
+fn work_area_top(window: &WebviewWindow) -> Option<f64> {
+    let monitor = window.current_monitor().ok()??;
+    Some(f64::from(monitor.work_area().position.y) / monitor.scale_factor())
+}
+
+/// 窗口操作只对主窗口开放；截屏译文窗口（overlay）不该被这些命令挪动。
+fn ensure_main(window: &WebviewWindow) -> Result<(), String> {
+    if window.label() == MAIN_WINDOW {
+        Ok(())
+    } else {
+        Err("只有主窗口可以这样操作".to_string())
+    }
+}
+
+fn read_frame(window: &WebviewWindow) -> Result<Frame, String> {
+    let scale = window.scale_factor().map_err(|err| err.to_string())?;
+    let position = window
+        .outer_position()
+        .map_err(|err| err.to_string())?
+        .to_logical::<f64>(scale);
+    let size = window
+        .outer_size()
+        .map_err(|err| err.to_string())?
+        .to_logical::<f64>(scale);
+    Ok(Frame {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+    })
+}
+
+fn apply_frame(window: &WebviewWindow, frame: Frame) -> Result<(), String> {
+    // 先改大小、再定位：改大小时 AppKit 保哪个角不动，不由我们说了算；
+    // 最后一步定位，保证左上角落在要的位置（拖左边 / 上边缩放时窗口要跟着挪）。
+    window
+        .set_size(LogicalSize::new(frame.width, frame.height))
+        .map_err(|err| err.to_string())?;
+    window
+        .set_position(LogicalPosition::new(frame.x, frame.y))
+        .map_err(|err| err.to_string())
+}
+
+/// 主窗口现在的外框。前端从窗口边缘 / 角上拖着缩放时，拿它当起点。
+#[tauri::command]
+pub fn get_window_frame(window: WebviewWindow) -> Result<Frame, String> {
+    ensure_main(&window)?;
+    read_frame(&window)
+}
+
+/// 一次设好位置和大小。
+///
+/// 系统对无边框窗口自带的缩放区只有窗口最外缘约 3px（落在里面的按下由 AppKit 先处理，网页收不到），
+/// 可见的面板比窗口缩进 12px，抓不到；tao 0.37 的 `drag_resize_window` 在 macOS 上又是 NotSupported，
+/// 没法从前端发起系统缩放。所以前端自己跟踪指针，逐帧调这个命令；
+/// 拖左边 / 上边时位置和大小必须一起变，所以是一个命令，不是两个。
+#[tauri::command]
+pub fn set_window_frame(
+    window: WebviewWindow,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    ensure_main(&window)?;
+    let mut frame = sanitize_frame(Frame { x, y, width, height })?;
+    if let Some(top) = work_area_top(&window) {
+        frame = keep_below_menu_bar(frame, top);
+    }
+    apply_frame(&window, frame)
+}
+
+/// 绿灯「缩放」：放大到屏幕可用区域（不含菜单栏和 Dock），再点一次还原。返回操作之后是不是放大状态。
+///
+/// 用 tao 的最大化：无边框窗口上它把窗口铺满屏幕可用区域，并记下放大前的外框，还原时恢复
+/// （2026-10-30 在 1920×1080 上实测：放大后外框恰为可用区域，还原后与放大前逐像素一致）。
+/// 标题栏双击是 Tauri 内置的，走同一套状态：已放大时双击能还原；未放大时 Tauri 不会放大无边框窗口
+/// （`is_maximizable` 对无边框窗口恒为 false），所以放大只能点绿灯。
+///
+/// 已知边界（评审读 tao 源码并在真实 AppKit 里复刻出的，都是 P3，与系统自带的 zoom 同一种语义）：
+/// - tao 判断「已放大」只比较大小（容差 1pt）：手动把窗口拖到恰好等于可用区域大小再点绿灯，它当作已放大，
+///   还原到自己的默认位置（50,50）800×600；
+/// - 放大后可用区域变了（Dock 自动隐藏、换分辨率、插拔显示器），下次点绿灯是再放大一次，
+///   并把过期的放大外框记成「标准外框」，之后回不到原来的小窗；
+/// - 放大带动画，主线程会被占住约 0.35 秒。
+#[tauri::command]
+pub fn toggle_zoom(window: WebviewWindow) -> Result<bool, String> {
+    ensure_main(&window)?;
+    let zoomed = window.is_maximized().map_err(|err| err.to_string())?;
+    if zoomed {
+        window.unmaximize().map_err(|err| err.to_string())?;
+    } else {
+        window.maximize().map_err(|err| err.to_string())?;
+    }
+    Ok(!zoomed)
+}
+
+/// 红灯「关闭」：退出应用（等同 ⌘Q）。负责人 2026-10-30 明确选了「红 = 退出、黄 = 隐藏」。
+/// 退出会丢掉只存在内存里的东西（正在翻译的长文、输入框里的字），快捷键也不再响应，要手动重开；
+/// 只想收起窗口、保留快捷键呼出的，用黄灯 `hide_window`。和其它窗口命令一样只对主窗口开放。
+#[tauri::command]
+pub fn quit_app(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
+    ensure_main(&window)?;
+    println!("[sense] quit requested from window controls");
+    app.exit(0);
+    Ok(())
+}
+
 /// 开发期开关：只在 debug 构建里生效，避免发布版被环境变量改行为。
 pub fn dev_flag(name: &str) -> bool {
     cfg!(debug_assertions) && std::env::var(name).is_ok()
@@ -625,6 +785,89 @@ mod tests {
             decide_blur(None, Instant::now(), BLUR_GRACE),
             BlurAction::HideNow
         );
+    }
+
+    fn frame(x: f64, y: f64, width: f64, height: f64) -> Frame {
+        Frame { x, y, width, height }
+    }
+
+    #[test]
+    fn sanitize_clamps_size_into_limits_and_rounds() {
+        // 太小：夹到最小尺寸，位置照旧
+        assert_eq!(
+            sanitize_frame(frame(10.4, 20.6, 100.0, 50.0)),
+            Ok(frame(10.0, 21.0, MIN_WIDTH, MIN_HEIGHT))
+        );
+        // 太大：夹到上限
+        let huge = sanitize_frame(frame(0.0, 0.0, 1.0e9, 1.0e9)).expect("应夹住");
+        assert_eq!((huge.width, huge.height), (MAX_SIDE, MAX_SIDE));
+        // 正常值只取整
+        assert_eq!(
+            sanitize_frame(frame(-30.0, 5.0, 900.4, 800.6)),
+            Ok(frame(-30.0, 5.0, 900.0, 801.0)),
+            "多屏时坐标可以是负的，不能被夹掉"
+        );
+    }
+
+    #[test]
+    fn top_edge_stops_at_the_menu_bar_and_bottom_edge_stays_put() {
+        // 屏幕可用区域顶在 y=30。窗口原来 y=60、高 960，底边在 1020
+        let dragged = frame(400.0, 10.0, 1140.0, 1010.0); // 顶边拖进了菜单栏，底边在 1020
+        let kept = keep_below_menu_bar(dragged, 30.0);
+        assert_eq!(kept, frame(400.0, 30.0, 1140.0, 990.0));
+        assert_eq!(kept.y + kept.height, dragged.y + dragged.height, "底边不能动");
+    }
+
+    #[test]
+    fn frame_below_the_menu_bar_is_left_alone() {
+        let ok = frame(100.0, 30.0, 900.0, 800.0);
+        assert_eq!(keep_below_menu_bar(ok, 30.0), ok);
+        let lower = frame(100.0, 200.0, 900.0, 800.0);
+        assert_eq!(keep_below_menu_bar(lower, 30.0), lower);
+    }
+
+    #[test]
+    fn menu_bar_clamp_never_goes_below_min_height() {
+        // 离谱的输入：整个窗口要被推到菜单栏上方很远
+        let kept = keep_below_menu_bar(frame(0.0, -900.0, 800.0, 800.0), 30.0);
+        assert_eq!(kept.y, 30.0);
+        assert_eq!(kept.height, MIN_HEIGHT);
+    }
+
+    #[test]
+    fn sanitize_clamps_coordinates_so_appkit_never_sees_absurd_values() {
+        // |坐标| 逼近 2^31 时 AppKit 会抛未捕获的异常、整个进程退出：评审在真实 AppKit 上复现过
+        let wild = sanitize_frame(frame(2.0e9, -2.5e9, 900.0, 800.0)).expect("应夹住");
+        assert_eq!((wild.x, wild.y), (MAX_COORD, -MAX_COORD));
+        // 多屏时的正常负坐标不受影响
+        assert_eq!(
+            sanitize_frame(frame(-1920.0, -300.0, 900.0, 800.0)),
+            Ok(frame(-1920.0, -300.0, 900.0, 800.0))
+        );
+    }
+
+    #[test]
+    fn sanitize_rejects_non_finite_numbers() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(sanitize_frame(frame(bad, 0.0, 800.0, 800.0)).is_err());
+            assert!(sanitize_frame(frame(0.0, bad, 800.0, 800.0)).is_err());
+            assert!(sanitize_frame(frame(0.0, 0.0, bad, 800.0)).is_err());
+            assert!(sanitize_frame(frame(0.0, 0.0, 800.0, bad)).is_err());
+        }
+    }
+
+    #[test]
+    fn min_size_matches_tauri_conf() {
+        // 最小尺寸写在三处：tauri.conf.json、这里、前端 windowFrame.ts；这里和配置文件对拍
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("配置必须是合法 JSON");
+        let main = conf["app"]["windows"]
+            .as_array()
+            .and_then(|windows| windows.iter().find(|w| w["label"] == MAIN_WINDOW))
+            .expect("配置里必须有主窗口");
+        assert_eq!(main["minWidth"].as_f64(), Some(MIN_WIDTH));
+        assert_eq!(main["minHeight"].as_f64(), Some(MIN_HEIGHT));
+        assert_eq!(main["resizable"], true, "窗口得是可缩放的，否则边缘拖拽无效");
     }
 
     #[test]

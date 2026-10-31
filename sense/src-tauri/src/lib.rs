@@ -121,6 +121,10 @@ pub fn run() {
         .manage(capture::CaptureState::default())
         .invoke_handler(tauri::generate_handler![
             window::hide_window,
+            window::quit_app,
+            window::toggle_zoom,
+            window::get_window_frame,
+            window::set_window_frame,
             window::hotkey_hint,
             commands::settings::list_providers,
             commands::settings::save_provider,
