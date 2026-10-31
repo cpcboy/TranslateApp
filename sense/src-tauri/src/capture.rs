@@ -1047,6 +1047,12 @@ async fn translate_blocks(app: &AppHandle, blocks: &mut [Block], target: &str) -
 
     let payload: Vec<&str> = blocks.iter().map(|block| block.text.as_str()).collect();
     let user = serde_json::to_string(&payload).map_err(|err| err.to_string())?;
+    // 这段提示词的措辞 2026-10-31 用真实模型核对过：deepseek-flash 上 47 个多行整段（517 个译文样本）、
+    // 在 deepseek-chat 上重复（178 个样本），第 4 条「每条尽量简短」都没有让模型删正文，所以原样保留。
+    // 也试过别的写法：完整优先的改写没有收益；写明条数 + 「一条对一条」的规则 + 小例子能压低整页「译文条数对不上」，
+    // 但好处在默认型号上不显著，还带来静默错位、个别限定语被压缩、坏 JSON 等代价，没采用。
+    // 数据、取舍和后续建议见 CHANGELOG「验证 · 2026-10-31 — 截屏翻译提示词」，改措辞之前先看那里。
+    // 开头那句是 tools/mock-provider.mjs 认「截屏翻译」请求的标记（MARKERS.capture），必须原样保留。
     let system = format!(
         "你是一位翻译，正在翻译屏幕上一段连续的文字。input 是按阅读顺序排好的 JSON 字符串数组，\
          相邻两条通常属于同一段内容。\n\n要求：\n\
