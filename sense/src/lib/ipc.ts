@@ -43,6 +43,11 @@ export type GrammarIssue = {
 
 export type WordGloss = { term: string; gloss: string; pos: string; note: string };
 
+export type OverlayRect = { x: number; y: number; w: number; h: number };
+
+/** 原文里的一个词：宽度（逻辑像素）用来反推原文字号 */
+export type OverlayWord = { t: string; w: number };
+
 export type OverlayBlock = {
   text: string;
   x: number;
@@ -52,6 +57,24 @@ export type OverlayBlock = {
   /** 单行高度：多行合并后 h 会变大，字号要按这个算 */
   line_h: number;
   translated: boolean;
+  /** 译成功了，但译文和原文一样（命令、版本号、专有名词原样保留）：覆盖层不画，留着原来的像素 */
+  unchanged?: boolean;
+  /**
+   * 以下是「原位替换」用的样式信息，都可能缺省（旧版辅助程序、像素分析失败），缺了就退回固定的深色样式。
+   */
+  /** 合并了几行 OCR 文字 */
+  lines?: number;
+  /** 原文底下的底色与文字颜色，`#rrggbb` */
+  bg?: string | null;
+  fg?: string | null;
+  /** 原文笔画的紧包围盒 */
+  ink?: OverlayRect | null;
+  /** 允许遮盖的范围：笔画外扩一点，每一侧只扩到下一个非底色像素为止，不会压到隔壁的色块、分隔线上 */
+  cover?: OverlayRect | null;
+  /** 笔画右边的空白宽度，0 = 不知道或没有 */
+  room?: number | null;
+  /** 原文的逐词宽度 */
+  words?: OverlayWord[];
 };
 
 /**
