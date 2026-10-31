@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { GrammarIssue } from "../../lib/ipc";
-import { findWhole, lastBlockIsOpen, markableSegments, markedCount, shouldCheckGrammar, sliceAround, splitMarked } from "./reading";
+import { findWhole, lastBlockIsOpen, markableSegments, markedCount, shouldCheckGrammar, sliceAround, splitMarked, GLOSS_WIDTH, glossPosition } from "./reading";
 
 const issue = (fragment: string): GrammarIssue => ({ fragment, replacement: "", explanation: "" });
 const marked = (pieces: ReturnType<typeof splitMarked>) =>
@@ -132,5 +132,57 @@ describe("标题栏的「N 处标记」数画出来的，不数模型给的条�
       "another item",
       "Plain paragraph.",
     ]);
+  });
+});
+
+describe("划词浮层的位置（fixed 定位 + 界面缩放 CSS zoom）", () => {
+  const viewport = { width: 960, height: 900 };
+
+  it("不缩放：和原来的算法一样——贴着点击位置，右边放不下就左移，下边放不下就上移", () => {
+    // 原来：left = min(x, innerWidth - 320)，top = min(y + 14, innerHeight - 200)
+    for (const [x, y] of [
+      [100, 100],
+      [500, 300],
+      [900, 300],
+      [300, 850],
+      [959, 899],
+    ]) {
+      expect(glossPosition({ x, y }, viewport, 1)).toEqual({
+        left: Math.min(x, viewport.width - 320),
+        top: Math.min(y + 14, viewport.height - 200),
+      });
+    }
+  });
+
+  it("放大 / 缩小：浮层落在点击的位置（写进去的长度会被 zoom 再乘一遍，所以先除掉）", () => {
+    for (const scale of [0.7, 1.3, 1.6]) {
+      const { left, top } = glossPosition({ x: 400, y: 300 }, viewport, scale);
+      expect(left * scale).toBeCloseTo(400, 6); // 渲染出来的设备坐标 = 点击位置
+      expect(top * scale).toBeCloseTo(314, 6);
+    }
+  });
+
+  it("放大后靠右 / 靠下点词：浮层整个留在窗口里（实测 130% 时右缘曾到 1040，160% 时落到窗口外）", () => {
+    for (const scale of [0.7, 1, 1.3, 1.6]) {
+      for (const [x, y] of [
+        [940, 450],
+        [640, 880],
+        [959, 899],
+      ]) {
+        const { left, top } = glossPosition({ x, y }, viewport, scale);
+        const deviceLeft = left * scale;
+        const deviceTop = top * scale;
+        expect(deviceLeft, `scale=${scale} x=${x}`).toBeGreaterThanOrEqual(0);
+        expect(deviceLeft + GLOSS_WIDTH * scale, `scale=${scale} x=${x}`).toBeLessThanOrEqual(viewport.width);
+        expect(deviceTop, `scale=${scale} y=${y}`).toBeGreaterThanOrEqual(0);
+        expect(deviceTop + 150 * scale, `scale=${scale} y=${y}`).toBeLessThanOrEqual(viewport.height);
+      }
+    }
+  });
+
+  it("窗口比浮层还窄：夹到 0，不会被推到屏幕左边之外", () => {
+    const { left, top } = glossPosition({ x: 50, y: 50 }, { width: 200, height: 100 }, 1.6);
+    expect(left).toBe(0);
+    expect(top).toBe(0);
   });
 });

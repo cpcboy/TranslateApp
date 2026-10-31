@@ -6,6 +6,8 @@ import { ResizeHandles } from "./features/window/ResizeHandles";
 import { WindowControls } from "./features/window/WindowControls";
 import { api, onHotkeyChanged } from "./lib/ipc";
 import { useLookup } from "./lib/store";
+import { UiScaleContext } from "./lib/uiScaleContext";
+import { useUiScale } from "./lib/useUiScale";
 
 const isTauri = "__TAURI_INTERNALS__" in window;
 
@@ -18,6 +20,7 @@ export default function App() {
   const run = useLookup((state) => state.run);
   const longSource = useLookup((state) => state.longSource);
   const resetLookup = useLookup((state) => state.reset);
+  const { scale, badge } = useUiScale();
 
   useEffect(() => {
     if (!isTauri) return;
@@ -96,60 +99,88 @@ export default function App() {
 
   return (
     <div className="relative h-full w-full p-3">
-      <div className="flex h-full flex-col overflow-hidden rounded-2xl border border-line bg-[#121217]">
-        {/* 无边框窗口没有标题栏。deep 让整条 header 的空白都能拖动，
-            但按钮/输入框仍优先响应点击（Tauri 会在 clickable 元素上短路）。 */}
-        <header
-          data-tauri-drag-region="deep"
-          className="flex shrink-0 items-center justify-between gap-4 border-b border-line py-4 pl-5 pr-7"
-        >
-          <div className="flex shrink-0 items-center gap-5">
-            {isTauri && <WindowControls />}
-            <div className="flex items-baseline gap-4">
-              <span className="font-serif text-[22px] font-semibold tracking-[0.16em] text-paper">
-                SENSE
-              </span>
-              <nav className="flex items-center gap-1">
-                <Tab active={view === "lookup"} onClick={() => setView("lookup")}>
-                  查词
-                </Tab>
-                <Tab active={view === "settings"} onClick={() => setView("settings")}>
-                  设置
-                </Tab>
-              </nav>
+      <div className="h-full overflow-hidden rounded-2xl border border-line bg-[#121217]">
+        {/* ⌘+ / ⌘- / ⌘0 缩放的是这一层里面的内容（见 lib/uiScale.ts）；
+            面板外框、外圈透明边距和缩放把手不跟着缩放 */}
+        <ZoomLayer scale={scale}>
+          {/* 无边框窗口没有标题栏。deep 让整条 header 的空白都能拖动，
+              但按钮/输入框仍优先响应点击（Tauri 会在 clickable 元素上短路）。 */}
+          <header
+            data-tauri-drag-region="deep"
+            className="flex shrink-0 items-center justify-between gap-4 border-b border-line py-4 pl-5 pr-7"
+          >
+            <div className="flex shrink-0 items-center gap-5">
+              {isTauri && <WindowControls />}
+              <div className="flex items-baseline gap-4">
+                <span className="font-serif text-[22px] font-semibold tracking-[0.16em] text-paper">
+                  SENSE
+                </span>
+                <nav className="flex items-center gap-1">
+                  <Tab active={view === "lookup"} onClick={() => setView("lookup")}>
+                    查词
+                  </Tab>
+                  <Tab active={view === "settings"} onClick={() => setView("settings")}>
+                    设置
+                  </Tab>
+                </nav>
+              </div>
             </div>
-          </div>
-          <span className="min-w-0 truncate font-mono text-[13.5px] text-subtle">
-            {hint ? `${hint} 呼出 · Esc 隐藏` : "Esc 隐藏"}
-          </span>
-        </header>
+            <span className="min-w-0 truncate font-mono text-[13.5px] text-subtle">
+              {hint ? `${hint} 呼出 · Esc 隐藏 · ⌘± 字号` : "Esc 隐藏 · ⌘± 字号"}
+            </span>
+          </header>
 
-        {notice && (
-          <div className="mx-4 mt-3 shrink-0 rounded-lg border border-[rgba(255,82,48,0.35)] bg-[rgba(255,82,48,0.1)] px-4 py-3 text-[13.5px] leading-relaxed text-[#f6b09b]">
-            <div className="flex items-start justify-between gap-3">
-              <span>{notice}</span>
-              <button
-                type="button"
-                onClick={() => setNotice("")}
-                className="shrink-0 rounded px-2 py-0.5 text-[13px] text-[#f6b09b] hover:text-paper"
-              >
-                知道了
-              </button>
+          {notice && (
+            <div className="mx-4 mt-3 shrink-0 rounded-lg border border-[rgba(255,82,48,0.35)] bg-[rgba(255,82,48,0.1)] px-4 py-3 text-[13.5px] leading-relaxed text-[#f6b09b]">
+              <div className="flex items-start justify-between gap-3">
+                <span>{notice}</span>
+                <button
+                  type="button"
+                  onClick={() => setNotice("")}
+                  className="shrink-0 rounded px-2 py-0.5 text-[13px] text-[#f6b09b] hover:text-paper"
+                >
+                  知道了
+                </button>
+              </div>
             </div>
-          </div>
-        )}
-
-        <main className="min-h-0 flex-1 px-4 py-3.5">
-          {view === "lookup" ? (
-            <LookupView onOpenSettings={() => setView("settings")} />
-          ) : (
-            <SettingsView onBack={() => setView("lookup")} />
           )}
-        </main>
+
+          <main className="min-h-0 flex-1 px-4 py-3.5">
+            {view === "lookup" ? (
+              <LookupView onOpenSettings={() => setView("settings")} />
+            ) : (
+              <SettingsView onBack={() => setView("lookup")} />
+            )}
+          </main>
+        </ZoomLayer>
       </div>
+
+      {badge && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="pointer-events-none absolute bottom-7 left-1/2 z-20 -translate-x-1/2 rounded-full border border-line-strong bg-black/80 px-4 py-1.5 font-mono text-[13.5px] text-paper"
+        >
+          {badge}
+        </div>
+      )}
 
       {isTauri && <ResizeHandles />}
     </div>
+  );
+}
+
+/**
+ * 面板内容套一层 CSS zoom（界面缩放），并把倍数交给 context：
+ * 这一层里 `position: fixed` 的东西（划词浮层）要靠它把视口坐标换算回 zoom 里的长度。
+ */
+function ZoomLayer({ scale, children }: { scale: number; children: React.ReactNode }) {
+  return (
+    <UiScaleContext.Provider value={scale}>
+      <div style={{ zoom: scale }} className="flex h-full flex-col">
+        {children}
+      </div>
+    </UiScaleContext.Provider>
   );
 }
 

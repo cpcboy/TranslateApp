@@ -123,3 +123,29 @@ export function markedCount(text: string, issues: GrammarIssue[]): number {
   return used.size;
 }
 
+
+/** 划词浮层的尺寸（CSS px）：宽与 LongTextView 里的 `w-[300px]` 一致，高是估计值；边距是浮层到窗口边缘的留白（设备像素） */
+export const GLOSS_WIDTH = 300;
+const GLOSS_HEIGHT = 150;
+const GLOSS_MARGIN_X = 20;
+const GLOSS_MARGIN_Y = 50;
+
+/**
+ * 划词浮层 `fixed` 定位时该写进 left / top 的值（CSS px）。
+ *
+ * 点击位置、窗口尺寸都是视口里的设备坐标；浮层在界面缩放（CSS zoom）的子树里，写进去的长度会被再乘一次 `scale`，
+ * 所以夹紧在设备坐标里做，最后除以 `scale`；浮层自己的宽高也随 zoom 放大，夹紧时要算进去。
+ * `scale` 为 1 时与原来的算法一致（再加一条：不会被夹到负数，窗口再窄也别把浮层推到屏幕左边之外）。
+ */
+export function glossPosition(
+  point: { x: number; y: number },
+  viewport: { width: number; height: number },
+  scale: number,
+): { left: number; top: number } {
+  const maxLeft = viewport.width - GLOSS_WIDTH * scale - GLOSS_MARGIN_X;
+  const maxTop = viewport.height - GLOSS_HEIGHT * scale - GLOSS_MARGIN_Y;
+  return {
+    left: Math.max(0, Math.min(point.x, maxLeft)) / scale,
+    top: Math.max(0, Math.min(point.y + 14, maxTop)) / scale,
+  };
+}

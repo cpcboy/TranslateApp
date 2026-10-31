@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { api, type GrammarIssue, type WordGloss } from "../../lib/ipc";
-import { lastBlockIsOpen, markedCount, shouldCheckGrammar, sliceAround, splitMarked } from "./reading";
+import { UiScaleContext } from "../../lib/uiScaleContext";
+import { glossPosition, lastBlockIsOpen, markedCount, shouldCheckGrammar, sliceAround, splitMarked } from "./reading";
 import { createScrollSync } from "./scrollSync";
 
 /** 复制到剪贴板：优先 Clipboard API，不行就退回 textarea + execCommand。 */
@@ -76,6 +77,8 @@ export function LongTextView({
   const [issues, setIssues] = useState<GrammarIssue[]>([]);
   const [checking, setChecking] = useState(false);
   const [gloss, setGloss] = useState<GlossState>(null);
+  // 界面缩放倍数：划词浮层是 fixed 定位，要靠它把视口坐标换算回 zoom 里的长度
+  const scale = useContext(UiScaleContext);
 
   // 真正画出来的标记数，不是模型给的问题条数
   const marks = useMemo(() => markedCount(source, issues), [source, issues]);
@@ -336,10 +339,12 @@ export function LongTextView({
       {gloss && (
         <div
           className="fixed z-50 w-[300px] rounded-xl border border-line-strong bg-[#16161b] px-4 py-3 shadow-[0_18px_50px_-20px_rgba(0,0,0,0.9)]"
-          style={{
-            left: Math.min(gloss.x, window.innerWidth - 320),
-            top: Math.min(gloss.y + 14, window.innerHeight - 200),
-          }}
+          // fixed 定位的坐标来自视口，而这里在界面缩放（CSS zoom）的子树里：写进去的长度会被再乘一遍倍数
+          style={glossPosition(
+            { x: gloss.x, y: gloss.y },
+            { width: window.innerWidth, height: window.innerHeight },
+            scale,
+          )}
           onMouseDown={(event) => event.stopPropagation()}
         >
           {gloss.error ? (
