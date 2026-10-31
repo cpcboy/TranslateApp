@@ -1,0 +1,10 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+html,body{margin:0;overflow:hidden;font-family:-apple-system,"Helvetica Neue",sans-serif}
+#stage{position:absolute;left:0;top:0;transform-origin:0 0}
+*{box-sizing:border-box}
+body{background:#1e1e1e;color:#e6e6e6}.bg{color:#1e1e1e}.fg{color:#e6e6e6}.mute{color:#9a9a9a}.line{color:#3a3a3a}.panel{color:#252526}.accent{color:#4fa3ff}.bgpanel{background:#252526}.bd{border-color:#3a3a3a}
+</style></head><body><div id="stage"><div style="position:relative;width:340px;height:27px;overflow:hidden"><div style="padding:8px 10px;font-size:12px;white-space:nowrap;display:flex;align-items:center;gap:6px"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex:none;"><line x1="5" y1="12" x2="19" y2="12"/></svg> <span>2</span> <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex:none;"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> <span style="margin-left:8px">Quantity</span></div></div></div><script>
+const Z = Number(new URLSearchParams(location.search).get('z') || 1); document.getElementById('stage').style.transform = `scale(${Z})`;
+window.__truth = () => [];
+
+</script></body></html>

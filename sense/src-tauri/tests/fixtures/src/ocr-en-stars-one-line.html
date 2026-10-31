@@ -1,0 +1,10 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+html,body{margin:0;overflow:hidden;font-family:-apple-system,"Helvetica Neue",sans-serif}
+#stage{position:absolute;left:0;top:0;transform-origin:0 0}
+*{box-sizing:border-box}
+body{background:#ffffff;color:#1d1d1f}.bg{color:#ffffff}.fg{color:#1d1d1f}.mute{color:#6e6e73}.line{color:#d2d2d7}.panel{color:#f5f5f7}.accent{color:#0071e3}.bgpanel{background:#f5f5f7}.bd{border-color:#d2d2d7}
+</style></head><body><div id="stage"><div style="position:relative;width:340px;height:32px;overflow:hidden"><div style="padding:8px 10px;font-size:14px;white-space:nowrap;display:flex;align-items:center;gap:6px"><span style="color:#f5a623">★★★☆☆</span> Not bad</div></div></div><script>
+const Z = Number(new URLSearchParams(location.search).get('z') || 1); document.getElementById('stage').style.transform = `scale(${Z})`;
+window.__truth = () => [];
+
+</script></body></html>

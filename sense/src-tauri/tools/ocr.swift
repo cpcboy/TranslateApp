@@ -4,8 +4,10 @@
 // 易碎且难调；这里用 swiftc 在构建时编译成 sidecar，运行时不依赖工具链。
 // 不联网、不上传图片、不花钱。
 //
+// 识别语言：中文优先、英文优先各识别一遍，图里有真中文用前一遍，否则用后一遍，见 `pickRecognition`。
+//
 // 用法：sense-ocr <png 路径>
-//       sense-ocr --selftest        （自检像素分析，不碰 Vision）
+//       sense-ocr --selftest        （自检像素分析与语言挑选，不碰 Vision）
 // 输出：JSON 数组，坐标是图片像素、原点左上：
 //       [{"text":..., "x":..., "y":..., "w":..., "h":..., "conf":...,
 //         "words":[{"t":..., "x":..., "w":...}],   // 逐词框（译文字号要按它反推）
@@ -17,6 +19,7 @@
 
 import AppKit
 import Foundation
+import NaturalLanguage
 import Vision
 
 // MARK: - 像素分析
@@ -364,12 +367,354 @@ func analyzeLine(_ raster: Raster, box: PixelRect) -> LineStyle? {
     return LineStyle(bg: bg, fg: foreground, ink: ink, room: room, cover: cover)
 }
 
+// MARK: - 识别语言的挑选
+
+/// 文字里有没有「连续两个以上的汉字」。
+///
+/// Vision 以 `recognitionLanguages` 的第一个语言为主，两种顺序各有毛病：
+///  · `en-US` 在前：英文最准，但中文整行读不出来——读成乱码（`+ ST22193`）或者干脆丢掉；
+///  · `zh-Hans` 在前：中文读得出来，但英文略差（`API`→`APl`、`(BETA)`→`（BETA）`），
+///    而且图标、星级会被读成汉字——菜单图标成了「三」、复选框成了「口」、★★★★★ 成了「大實女實」——
+///    不含中文的英文截图里也会冒出汉字，下游据此判断翻译方向时会被带偏。
+/// 所以两遍都识别，再挑一遍用，见 `pickRecognition`。真中文基本都是词、汉字连着出现，这是挑选的第一道筛子。
+func hasChineseRun(_ text: String) -> Bool {
+    var run = 0
+    for scalar in text.unicodeScalars {
+        if isHan(scalar) {
+            run += 1
+            if run >= 2 { return true }
+        } else {
+            run = 0
+        }
+    }
+    return false
+}
+
+/// 汉字（含扩展 A 和兼容汉字；扩展 B 以后的生僻字不算）。
+func isHan(_ scalar: Unicode.Scalar) -> Bool {
+    switch scalar.value {
+    case 0x3400...0x4DBF, 0x4E00...0x9FFF, 0xF900...0xFAFF: return true
+    default: return false
+    }
+}
+
+/// 文字里汉字的个数。
+func hanCount(_ text: String) -> Int {
+    text.unicodeScalars.filter(isHan).count
+}
+
+/// 方框、横竖线一类的汉字：图标（菜单、复选框、日历、进度条）最常被读成这些。（日、目、田不在内：日历、项目、目录里都有。）
+let boxLikeHan: Set<Character> = Set("口回囗囚㗊凹凸三二一十丨")
+
+/// 判断「词」时用的方框字：去掉「回」——返回、回复、回收站里的回是真字；`回回回` 这种读歪的串靠「不同的字」那条挡。
+let boxLikeInWords: Set<Character> = boxLikeHan.subtracting(["回"])
+
+/// 这一串汉字是不是整个都由方框、横竖线字组成（`口口口`、`回回回`、`三三`）：那是图标，不是文字。
+func isAllBoxLike(_ text: String) -> Bool {
+    let han = text.unicodeScalars.filter(isHan)
+    return !han.isEmpty && han.allSatisfy { boxLikeHan.contains(Character($0)) }
+}
+
+enum WordTokenizer {
+    /// 系统的中文分词；只在很短的选区里才会用到，所以放在静态属性里，第一次用才创建（英文图根本碰不到）
+    static let shared: NLTokenizer = {
+        let tokenizer = NLTokenizer(unit: .word)
+        tokenizer.setLanguage(.simplifiedChinese)
+        return tokenizer
+    }()
+}
+
+/// 真词要盖住那一串汉字的多少（严格大于）。星级读成的 `众众公众` 里碰巧有个 `公众`，只盖住一半，不算；
+/// 真菜单项 `首页`、`搜索`、`联系人员` 是 100%，`设置与偏好` 是 80%。
+let realWordCoverage = 0.5
+
+/// 文字里有没有「真词」：某一段连续汉字（≥ 2 个）被系统的中文分词切出了词——由 ≥ 2 个不同的字组成、不是主要由方框字组成——
+/// 并且这些词盖住了这一段的一半以上。
+/// 图标读成的汉字也会碰巧连成词（`冰水`、`大火`），但很少：评审员的语料里，英文图上读歪的汉字串约 3% 过得了这一关，真中文 80% 以上；
+/// 过不了的真中文多是系统词典里没有的两字词（`已选`、`更多`、`我的`）和换行折断的残片。
+func hasRealWord(_ text: String) -> Bool {
+    var run = ""
+    var runs: [String] = []
+    for scalar in text.unicodeScalars {
+        if isHan(scalar) {
+            run.unicodeScalars.append(scalar)
+        } else {
+            if run.count >= 2 { runs.append(run) }
+            run = ""
+        }
+    }
+    if run.count >= 2 { runs.append(run) }
+    let tokenizer = WordTokenizer.shared
+    for han in runs {
+        tokenizer.string = han
+        var covered = 0
+        tokenizer.enumerateTokens(in: han.startIndex..<han.endIndex) { range, _ in
+            let token = han[range]
+            if token.count >= 2, Set(token).count >= 2,
+               Double(token.filter { boxLikeInWords.contains($0) }.count) / Double(token.count) < 0.5 {
+                covered += token.count
+            }
+            return true
+        }
+        if Double(covered) / Double(han.count) > realWordCoverage { return true }
+    }
+    return false
+}
+
+/// 一遍识别里的一行：文字、Vision 给的框（归一化坐标，原点左下；两遍识别用同一套，直接比）、置信度。
+struct PassLine: Equatable {
+    let text: String
+    let box: CGRect
+    var confidence: Float = 1
+}
+
+/// 比对两遍识别读出的拉丁内容用的键：只留 ASCII 字母数字，转小写，并把识别时常读混的字符并成一类
+/// （l、1 → i，0 → o，5 → s）。汉字、符号、空白都不进键。
+func latinKey(_ text: String) -> [UInt8] {
+    var key: [UInt8] = []
+    for scalar in text.precomposedStringWithCompatibilityMapping.unicodeScalars where scalar.isASCII {
+        var byte = UInt8(scalar.value)
+        if byte >= 0x41 && byte <= 0x5A { byte += 0x20 }  // A–Z → a–z
+        guard (byte >= 0x61 && byte <= 0x7A) || (byte >= 0x30 && byte <= 0x39) else { continue }
+        switch byte {
+        case 0x6C, 0x31: byte = 0x69  // l、1 → i
+        case 0x30: byte = 0x6F        // 0 → o
+        case 0x35: byte = 0x73        // 5 → s
+        default: break
+        }
+        key.append(byte)
+    }
+    return key
+}
+
+/// 编辑距离（插入、删除、替换各算 1）。
+func editDistance(_ a: [UInt8], _ b: [UInt8]) -> Int {
+    if a.isEmpty { return b.count }
+    if b.isEmpty { return a.count }
+    var previous = Array(0...b.count)
+    for i in 1...a.count {
+        var current = [Int](repeating: 0, count: b.count + 1)
+        current[0] = i
+        for j in 1...b.count {
+            current[j] = min(previous[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1), previous[j] + 1, current[j - 1] + 1)
+        }
+        previous = current
+    }
+    return previous[b.count]
+}
+
+/// 中文优先那一遍读出的一行，英文优先那一遍能不能用别的东西解释。
+///
+/// 英文优先在这一行的位置（框重叠过半）读出的拉丁内容，和这一行去掉汉字之后的拉丁内容一样（编辑距离不超过 20%），
+/// 就说明那几个「汉字」是图标、星级被读歪的；英文优先在这个位置什么都没读到、或者读出来对不上，就解释不了。
+func isExplainedByEnglishPass(_ line: PassLine, englishFirst: [PassLine]) -> Bool {
+    let area = line.box.width * line.box.height
+    let overlapping = englishFirst.filter { other in
+        let common = line.box.intersection(other.box)
+        guard !common.isNull else { return false }
+        let smaller = min(area, other.box.width * other.box.height)
+        return smaller > 0 && common.width * common.height >= 0.5 * smaller
+    }.sorted { $0.box.minX < $1.box.minX }
+    guard !overlapping.isEmpty else { return false }
+    // 超长的行只比前 400 个字符，编辑距离是平方级的
+    let chinese = Array(latinKey(line.text).prefix(400))
+    let english = Array(overlapping.flatMap { latinKey($0.text) }.prefix(400))
+    // 两边都没有字母：英文优先把那里读成了符号（* • = 之类）——图标、星级。但置信度拉满（1.0）的纯汉字行是真中文：
+    // 英文优先有时把整行中文读成符号或西里尔字母（`ВАЛА`、`ЛК#`），不能因此抹掉
+    if chinese.isEmpty && english.isEmpty { return line.confidence < 0.99 }
+    if chinese.isEmpty || english.isEmpty { return false }
+    return editDistance(chinese, english) <= max(1, max(chinese.count, english.count) / 5)
+}
+
+/// 很短的选区（识别出的行数不超过这个数）：证据凑不够 6 行，改看有没有「真词」。
+let shortSelectionLines = 10
+
+/// 两遍识别的结果里挑一遍用。
+///
+/// 中文优先那一遍里有「有连续的汉字、并且英文优先那一遍解释不了」的行，就认为图里有真中文，整张图用中文优先那一遍；
+/// 否则用英文优先那一遍——不含中文的图，输出和只做英文优先时完全一样。证据分三档：
+///  · 强：有一行置信度 ≥ 0.5，一行就够（`取消 确定` 这样很短的选区也认得出来）；
+///  · 弱：行行都只有 0.3——图标读歪的汉字几乎都是这档，但夹着表情符号的中文菜单也是（每行都被表情拖到 0.3）。
+///    区别在量：图标读歪出来的弱行最多四五行、十几个字，整页的中文有十几行、几十个字，所以弱证据要 ≥ 6 行并且 ≥ 20 个汉字；
+///  · 很短的选区（≤ 10 行）：量凑不够——带图标的菜单项（`B 首页`）每行都是 0.3，选一两行是最常见的用法。
+///    这时看有没有「真词」（`hasRealWord`：系统的中文分词在那串汉字里切出了词）：有，并且这一行英文优先解释不了、或者置信度 ≥ 0.5，就算数。
+///    `Search 搜索` 这种中英混排的一行，英文优先把汉字丢了、剩下的英文两遍一样，所以「解释得了」，要靠置信度 ≥ 0.5 + 真词才认得出。
+///
+/// 为什么不能只数汉字：图标读成的汉字多半孤零零一个，但星级、成排的图标会读成连着的好几个（`大實女實*`、`實責責次次`），
+/// 光看汉字分不开。分得开的是另一遍：图标和星级在英文优先那一遍里读成符号（`*****`），旁边的英文字母两遍读出来一样；
+/// 真中文在英文优先那一遍里读成乱码、被丢掉，或者在汉字的位置多出乱码字母，两遍对不上。
+/// 只靠置信度也分得开，但置信度的档位（0.3 / 0.5 / 1.0）跟 Vision 的模型版本有关，换一个系统版本就可能失效；
+/// 所以置信度只用来给「解释不了」的行分强弱，不单独当判据。
+///
+/// 已知会判错的：成片的纯图标——一页里有 ≥ 6 行读成了汉字的图标行、≥ 20 个汉字，或者有一行置信度 ≥ 0.5 而英文优先没读到——
+/// 会被认成中文：整张图改用中文优先那一遍（英文单词多几处读错、半角括号变全角），图标位置多出几个汉字；
+/// 选区只有这么几行时，汉字数还可能压过字母数，翻译方向被带反。评审员的语料里只有「一页塞满方框图标」这一种（96 张里 6 张）。
+/// 漏判的：整张图里只有孤立的单个汉字（按钮、标签页上的一个字）；中文优先什么都没读到；系统词典里没有的两字词
+/// （`日历`、`项目`、`更多`）加图标、又没有置信度 ≥ 0.5 的行；很长的页面里只夹着一两个中文词；竖排文字——这些仍按老办法读，
+/// 中文读不出来，英文页保持原样。
+func pickRecognition<T>(chineseFirst: [T], englishFirst: [T], line: (T) -> PassLine) -> [T] {
+    let english = englishFirst.map(line)
+    let lines = chineseFirst.map(line)
+    let unexplained = lines.filter { hasChineseRun($0.text) && !isAllBoxLike($0.text) && !isExplainedByEnglishPass($0, englishFirst: english) }
+    let strong = unexplained.contains { $0.confidence >= 0.5 }
+    let weak = unexplained.filter { $0.confidence < 0.5 }
+    var foundChinese = strong || (weak.count >= 6 && weak.reduce(0) { $0 + hanCount($1.text) } >= 20)
+    if !foundChinese && lines.count <= shortSelectionLines {
+        foundChinese = lines.contains { candidate in
+            hasChineseRun(candidate.text) && hasRealWord(candidate.text) && (candidate.confidence >= 0.5 || unexplained.contains(candidate))
+        }
+    }
+    return foundChinese ? chineseFirst : englishFirst
+}
+
+/// 两个请求里可能有一个失败（`perform` 会抛出，但另一个请求的结果已经有了）：能用哪一遍就用哪一遍，两遍都没有才算失败（nil）。
+/// `nil` 是「这一遍没跑出来」，空数组是「跑完了、图里没有字」。
+func chooseRecognition<T>(chineseFirst: [T]?, englishFirst: [T]?, line: (T) -> PassLine) -> [T]? {
+    switch (chineseFirst, englishFirst) {
+    case let (chinese?, english?): return pickRecognition(chineseFirst: chinese, englishFirst: english, line: line)
+    case let (chinese?, nil): return chinese
+    case let (nil, english?): return english
+    case (nil, nil): return nil
+    }
+}
+
 // MARK: - 自检
 
-/// `--selftest`：用合成的图片核对像素分析，不碰 Vision。失败时往 stderr 说清哪一条，退出码非 0。
+/// `--selftest`：用合成的图片核对像素分析、用字符串核对语言挑选，不碰 Vision。失败时往 stderr 说清哪一条，退出码非 0。
 func runSelfTest() -> Never {
     var failures: [String] = []
     func check(_ condition: Bool, _ message: String) { if !condition { failures.append(message) } }
+
+    // 语言挑选：真中文连着汉字，图标读成的汉字孤零零一个
+    for text in ["新建任务", "更多", "◎ 新建任务", "AI 助手 (BETA)", "Esc 关闭覆盖层。", "按 X 开始", "日本語", "㐀㐁"] {
+        check(hasChineseRun(text), "语言挑选：「\(text)」是中文，要认出来")
+    }
+    for text in ["三 Menu", "口 Remember me", "曲 Calendar", "Tasks (0)", "按", "三 口 目", "（BETA）", "© 2026", "", "日 a 本"] {
+        check(!hasChineseRun(text), "语言挑选：「\(text)」不算有中文")
+    }
+    // 语言挑选（二）：两遍识别挑哪一遍。row 是同一个位置，两遍的框一样；图标读歪的汉字置信度多半只有 0.3
+    func rect(_ x: Double, _ y: Double, _ width: Double = 0.4) -> CGRect { CGRect(x: x, y: y, width: width, height: 0.04) }
+    func pass(_ text: String, _ box: CGRect, _ confidence: Float = 1) -> PassLine { PassLine(text: text, box: box, confidence: confidence) }
+    func expectPick(_ name: String, zh: [PassLine], en: [PassLine], chinese: Bool) {
+        let chosen = pickRecognition(chineseFirst: zh, englishFirst: en, line: { $0 })
+        check(chosen == (chinese ? zh : en), "语言挑选：\(name)——应该用\(chinese ? "中文" : "英文")优先那一遍")
+    }
+    func rows(_ count: Int, _ text: String, _ confidence: Float) -> [PassLine] { (0..<count).map { pass(text, rect(0.1, 0.08 * Double($0)), confidence) } }
+    let row = rect(0.1, 0.8), other = rect(0.1, 0.5)
+    // 真中文：英文优先把它读成乱码、丢掉，或者在汉字的位置多出乱码字母
+    expectPick("纯中文，英文优先读成乱码", zh: [pass("新建任务", row)], en: [pass("X#5127", row)], chinese: true)
+    expectPick("纯中文，英文优先丢掉了", zh: [pass("新建任务", row)], en: [pass("Tasks", other)], chinese: true)
+    expectPick("纯中文，英文优先什么都没读到", zh: [pass("更多", row)], en: [], chinese: true)
+    expectPick("中英混排，汉字的位置英文优先读成乱码字母",
+               zh: [pass("API Key 只存放在 Keychain 里", row, 0.5)], en: [pass("API Key RIXE Keychain #", row)], chinese: true)
+    expectPick("图标 + 中文", zh: [pass("◎ 新建任务", row)], en: [pass("+ ST22193", row)], chinese: true)
+    // 图标、星级被读成汉字：英文优先在同一位置读出符号，旁边的英文两遍一样
+    expectPick("星级 + 英文", zh: [pass("大實女實* Excellent quality,fits perfectly", row, 0.3)],
+               en: [pass("***** Excellent quality, fits perfectly", row)], chinese: false)
+    expectPick("星级 + 英文，I 和 l 读混", zh: [pass("真責众众公 Not what lexpected", row, 0.3)],
+               en: [pass("* * * * * Not what I expected", row)], chinese: false)
+    expectPick("星级 + 英文，英文优先把一行拆成两段",
+               zh: [pass("大實 Good value for money", row, 0.3)],
+               en: [pass("* Good value", rect(0.1, 0.8, 0.2)), pass("for money", rect(0.3, 0.8, 0.2))], chinese: false)
+    expectPick("星级 + 英文，英文优先的两段不是按从左到右的顺序给的",
+               zh: [pass("大實 Good value for money", row, 0.5)],
+               en: [pass("for money", rect(0.3, 0.8, 0.2)), pass("* Good value", rect(0.1, 0.8, 0.2))], chinese: false)
+    // 两遍读出的英文允许有一点出入（编辑距离不超过 20%，至少容 1 个字母）；汉字的位置多出一串乱码字母就不行
+    expectPick("星级 + 英文，一个字母读错", zh: [pass("大實 Hello world", row, 0.3)], en: [pass("* Helo world", row)], chinese: false)
+    expectPick("星级 + 很短的英文，一个字母读错", zh: [pass("真众公众的 Bad", row, 0.3)], en: [pass("* Bd", row)], chinese: false)
+    expectPick("星级 + 很短的英文，一个字母读错（置信度 0.5：解释得了与否才决定结果）", zh: [pass("大實女 Bad", row, 0.5)], en: [pass("* Bd", row)], chinese: false)
+    expectPick("星级 + 英文，出入超过 20%", zh: [pass("大實 Hello world", row, 0.5)], en: [pass("* Hxxo wxrld", row)], chinese: true)
+    expectPick("汉字的位置英文优先读成了字母", zh: [pass("新建任务 Tasks", row)], en: [pass("ST22193 Tasks", row)], chinese: true)
+    expectPick("只有星级，英文优先读成符号", zh: [pass("實責責次次", row, 0.3)], en: [pass("*****", row)], chinese: false)
+    expectPick("评分条", zh: [pass("4大女女女* 12%", row, 0.3)], en: [pass("4 ***** 12%", row)], chinese: false)
+    expectPick("没有连续的汉字", zh: [pass("三 Menu", row), pass("口 Remember me", other)], en: [], chinese: false)
+    expectPick("中文优先什么都没读到", zh: [], en: [pass("Tasks", row)], chinese: false)
+    // 一行星级 + 一行真中文：只要有一行是真中文，整张图用中文优先那一遍
+    expectPick("星级 + 真中文", zh: [pass("大實女實* Excellent", row, 0.3), pass("新建任务", other)],
+               en: [pass("***** Excellent", row), pass("X#5127", other)], chinese: true)
+    // 已知的局限：只有星级的一行，英文优先把它整个丢了；置信度只有 0.3 时一行不够，要 ≥ 0.5 才会被认成中文
+    expectPick("只有星级、英文优先读到的在别处，置信度 0.3", zh: [pass("實責責次次", row, 0.3)], en: [pass("Tasks", other)], chinese: false)
+    expectPick("（已知局限）只有星级、英文优先读到的在别处，置信度 0.5", zh: [pass("實責責次次", row, 0.5)], en: [pass("Tasks", other)], chinese: true)
+    // 框重叠：过半才算同一行
+    expectPick("框重叠 80%：同一行", zh: [pass("大實 Hello", rect(0.1, 0.8), 0.5)], en: [pass("* Hello", rect(0.18, 0.8))], chinese: false)
+    expectPick("框重叠 60%：同一行", zh: [pass("大實 Hello", rect(0.1, 0.8), 0.5)], en: [pass("* Hello", rect(0.26, 0.8))], chinese: false)
+    expectPick("框只重叠 30%：不是同一行", zh: [pass("大實 Hello", rect(0.1, 0.8), 0.5)], en: [pass("* Hello", rect(0.38, 0.8))], chinese: true)
+    expectPick("竖直方向不重叠：不是同一行", zh: [pass("大實 Hello", rect(0.1, 0.8), 0.5)], en: [pass("* Hello", rect(0.1, 0.7))], chinese: true)
+
+    // 置信度拉满（1.0）的纯汉字行是真中文：英文优先有时把整行中文读成符号或西里尔字母，不能因此抹掉
+    expectPick("纯汉字、置信度 1.0，英文优先读成西里尔字母", zh: [pass("联系人员", row, 1)], en: [pass("ВАЛА", row)], chinese: true)
+    expectPick("纯汉字、置信度 1.0，英文优先读成符号", zh: [pass("联系人员", row, 1)], en: [pass("****", row)], chinese: true)
+    expectPick("纯汉字、置信度 0.3，英文优先读成符号（图标、星级）", zh: [pass("實責責次次", row, 0.3)], en: [pass("****", row)], chinese: false)
+
+    // 置信度：强证据（一行 ≥ 0.5）一行就够；弱证据（只有 0.3）要 ≥ 6 行并且 ≥ 20 个汉字。
+    // 这几组用读歪的杂音（`實責責次次` 系统词典里切不出真词），别用真中文——真中文在短选区里走另一条路（见下面）
+    expectPick("一行 0.5 的短中文（取消 确定）", zh: [pass("取消 确定", row, 0.5)], en: [], chinese: true)
+    expectPick("一行 0.3 的读歪的词", zh: [pass("搜案", row, 0.3)], en: [], chinese: false)
+    expectPick("几行 0.3 的图标汉字", zh: rows(4, "回回回回", 0.3), en: [], chinese: false)
+    expectPick("0.3 的行数不够（5 行，每行 5 字）", zh: rows(5, "實責責次次", 0.3), en: [], chinese: false)
+    expectPick("0.3 的字数不够（6 行，每行 3 字 = 18 字）", zh: rows(6, "實責責", 0.3), en: [], chinese: false)
+    expectPick("0.3 的行数和字数刚好够（6 行，每行 4 字 = 24 字）", zh: rows(6, "實責責次", 0.3), en: [], chinese: true)
+    expectPick("夹着表情符号的中文菜单：整页都是 0.3，但行多字多", zh: rows(8, "设置与偏好", 0.3), en: [pass("*#F*", rect(0.1, 0.95))], chinese: true)
+    expectPick("弱证据 + 一行强证据：强的一行就够", zh: rows(2, "實責責次次", 0.3) + [pass("新建任务", rect(0.1, 0.9), 0.5)], en: [], chinese: true)
+    expectPick("被英文优先解释掉的行不算证据（即使置信度是 1）", zh: [pass("大實女實* Excellent", row, 1)], en: [pass("***** Excellent", row)], chinese: false)
+    expectPick("被解释掉的 0.3 星级行再多也不算（8 行）", zh: rows(8, "實責責次次 Not bad", 0.3), en: rows(8, "***** Not bad", 1), chinese: false)
+
+    // 很短的选区（≤ 10 行）：量凑不够，看有没有「真词」。带图标的菜单项每行都是 0.3，选一两行是最常见的用法
+    expectPick("短选区：图标 + 中文，英文优先读成乱码字母", zh: [pass("B 首页", row, 0.3)], en: [pass("ВИЛ", row)], chinese: true)
+    expectPick("短选区：只有一行 0.3 的真词", zh: [pass("搜索", row, 0.3)], en: [], chinese: true)
+    expectPick("短选区：三行带图标的菜单，都是 0.3", zh: [pass("© 数据分析", rect(0.1, 0.8), 0.3), pass("D 帮助", rect(0.1, 0.7), 0.3), pass("⑦ 联系人", rect(0.1, 0.6), 0.3)],
+               en: [pass("•", rect(0.1, 0.8)), pass("• #", rect(0.1, 0.7))], chinese: true)
+    expectPick("短选区：中英混排，英文优先把汉字丢了、剩下的英文一样，靠置信度 0.5 + 真词", zh: [pass("Search 搜索", row, 0.5)], en: [pass("Search", row)], chinese: true)
+    expectPick("短选区：中英混排，置信度 0.5，英文优先在汉字的位置读出乱码字母", zh: [pass("WorkBuddy 助手", row, 0.5)], en: [pass("WorkBuddy BJ#", row)], chinese: true)
+    expectPick("短选区：汉字被英文优先读成符号，置信度 0.5 + 真词", zh: [pass("共享文件", row, 0.5)], en: [pass("****", row)], chinese: true)
+    expectPick("（已知局限）短选区：中英混排，置信度只有 0.3、又被英文优先解释掉", zh: [pass("Mac 设置", row, 0.3)], en: [pass("Mac", row)], chinese: false)
+    expectPick("（已知局限）短选区：纯汉字 0.3，英文优先读成符号", zh: [pass("账单", row, 0.3)], en: [pass("ЛК#", row)], chinese: false)
+    expectPick("短选区：星级读成的汉字，置信度 0.5，被符号解释掉、系统词典里也切不出词", zh: [pass("真责众众公", row, 0.5)], en: [pass("***", row)], chinese: false)
+    expectPick("短选区：方框读成的汉字不算词", zh: [pass("回回回", row, 0.3), pass("口众", rect(0.1, 0.7), 0.3)], en: [], chinese: false)
+    expectPick("短选区：重复的字不算词（大大、次次）", zh: [pass("大大", row, 0.3), pass("次次", rect(0.1, 0.7), 0.3)], en: [], chinese: false)
+    expectPick("短选区的上限：10 行带真词的中英混排", zh: rows(10, "Search 搜索", 0.5), en: rows(10, "Search", 1), chinese: true)
+    expectPick("超过短选区的上限：11 行带真词、被英文优先解释掉的 0.5 的行", zh: rows(11, "Search 搜索", 0.5), en: rows(11, "Search", 1), chinese: false)
+
+    // 编辑距离容差（20%）、弱证据汉字数的边界（19 / 20）
+    expectPick("英文出入刚好 20%（10 个字母错 2 个）：解释得了", zh: [pass("大實 Hello world", row, 0.5)], en: [pass("* Hexlo worxd", row)], chinese: false)
+    expectPick("弱证据 6 行、19 个汉字：不够", zh: rows(5, "實責責", 0.3) + [pass("實責責次", rect(0.1, 0.9), 0.3)], en: [], chinese: false)
+    expectPick("弱证据 6 行、20 个汉字：刚好够", zh: rows(4, "實責責", 0.3) + [pass("實責責次", rect(0.1, 0.9), 0.3), pass("實責責次", rect(0.1, 0.95), 0.3)], en: [], chinese: true)
+    // 整行都是方框字的行不是文字：`▢▢▢ Slots` 里的方框被读成 `口口口`（置信度 0.5），英文优先读成 `000`，不能算强证据
+    expectPick("整行方框字，置信度 0.5，英文优先读成数字", zh: [pass("口口口", row, 0.5), pass("Slots", other, 0.5)], en: [pass("000", row), pass("Slots", other)], chinese: false)
+    expectPick("整行方框字、置信度 1.0，英文优先读成符号：也不算", zh: [pass("回回回回", row, 1)], en: [pass("****", row)], chinese: false)
+    // 置信度 1.0 的例外要在行数多、短选区那档用不上的时候也起作用
+    expectPick("11 行纯汉字、置信度 1.0，英文优先读成西里尔字母", zh: rows(11, "联系人员", 1), en: rows(11, "ВАЛА", 1), chinese: true)
+    // 星级读成的汉字碰巧含一个词（`公众`），但只盖住那串汉字的一半：不算真词
+    expectPick("星级读成 `众众公众`（置信度 0.3，英文优先没读到），碰巧含词 `公众`", zh: [pass("*众众公众 Great！", row, 0.3)], en: [], chinese: false)
+    expectPick("星级读成 `真众公众的`（置信度 0.3），碰巧含词 `公众`", zh: [pass("真众公众的 Bad", row, 0.3)], en: [], chinese: false)
+
+    // 文字里有没有真词
+    for text in ["首页", "搜索", "项目", "日历", "返回", "回复", "设置与偏好", "联系人员", "A 首页", "◎ 项目 ©", "是首页", "公众"] {
+        check(hasRealWord(text), "hasRealWord：「\(text)」里有真词")
+    }
+    for text in ["口众", "大大", "次次", "實責責次次", "回回回", "三 Menu", "Tasks", "", "三二", "真众公众的", "众众公众", "回口"] {
+        check(!hasRealWord(text), "hasRealWord：「\(text)」里没有真词")
+    }
+    check(isAllBoxLike("口口口") && isAllBoxLike("回回") && isAllBoxLike("三 二") && !isAllBoxLike("口众") && !isAllBoxLike("Menu") && !isAllBoxLike(""), "isAllBoxLike：整串都是方框字才算")
+
+    // 一个请求失败（结果是 nil）时用另一遍；两遍都没有才算失败；空数组是「图里没有字」，不是失败
+    let oneLine = [pass("Tasks", row)], noLines: [PassLine] = []
+    check(chooseRecognition(chineseFirst: nil, englishFirst: oneLine, line: { $0 }) == oneLine, "chooseRecognition：中文优先失败时用英文优先")
+    check(chooseRecognition(chineseFirst: [pass("新建任务", row)], englishFirst: nil, line: { $0 }) == [pass("新建任务", row)], "chooseRecognition：英文优先失败时用中文优先")
+    check(chooseRecognition(chineseFirst: nil as [PassLine]?, englishFirst: nil, line: { $0 }) == nil, "chooseRecognition：两遍都没有才算失败")
+    check(chooseRecognition(chineseFirst: noLines, englishFirst: noLines, line: { $0 }) == noLines, "chooseRecognition：两遍都跑完了、图里没有字，不是失败")
+    check(chooseRecognition(chineseFirst: noLines, englishFirst: oneLine, line: { $0 }) == oneLine, "chooseRecognition：都跑完了就照常挑")
+
+    // 拉丁内容的键与编辑距离
+    check(latinKey("Al") == latinKey("AI"), "latinKey：Al 与 AI 要并成同一个键")
+    check(latinKey("l1|!0 5") == Array("iios".utf8), "latinKey：l1 → ii、0 → o、5 → s，符号和空白不进键，实际 \(latinKey("l1|!0 5"))")
+    check(latinKey("新建 Tasks（0）") == latinKey("TASKS O"), "latinKey：汉字不进键，全角括号不进键")
+    check(latinKey("ＡＢＣ１２") == latinKey("abci2"), "latinKey：全角字母数字先转成半角")
+    check(latinKey("").isEmpty && latinKey("三 口").isEmpty, "latinKey：没有字母数字时是空的")
+    check(editDistance(Array("kitten".utf8), Array("sitting".utf8)) == 3, "editDistance：kitten → sitting 是 3")
+    check(editDistance([], Array("abc".utf8)) == 3 && editDistance(Array("abc".utf8), []) == 3, "editDistance：与空串的距离是长度")
+    check(editDistance(Array("abc".utf8), Array("abc".utf8)) == 0, "editDistance：相同的串是 0")
+
     func near(_ a: (Int, Int, Int)?, _ b: (Int, Int, Int), _ tolerance: Int = 3) -> Bool {
         guard let a = a else { return false }
         return abs(a.0 - b.0) <= tolerance && abs(a.1 - b.1) <= tolerance && abs(a.2 - b.2) <= tolerance
@@ -769,29 +1114,54 @@ else {
 let width = CGFloat(cg.width)
 let height = CGFloat(cg.height)
 
-let request = VNRecognizeTextRequest()
-request.recognitionLevel = .accurate
-request.usesLanguageCorrection = true
-request.recognitionLanguages = ["en-US", "zh-Hans"]
+// 两遍识别：Vision 以 recognitionLanguages 的第一个语言为主，只放一种顺序总有一头不行（见 `pickRecognition`）。
 // 关掉自动语言检测，省一点时间；两种语言都明确给了。
-request.automaticallyDetectsLanguage = false
+func makeRequest(languages: [String]) -> VNRecognizeTextRequest {
+    let request = VNRecognizeTextRequest()
+    request.recognitionLevel = .accurate
+    request.usesLanguageCorrection = true
+    request.recognitionLanguages = languages
+    request.automaticallyDetectsLanguage = false
+    return request
+}
+
+let englishFirst = makeRequest(languages: ["en-US", "zh-Hans"])
+let chineseFirst = makeRequest(languages: ["zh-Hans", "en-US"])
 
 let handler = VNImageRequestHandler(cgImage: cg, options: [:])
+var performError: Error?
 do {
-    try handler.perform([request])
+    // 两个请求放在同一次 perform 里；分成两次 perform 并不更快。代价是识别时间变长：典型的小图（360×190 到 1100×780）
+    // 约 1.3–2.3 倍（0.35–0.8 秒 → 0.5–1.8 秒）；CPU 时间英文页约 2 倍，中文大图 3–4 倍（旧程序根本读不出那些字，
+    // 5120×2880 的密集中文页约 3 秒 → 10–12 秒）
+    try handler.perform([chineseFirst, englishFirst])
 } catch {
-    FileHandle.standardError.write("OCR 失败: \(error)\n".data(using: .utf8)!)
-    exit(3)
+    // 一个请求失败时 perform 会抛出，但另一个请求的结果已经有了，见 chooseRecognition
+    performError = error
 }
 
 // 像素分析读不出来（极端的图片格式）就不给 bg / fg / ink / room，使用方退回旧做法
 let raster = Raster(cgImage: cg)
 
+/// 置信度太低的多数是图标、边线、噪点，留给页面反而更乱。没跑出结果的那一遍（results 是 nil）返回 nil
+func usableLines(_ request: VNRecognizeTextRequest) -> [(VNRecognizedTextObservation, VNRecognizedText)]? {
+    request.results?.compactMap { observation in
+        guard let candidate = observation.topCandidates(1).first, candidate.confidence >= 0.3 else { return nil }
+        return (observation, candidate)
+    }
+}
+
+guard let chosen = chooseRecognition(
+    chineseFirst: usableLines(chineseFirst),
+    englishFirst: usableLines(englishFirst),
+    line: { PassLine(text: $0.1.string, box: $0.0.boundingBox, confidence: $0.1.confidence) }
+) else {
+    FileHandle.standardError.write("OCR 失败: \(performError.map { "\($0)" } ?? "没有识别结果")\n".data(using: .utf8)!)
+    exit(3)
+}
+
 var out: [[String: Any]] = []
-for observation in (request.results ?? []) {
-    guard let candidate = observation.topCandidates(1).first else { continue }
-    // 置信度太低的多数是图标、边线、噪点，留给页面反而更乱
-    guard candidate.confidence >= 0.3 else { continue }
+for (observation, candidate) in chosen {
     let box = observation.boundingBox
     let x = Double(box.origin.x * width)
     let y = Double((1 - box.origin.y - box.size.height) * height)

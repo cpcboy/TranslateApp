@@ -602,7 +602,7 @@ pub async fn run_with_image(
     }
 
 
-    // OCR 最多会占 30 秒，放到阻塞线程里跑，别霸占异步运行时的工作线程
+    // OCR 最多会占 60 秒，放到阻塞线程里跑，别霸占异步运行时的工作线程
     let ocr_png = png.to_path_buf();
     let lines = tauri::async_runtime::spawn_blocking(move || run_ocr(&ocr_png))
         .await
@@ -821,7 +821,10 @@ fn ocr_binary() -> Result<PathBuf, String> {
 }
 
 /// OCR 子进程最多跑这么久，超时就杀掉并如实报错：一直卡着的话，这次截屏会悄无声息地没有下文。
-const OCR_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// 辅助程序对每张图做两遍识别，中文的大图更慢：5120×2880 的密集中文页在 M4 上要 12 秒左右，慢两倍多的机器就逼近 30 秒了，
+/// 所以放宽到 60 秒——这个上限防的是卡死，不是慢。
+const OCR_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 跑一个子进程，带超时；返回 (是否成功退出, stdout, stderr)。
 ///
@@ -1312,34 +1315,182 @@ mod tests {
         assert_eq!((block.x, block.y), (16.0, 18.0));
     }
 
-    #[test]
-    fn real_ocr_sidecar_passes_its_own_pixel_selftest() {
-        // 像素分析（底色 / 字色 / 笔画包围盒 / 右边的空白）写在 Swift 里，它的逻辑靠辅助程序自带的自检守住。
-        // 没有 swiftc 时 build.rs 放的是占位脚本，这时没东西可测，跳过并说明
+    /// 真正的辅助程序：不是占位脚本，也不比源码旧。没有就返回 None，调用方跳过并说明。
+    /// 没有 swiftc 时 build.rs 放的是占位脚本，这时没东西可测。
+    fn real_sidecar() -> Option<PathBuf> {
         let Ok(binary) = ocr_binary() else {
             eprintln!("跳过：找不到 sense-ocr");
-            return;
+            return None;
         };
         if std::fs::read(&binary).map(|bytes| bytes.starts_with(b"#!")).unwrap_or(true) {
             eprintln!("跳过：sense-ocr 是占位脚本，不是真产物");
-            return;
+            return None;
         }
-        // build.rs 编译失败时只发 cargo:warning 并保留旧产物——这时跑旧产物的自检等于没测新源码，必须报出来
+        // build.rs 编译失败时只发 cargo:warning 并保留旧产物——这时跑旧产物等于没测新源码，必须报出来
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
         if binary.starts_with(manifest.join("binaries")) {
             let modified = |path: &Path| std::fs::metadata(path).and_then(|meta| meta.modified()).ok();
             if let (Some(source), Some(product)) = (modified(&manifest.join("tools/ocr.swift")), modified(&binary)) {
                 assert!(
                     product >= source,
-                    "OCR 辅助程序比 tools/ocr.swift 旧：swiftc 编译失败了（build.rs 只发警告、保留旧产物），这里跑的不是当前源码。先 cargo build 看警告"
+                    "OCR 辅助程序比 tools/ocr.swift 旧，这里跑的不是当前源码：swiftc 编译失败了（build.rs 只发警告、保留旧产物，先 cargo build 看警告），\
+                     或者编译被 SENSE_SKIP_OCR 跳过了（没有警告：去掉它再 cargo build）"
                 );
             }
         }
+        Some(binary)
+    }
+
+    #[test]
+    fn real_ocr_sidecar_passes_its_own_pixel_selftest() {
+        // 像素分析（底色 / 字色 / 笔画包围盒 / 右边的空白）、语言挑选、切词写在 Swift 里，它们的逻辑靠辅助程序自带的自检守住
+        let Some(binary) = real_sidecar() else {
+            return;
+        };
         let mut command = Command::new(&binary);
         command.arg("--selftest");
         let (ok, stdout, stderr) = run_with_timeout(command, Duration::from_secs(30)).expect("自检要能跑起来");
         assert!(ok, "辅助程序自检失败：{}", String::from_utf8_lossy(&stderr));
         assert!(String::from_utf8_lossy(&stdout).contains("selftest ok"));
+    }
+
+    /// 跑真的 OCR。图在 tests/fixtures/（来源和重做办法见那里的 README），是真实渲染出来的截图。
+    fn recognized_lines(fixture: &str) -> Vec<OcrLine> {
+        let png = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(fixture);
+        assert!(png.exists(), "缺测试图片 {}", png.display());
+        run_ocr(&png).expect("识别要能跑完")
+    }
+
+    fn joined(lines: &[OcrLine]) -> String {
+        lines.iter().map(|line| line.text.as_str()).collect::<Vec<_>>().join("\n")
+    }
+
+    fn han_chars(text: &str) -> Vec<char> {
+        text.chars().filter(|ch| ('\u{4e00}'..='\u{9fff}').contains(ch)).collect()
+    }
+
+    #[test]
+    fn real_ocr_reads_chinese_text_in_a_screenshot() {
+        // Vision 以识别语言列表里的第一个为主：英文排前面时，中文整行读不出来——读成乱码（`X#5127`）或者直接丢掉，
+        // 中文截图就等于没法翻译。图里四行：两行纯中文、一行英文、一行中英混排。
+        // 不断言 `API Key`：中文优先的识别偶尔会把 I 读成 l（`APl Key`），那是已知的小毛病，不该让测试跟着抖。
+        if real_sidecar().is_none() {
+            return;
+        }
+        let lines = recognized_lines("ocr-zh-en.png");
+        let text = joined(&lines);
+        for expected in ["新建任务", "设置与偏好", "Tasks", "Keychain"] {
+            assert!(text.contains(expected), "识别结果里没有「{expected}」——中文截图要能读出来：\n{text}");
+        }
+        // 方向：中文为主就译成英文。这正是「冒出汉字会把方向带偏」要守住的那个判断
+        assert_eq!(translate_target(&merge_lines(&lines, 1.0)), Some("英文"), "中文截图要译成英文：\n{text}");
+        // 逐词框：译文字号靠它反推，中文行现在也会走这条路。每个词都要有正的宽度、出现在它那一行里，加起来是整行的一部分
+        let mut multi_word_lines = 0;
+        for line in &lines {
+            assert!(!line.words.is_empty(), "「{}」这一行没有逐词框", line.text);
+            for word in &line.words {
+                assert!(word.w.is_finite() && word.w > 0.0, "「{}」里的词「{}」宽度不对：{}", line.text, word.t, word.w);
+                assert!(line.text.contains(&word.t), "词「{}」不在它那一行「{}」里", word.t, line.text);
+            }
+            // 词框是这一行框的一部分：加起来不会只占一小半（图标那一个词也算在里面），也不会比整行宽出一大截——
+            // 每个词的框自带一点边距，词多了会累积，所以上界按词数放宽
+            let total: f64 = line.words.iter().map(|word| word.w).sum();
+            assert!(
+                total <= line.w * 1.15 + 3.0 * line.words.len() as f64 && total >= line.w * 0.5,
+                "「{}」的词框宽度加起来是 {total}，整行是 {}，对不上",
+                line.text,
+                line.w
+            );
+            if line.words.len() > 1 {
+                multi_word_lines += 1;
+            }
+        }
+        assert!(multi_word_lines >= 1, "没有一行被切成多个词：\n{text}");
+    }
+
+    #[test]
+    fn real_ocr_reads_short_chinese_selections() {
+        // 选一两行是最常见的用法：带图标的菜单项（`B 首页`，每行置信度只有 0.3）、中英混排的一行（`Search 搜索`，
+        // 英文优先把汉字丢了、剩下的英文两遍一样）——量凑不够，要靠系统的中文分词认出「真词」（ocr.swift 的 `pickRecognition`）
+        if real_sidecar().is_none() {
+            return;
+        }
+        let icon_label = joined(&recognized_lines("ocr-zh-icon-label.png"));
+        assert!(icon_label.contains("首页"), "带图标的单行菜单项要读得出来：\n{icon_label}");
+        let lines = recognized_lines("ocr-zh-icon-label.png");
+        assert_eq!(translate_target(&merge_lines(&lines, 1.0)), Some("英文"), "中文菜单项要译成英文：\n{icon_label}");
+        // 中英混排的一行，方向由汉字和字母的多少定（`Search 搜索`：2 个汉字、6 个字母，会判成译成中文），这里只看汉字读没读出来
+        let mixed = joined(&recognized_lines("ocr-zh-mixed-line.png"));
+        assert!(mixed.contains("搜索"), "中英混排的一行，汉字要读得出来：\n{mixed}");
+    }
+
+    #[test]
+    fn real_ocr_reads_a_chinese_menu_decorated_with_emoji() {
+        // 每行都夹着表情符号的中文菜单：Vision 给每一行的置信度都是 0.3（表情把识别拖低了），
+        // 单看置信度会把它当成图标读歪的杂音。要靠「弱证据行多、汉字多」才认得出来（ocr.swift 的 `pickRecognition`）
+        if real_sidecar().is_none() {
+            return;
+        }
+        let lines = recognized_lines("ocr-zh-emoji.png");
+        let text = joined(&lines);
+        let found = ["帮助", "设置与偏好", "集成", "共享", "发现", "团队", "视频", "照片", "提醒", "联系人", "下载"]
+            .iter()
+            .filter(|word| text.contains(**word))
+            .count();
+        assert!(found >= 4, "只读出了 {found} 个菜单项，中文菜单要读得出来：\n{text}");
+        assert_eq!(translate_target(&merge_lines(&lines, 1.0)), Some("英文"), "中文菜单要译成英文：\n{text}");
+    }
+
+    /// 英文截图里的图标、星级会被中文优先的那一遍读成汉字（见 ocr.swift 的 `pickRecognition`）：
+    /// 不含中文的图必须用英文优先的那一遍，否则英文截图里会冒出汉字，翻译方向还可能被带偏。
+    fn assert_english_screenshot_stays_english(fixture: &str, expected: &[&str]) {
+        let lines = recognized_lines(fixture);
+        let text = joined(&lines);
+        let han = han_chars(&text);
+        assert!(han.is_empty(), "英文截图 {fixture} 里冒出了汉字 {han:?}——多半是误用了中文优先的那一遍：\n{text}");
+        for expected in expected {
+            assert!(text.contains(expected), "{fixture} 的识别结果里没有「{expected}」：\n{text}");
+        }
+        assert_eq!(translate_target(&merge_lines(&lines, 1.0)), Some("中文"), "英文截图要译成中文：\n{text}");
+    }
+
+    #[test]
+    fn real_ocr_does_not_invent_chinese_from_icons_in_an_english_screenshot() {
+        // 中文优先时 Vision 会把菜单图标读成「三」、复选框读成「口」、日历图标读成「曲」、文档图标读成「目」
+        if real_sidecar().is_none() {
+            return;
+        }
+        assert_english_screenshot_stays_english(
+            "ocr-en-icons.png",
+            &["Menu", "Remember me", "Calendar", "Documents", "Release notes", "Favorites"],
+        );
+        // 数量步进器 `[−] 2 [+]`：中文优先把 `+ 2 −` 读成 `+乙一`（置信度 0.3），英文优先读成 `+ Z -`——对不上，但只有一行 0.3、
+        // 不是整行方框字、也没有真词。要靠「置信度 0.3 是弱证据」才挡得住；调用处要是把置信度传丢了（当成 1.0），这行就成了强证据
+        let stepper = joined(&recognized_lines("ocr-en-stepper.png"));
+        assert!(han_chars(&stepper).is_empty() && stepper.contains("Quantity"), "数量步进器那一行不该冒汉字：\n{stepper}");
+        // 只有成排的方框图标、一个字也没有：中文优先把它们读成「回回回」「回回回口回回」，每行置信度只有 0.3。
+        // 英文优先在那里读出的是乱码字母，「解释得了」解释不了；要靠「置信度 0.3 的行要 ≥ 6 行、≥ 20 个汉字才算数」挡住
+        let boxed = joined(&recognized_lines("ocr-en-icons-boxed.png"));
+        let han = han_chars(&boxed);
+        assert!(han.is_empty(), "纯图标的图里冒出了汉字 {han:?}——弱证据（置信度 0.3）不该被采信：\n{boxed}");
+    }
+
+    #[test]
+    fn real_ocr_does_not_invent_chinese_from_star_ratings_in_an_english_screenshot() {
+        // 星级、成排的图标会被中文优先读成连着的好几个汉字（`大實女實*`、`實責責次次`），光数「连续的汉字」分不开；
+        // 要靠英文优先那一遍：它在同一位置读出符号，旁边的英文字母和中文优先那一遍一样
+        if real_sidecar().is_none() {
+            return;
+        }
+        assert_english_screenshot_stays_english(
+            "ocr-en-stars.png",
+            &["Excellent quality", "Good value", "battery life", "Reviewed in"],
+        );
+        // 选区只有一行星级 + 两个英文词时更要紧：中文优先读成 5 个汉字、字母只有 6 个，汉字 ×2 ≥ 字母，方向会被判成「英文」
+        assert_english_screenshot_stays_english("ocr-en-stars-one-line.png", &["Not bad"]);
+        // SVG 描边星：中文优先那一遍里有置信度 0.5 的星级行（`真真責众众 Okay, but …`）。没有「英文优先解释得了」这一层，
+        // 一行 0.5 就够让整张图改用中文优先。上面两张的星级行都只有 0.3，被「弱证据要 6 行」挡住了，守不住这一层
+        assert_english_screenshot_stays_english("ocr-en-stars-svg.png", &["Excellent quality", "Good value", "battery life"]);
     }
 
     #[test]
