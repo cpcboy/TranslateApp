@@ -81,6 +81,7 @@ function startResize(edge: Edge, event: ReactPointerEvent<HTMLDivElement>) {
     edge,
     startX: event.screenX,
     startY: event.screenY,
+    buttonsAtStart: event.buttons,
     measure: api.windowFrame,
     send: api.setWindowFrame,
     onEnd: cleanup,

@@ -183,7 +183,7 @@ describe("createDragSession：一次拖拽的时序", () => {
   const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
   /** 手动控制「量起始外框」何时完成、成功还是失败 */
-  function rig(edge: Edge = "e") {
+  function rig(edge: Edge = "e", buttonsAtStart = 1) {
     const sent: Frame[] = [];
     let measured: { resolve: (frame: Frame) => void; reject: (error: unknown) => void } = {
       resolve: () => {},
@@ -194,6 +194,7 @@ describe("createDragSession：一次拖拽的时序", () => {
       edge,
       startX: 1000,
       startY: 500,
+      buttonsAtStart,
       measure: () => new Promise<Frame>((resolve, reject) => (measured = { resolve, reject })),
       send: async (frame) => {
         sent.push(frame);
@@ -245,6 +246,22 @@ describe("createDragSession：一次拖拽的时序", () => {
     expect(session.ended).toBe(true);
   });
 
+  it("合成事件（按下时 buttons 就是 0；WebKit 的 buttons 取自系统按键状态，辅助功能 / 自动化工具发的事件永远是 0）：不信 buttons，拖拽照常进行", async () => {
+    // 真机实测踩过：信 buttons 的话，第一个移动事件就被当成「已松手」，拖拽永远起不来
+    const { session, sent, measured, ends } = rig("e", 0);
+    measured().resolve(START);
+    await tick();
+    session.move(1020, 500, 0);
+    session.move(1040, 500, 0);
+    await tick();
+    expect(sent.length).toBeGreaterThan(0);
+    expect(sent[sent.length - 1]).toEqual(resizeFrame(START, "e", 40, 0));
+    expect(ends()).toBe(0);
+    expect(session.ended).toBe(false);
+    session.end(); // 照常靠松手收尾
+    expect(ends()).toBe(1);
+  });
+
   it("量起始外框失败：放弃这次拖动，收尾一次", async () => {
     const { session, measured, ends, sent } = rig();
     measured().reject(new Error("window gone"));
@@ -262,6 +279,7 @@ describe("createDragSession：一次拖拽的时序", () => {
       edge: "e",
       startX: 0,
       startY: 0,
+      buttonsAtStart: 1,
       measure: () => {
         throw new Error("sync");
       },

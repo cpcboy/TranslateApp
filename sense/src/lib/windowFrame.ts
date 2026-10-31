@@ -98,6 +98,9 @@ export type DragSession = {
  *   （用户快速点一下就松手时 pointerup 发生在量的期间——旧实现栽过这个，监听器永远收不到松手。）
  * - 松手可能丢——窗口被快捷键 / Esc 隐藏、右键菜单打断、指针捕获被抢走：移动事件里主键已经松开就收尾，
  *   不然监听器残留，窗口再出现后没按着键移动鼠标也会缩放。
+ *   但只在「按下的那一刻就带着主键值」的环境里信这个判断：WebKit 的 `buttons` 取自系统当前的按键状态，
+ *   合成的鼠标事件（辅助功能 / 远程控制 / 自动化工具发来的）按下和拖动期间都是 0，照信的话一动就会被当成已松手、
+ *   拖拽永远起不来（真机实测踩过）。这种环境靠失焦、指针捕获丢失、pointerup 收尾。
  * - 量不出来就放弃这次拖动。
  * `onEnd` 只调用一次，调用方在里面摘监听器、释放指针捕获。
  */
@@ -105,12 +108,15 @@ export function createDragSession(options: {
   edge: Edge;
   startX: number;
   startY: number;
+  /** 按下那一刻的 `PointerEvent.buttons`：带着主键值才信后面移动事件里的 `buttons` */
+  buttonsAtStart: number;
   measure: () => Promise<Frame>;
   send: (frame: Frame) => Promise<unknown>;
   onEnd: () => void;
 }): DragSession {
   let start: Frame | null = null;
   let ended = false;
+  const trustButtons = (options.buttonsAtStart & 1) !== 0;
   const sender = createFrameSender(options.send);
 
   const end = () => {
@@ -137,7 +143,7 @@ export function createDragSession(options: {
     end,
     move(screenX, screenY, buttons) {
       if (ended) return;
-      if ((buttons & 1) === 0) {
+      if (trustButtons && (buttons & 1) === 0) {
         end();
         return;
       }
