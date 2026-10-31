@@ -62,6 +62,9 @@ const ALIGN_TOLERANCE: f64 = 40.0;
 const MIN_DRAG: f64 = 8.0;
 
 /// OCR 出来的一行（图片像素坐标，原点左上）。
+///
+/// `words` / `bg` / `fg` / `ink` / `room` 是辅助程序后加的，全部可缺省：
+/// 缺了（旧版辅助程序、像素分析失败）就退回「只有文字和位置」的旧做法。
 #[derive(Debug, Clone, Default, Deserialize)]
 struct OcrLine {
     text: String,
@@ -69,10 +72,69 @@ struct OcrLine {
     y: f64,
     w: f64,
     h: f64,
+    /// 逐词框。行首的图标被读成的单个字符自己成一个词，反推字号时靠它把图标的宽度排除掉
+    #[serde(default)]
+    words: Vec<OcrWord>,
+    /// 这一行底下的底色与文字颜色（sRGB，三个 0–255）
+    #[serde(default)]
+    bg: Option<Vec<f64>>,
+    #[serde(default)]
+    fg: Option<Vec<f64>>,
+    /// 原文笔画的紧包围盒（含越出 Vision 框的部分）
+    #[serde(default)]
+    ink: Option<OcrInk>,
+    /// 笔画右边到下一个非底色像素的空白宽度
+    #[serde(default)]
+    room: Option<f64>,
+    /// 允许遮盖的范围：笔画外扩一点，每一侧只扩到下一个非底色像素为止（不会盖到隔壁的色块、分隔线上）
+    #[serde(default)]
+    cover: Option<OcrInk>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct OcrWord {
+    t: String,
+    #[serde(default)]
+    w: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+struct OcrInk {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+/// 矩形（逻辑像素，相对选区左上）。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Rect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+impl Rect {
+    fn union(self, other: Rect) -> Rect {
+        let left = self.x.min(other.x);
+        let top = self.y.min(other.y);
+        let right = (self.x + self.w).max(other.x + other.w);
+        let bottom = (self.y + self.h).max(other.y + other.h);
+        Rect { x: left, y: top, w: right - left, h: bottom - top }
+    }
+}
+
+/// 原文里的一个词：只要宽度，前端用 `measureText` 量出「这个词在多大的字号下有这么宽」来反推原文字号。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Word {
+    pub t: String,
+    /// 逻辑像素
+    pub w: f64,
 }
 
 /// 合并成段之后、经翻译的块（逻辑像素坐标，相对选区左上）。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Block {
     pub text: String,
     pub x: f64,
@@ -84,6 +146,70 @@ pub struct Block {
     pub line_h: f64,
     /// 没有译文时为 false，前端只画原文
     pub translated: bool,
+    /// 译成功了，但译文和原文一样（命令、版本号、专有名词原样保留）：覆盖层不画这一块，留着原来的像素
+    pub unchanged: bool,
+    /// 合并了几行 OCR 文字（≥ 1）
+    pub lines: u32,
+    /// 原文底下的底色 / 文字颜色，`#rrggbb`。读不出来是 None，覆盖层退回固定的深色样式
+    pub bg: Option<String>,
+    pub fg: Option<String>,
+    /// 原文笔画的紧包围盒：译文从它的左边起笔，竖直方向按它的中心对齐
+    pub ink: Option<Rect>,
+    /// 允许遮盖的范围：覆盖层只往这个范围里填底色。没有它就退回「笔画包围盒外扩一圈」
+    pub cover: Option<Rect>,
+    /// 笔画右边的空白宽度；None = 没量到（0 是「量到了，紧贴着别的东西」）。
+    /// 译文比原文长时可以往这片空白里延伸，不必缩小字号
+    pub room: Option<f64>,
+    /// 原文的逐词宽度，前端靠它反推原文的字号
+    pub words: Vec<Word>,
+}
+
+impl Block {
+    /// 整块平移（覆盖层窗口为了不伸出屏幕往回挪时，块要同步补偿，仍对准原文）。
+    fn shift(&mut self, dx: f64, dy: f64) {
+        self.x += dx;
+        self.y += dy;
+        for rect in [self.ink.as_mut(), self.cover.as_mut()].into_iter().flatten() {
+            rect.x += dx;
+            rect.y += dy;
+        }
+    }
+}
+
+/// 辅助程序给的三个通道值 → `#rrggbb`。长度不对、有非有限数就当没有。
+fn rgb_hex(color: Option<&Vec<f64>>) -> Option<String> {
+    let channels = color?;
+    if channels.len() != 3 || channels.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let byte = |value: f64| value.round().clamp(0.0, 255.0) as u8;
+    Some(format!("#{:02x}{:02x}{:02x}", byte(channels[0]), byte(channels[1]), byte(channels[2])))
+}
+
+/// 辅助程序给的矩形（图片像素）→ 逻辑像素。有非有限数、宽或高不大于 0 就当没有。
+fn scaled_rect(rect: Option<OcrInk>, scale: f64) -> Option<Rect> {
+    let rect = rect?;
+    if ![rect.x, rect.y, rect.w, rect.h].iter().all(|value| value.is_finite()) || rect.w <= 0.0 || rect.h <= 0.0 {
+        return None;
+    }
+    Some(Rect { x: rect.x / scale, y: rect.y / scale, w: rect.w / scale, h: rect.h / scale })
+}
+
+/// 两个可能缺失的矩形取并集：**任何一个缺了结果就缺**。
+/// 合并多行时用：只剩部分行的框比没有更糟——前端会按它定位，错一行、漏盖另一行。
+fn union_all(a: Option<Rect>, b: Option<Rect>) -> Option<Rect> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.union(b)),
+        _ => None,
+    }
+}
+
+/// 两个可能没量到的数取较小的：没量到的不参与（0 是量到了的值，会被保留）。
+fn min_known(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 #[derive(Default)]
@@ -437,6 +563,12 @@ pub async fn start_capture(app: AppHandle, state: State<'_, CaptureState>) -> Re
     }
 }
 
+/// 覆盖层要不要放大到能放下一条提示：翻译失败、位置不准，或所有块的译文都和原文一样
+/// （前端这时不画任何块，只给一条说明——选区再小也得让人读完）。
+fn needs_alert_room(failure: &Option<String>, notice: &Option<String>, blocks: &[Block]) -> bool {
+    failure.is_some() || notice.is_some() || (!blocks.is_empty() && blocks.iter().all(|block| block.unchanged))
+}
+
 /// 关掉已有的译文窗口，并等它真的从窗口表里消失（最多 1 秒）。返回之前有没有这个窗口。
 async fn close_overlay_and_wait(app: &AppHandle) -> bool {
     if app.get_webview_window(OVERLAY_WINDOW).is_none() {
@@ -499,8 +631,9 @@ pub async fn run_with_image(
         None => failure = Some("选区里没有中文或英文，目前只支持中英互译".to_string()),
     }
 
-    // 有失败或位置提示时，覆盖层至少要放得下这条提示：只框了一行字时选区太矮，提示会被截掉
-    let (w, h) = if failure.is_some() || notice.is_some() {
+    // 有失败、位置提示、或「译文全和原文一样」的提示时，覆盖层至少要放得下这条提示：
+    // 只框了一行字（比如一个版本号、一条命令）时选区太矮，提示会被截掉
+    let (w, h) = if needs_alert_room(&failure, &notice, &blocks) {
         (w.max(ALERT_MIN_WIDTH), h.max(ALERT_MIN_HEIGHT))
     } else {
         (w, h)
@@ -512,8 +645,7 @@ pub async fn run_with_image(
         .unwrap_or((0.0, 0.0));
     let (x, y) = (x - shift_x, y - shift_y);
     for block in &mut blocks {
-        block.x += shift_x;
-        block.y += shift_y;
+        block.shift(shift_x, shift_y);
     }
 
     trace(
@@ -768,6 +900,16 @@ fn merge_lines(lines: &[OcrLine], scale: f64) -> Vec<Block> {
     for line in sorted {
         let (x, y, w, h) = (line.x / scale, line.y / scale, line.w / scale, line.h / scale);
         let text = line.text.trim().to_string();
+        let ink = scaled_rect(line.ink, scale);
+        let cover = scaled_rect(line.cover, scale);
+        let room = line.room.filter(|value| value.is_finite() && *value >= 0.0).map(|value| value / scale);
+        let words = || {
+            line.words
+                .iter()
+                .filter(|word| word.w.is_finite() && word.w > 0.0)
+                .map(|word| Word { t: word.t.clone(), w: word.w / scale })
+                .collect::<Vec<_>>()
+        };
 
         if let Some(last) = blocks.last_mut() {
             let same_column = x >= last.x - last.w * 0.35 && x <= last.x + last.w * 0.35;
@@ -803,6 +945,20 @@ fn merge_lines(lines: &[OcrLine], scale: f64) -> Vec<Block> {
                 last.line_h = last.line_h.max(h);
                 last.text.push(' ');
                 last.text.push_str(&text);
+                last.lines += 1;
+                last.words.extend(words());
+                // 一段里各行的底色、字色是同一套：沿用第一行的，第一行没采到就用后面行的。
+                // 笔画包围盒 / 遮盖范围取并集——但任何一行缺了就整块不给：只剩部分行的框，前端会按它错位一行、漏盖另一行；
+                // 不给的话前端退回按 Vision 的框盖。右边的空白取各行里最窄的（没量到的行不参与）
+                if last.bg.is_none() {
+                    last.bg = rgb_hex(line.bg.as_ref());
+                }
+                if last.fg.is_none() {
+                    last.fg = rgb_hex(line.fg.as_ref());
+                }
+                last.ink = union_all(last.ink, ink);
+                last.cover = union_all(last.cover, cover);
+                last.room = min_known(last.room, room);
                 continue;
             }
         }
@@ -815,6 +971,14 @@ fn merge_lines(lines: &[OcrLine], scale: f64) -> Vec<Block> {
             h,
             line_h: h,
             translated: false,
+            unchanged: false,
+            lines: 1,
+            bg: rgb_hex(line.bg.as_ref()),
+            fg: rgb_hex(line.fg.as_ref()),
+            ink,
+            cover,
+            room,
+            words: words(),
         });
     }
 
@@ -890,14 +1054,27 @@ async fn translate_blocks(app: &AppHandle, blocks: &mut [Block], target: &str) -
         ));
     }
 
+    apply_translations(blocks, translations);
+    Ok(())
+}
+
+/// 把译文按顺序套回各块。空译文保留原文（`translated` 仍为 false）；
+/// 译文和原文一样（模型按提示词把命令、版本号、专有名词原样保留了）的标 `unchanged`：
+/// 覆盖层不去动这样的块，原来的像素一点不改，比用另一种字体照着再画一遍更像原文。
+fn apply_translations(blocks: &mut [Block], translations: Vec<String>) {
     for (block, text) in blocks.iter_mut().zip(translations) {
         let text = text.trim().to_string();
         if !text.is_empty() {
+            block.unchanged = same_text(&block.text, &text);
             block.text = text;
             block.translated = true;
         }
     }
-    Ok(())
+}
+
+/// 两段文字只差空白（OCR 的空格与模型的空格不一定一致）也算一样。
+fn same_text(a: &str, b: &str) -> bool {
+    a.split_whitespace().eq(b.split_whitespace())
 }
 
 /// 模型偶尔会包一层 ```json，这里统一剥掉再解析。
@@ -938,6 +1115,231 @@ mod tests {
         assert_eq!(blocks.len(), 2, "相邻两行应合成一段");
         assert_eq!(blocks[0].text, "The quick brown fox jumps over");
         assert!(blocks[0].h > 30.0, "高度要覆盖两行");
+    }
+
+    /// 带样式信息的一行（辅助程序新版的输出）。
+    fn styled(text: &str, x: f64, y: f64, w: f64, h: f64, ink: OcrInk, room: f64) -> OcrLine {
+        OcrLine {
+            words: text
+                .split_whitespace()
+                .map(|word| OcrWord { t: word.to_string(), w: word.chars().count() as f64 * 6.0 })
+                .collect(),
+            bg: Some(vec![30.0, 30.0, 30.0]),
+            fg: Some(vec![200.0, 201.0, 202.0]),
+            ink: Some(ink),
+            cover: Some(OcrInk { x: ink.x - 2.0, y: ink.y - 2.0, w: ink.w + 4.0, h: ink.h + 4.0 }),
+            room: Some(room),
+            ..line(text, x, y, w, h)
+        }
+    }
+
+    #[test]
+    fn old_sidecar_output_without_style_fields_still_parses_and_degrades_to_plain_blocks() {
+        // 旧版辅助程序只有文字、位置和置信度：必须照样能用，样式字段退回「没有」
+        let raw = r#"[{"text":"hello world","x":10,"y":20,"w":100,"h":16,"conf":0.9}]"#;
+        let lines: Vec<OcrLine> = serde_json::from_str(raw).expect("旧格式要能解析");
+        let blocks = merge_lines(&lines, 1.0);
+        assert_eq!(blocks.len(), 1);
+        let block = &blocks[0];
+        assert_eq!((block.lines, block.bg.as_deref(), block.fg.as_deref()), (1, None, None));
+        assert_eq!((block.ink, block.cover, block.room, block.words.len()), (None, None, None, 0));
+    }
+
+    #[test]
+    fn new_sidecar_output_is_carried_into_the_block_in_logical_pixels() {
+        let raw = r##"[{"text":"© New task","x":28,"y":168,"w":168,"h":28,"conf":1,
+            "words":[{"t":"©","x":28,"w":46},{"t":"New","x":70,"w":50},{"t":"task","x":124,"w":72}],
+            "bg":[30,30,30],"fg":[200,201,202],"ink":{"x":34,"y":166,"w":156,"h":26},"room":410,
+            "cover":{"x":30,"y":162,"w":164,"h":34}}]"##;
+        let lines: Vec<OcrLine> = serde_json::from_str(raw).expect("新格式要能解析");
+        let blocks = merge_lines(&lines, 2.0); // Retina：图片像素 → 逻辑点要除以 2
+        let block = &blocks[0];
+        assert_eq!((block.x, block.y, block.w, block.h), (14.0, 84.0, 84.0, 14.0));
+        assert_eq!(block.bg.as_deref(), Some("#1e1e1e"));
+        assert_eq!(block.fg.as_deref(), Some("#c8c9ca"));
+        assert_eq!(block.ink, Some(Rect { x: 17.0, y: 83.0, w: 78.0, h: 13.0 }));
+        assert_eq!(block.cover, Some(Rect { x: 15.0, y: 81.0, w: 82.0, h: 17.0 }));
+        assert_eq!(block.room, Some(205.0));
+        assert_eq!(
+            block.words,
+            vec![
+                Word { t: "©".into(), w: 23.0 },
+                Word { t: "New".into(), w: 25.0 },
+                Word { t: "task".into(), w: 36.0 },
+            ]
+        );
+    }
+
+    #[test]
+    fn merged_lines_union_the_ink_keep_the_first_style_and_use_the_tightest_room() {
+        let lines = vec![
+            styled("The quick brown,", 10.0, 10.0, 200.0, 20.0, OcrInk { x: 12.0, y: 12.0, w: 190.0, h: 16.0 }, 120.0),
+            OcrLine {
+                bg: Some(vec![250.0, 250.0, 250.0]),
+                ..styled("fox jumps over", 10.0, 32.0, 180.0, 20.0, OcrInk { x: 11.0, y: 34.0, w: 170.0, h: 16.0 }, 300.0)
+            },
+        ];
+        let blocks = merge_lines(&lines, 1.0);
+        assert_eq!(blocks.len(), 1, "以逗号结尾的行与下一行合成一段");
+        let block = &blocks[0];
+        assert_eq!(block.lines, 2);
+        assert_eq!(block.bg.as_deref(), Some("#1e1e1e"), "沿用第一行的底色");
+        assert_eq!(block.ink, Some(Rect { x: 11.0, y: 12.0, w: 191.0, h: 38.0 }), "笔画包围盒取并集");
+        assert_eq!(block.cover, Some(Rect { x: 9.0, y: 10.0, w: 195.0, h: 42.0 }), "遮盖范围同样取并集");
+        assert_eq!(block.room, Some(120.0), "右边的空白取各行里最窄的（最窄的在第一行：不是「取最后一行」）");
+        let words: Vec<&str> = block.words.iter().map(|word| word.t.as_str()).collect();
+        assert_eq!(words, ["The", "quick", "brown,", "fox", "jumps", "over"]);
+
+        // 最窄的在最后一行：也要取到（不是「取第一行」）
+        let reversed = vec![
+            styled("The quick brown,", 10.0, 10.0, 200.0, 20.0, OcrInk { x: 12.0, y: 12.0, w: 190.0, h: 16.0 }, 300.0),
+            styled("fox jumps over", 10.0, 32.0, 180.0, 20.0, OcrInk { x: 11.0, y: 34.0, w: 170.0, h: 16.0 }, 120.0),
+        ];
+        assert_eq!(merge_lines(&reversed, 1.0)[0].room, Some(120.0));
+    }
+
+    #[test]
+    fn a_measured_zero_room_is_kept_not_swallowed_by_later_lines() {
+        // 第一行「量到了，右边紧贴着别的东西」（0）和「没量到」（None）不是一回事
+        let lines = vec![
+            styled("The quick brown,", 10.0, 10.0, 200.0, 20.0, OcrInk { x: 12.0, y: 12.0, w: 190.0, h: 16.0 }, 0.0),
+            styled("fox jumps over", 10.0, 32.0, 180.0, 20.0, OcrInk { x: 11.0, y: 34.0, w: 170.0, h: 16.0 }, 100.0),
+        ];
+        assert_eq!(merge_lines(&lines, 1.0)[0].room, Some(0.0));
+    }
+
+    #[test]
+    fn a_line_without_ink_makes_the_whole_block_drop_its_boxes() {
+        // 只剩部分行的笔画框，前端会按它定位：错一行、漏盖另一行。不给，前端就退回按 Vision 的框盖
+        let first_missing = vec![
+            OcrLine { ink: None, cover: None, room: None, ..line("The quick brown,", 10.0, 10.0, 200.0, 20.0) },
+            styled("fox jumps over", 10.0, 32.0, 180.0, 20.0, OcrInk { x: 11.0, y: 34.0, w: 170.0, h: 16.0 }, 300.0),
+        ];
+        let block = &merge_lines(&first_missing, 1.0)[0];
+        assert_eq!(block.lines, 2);
+        assert_eq!((block.ink, block.cover), (None, None), "首行没有：不能只留后一行的框");
+        assert_eq!(block.room, Some(300.0), "没量到的行不参与「取最窄」，不把别的行的值丢掉");
+
+        let last_missing = vec![
+            styled("The quick brown,", 10.0, 10.0, 200.0, 20.0, OcrInk { x: 12.0, y: 12.0, w: 190.0, h: 16.0 }, 300.0),
+            OcrLine { ink: None, cover: None, room: None, ..line("fox jumps over", 10.0, 32.0, 180.0, 20.0) },
+        ];
+        let block = &merge_lines(&last_missing, 1.0)[0];
+        assert_eq!((block.ink, block.cover), (None, None), "后一行没有：同样整块不给");
+    }
+
+    #[test]
+    fn style_colors_missing_on_the_first_line_are_taken_from_a_later_one() {
+        let lines = vec![
+            OcrLine { bg: None, fg: None, ..line("The quick brown,", 10.0, 10.0, 200.0, 20.0) },
+            styled("fox jumps over", 10.0, 32.0, 180.0, 20.0, OcrInk { x: 11.0, y: 34.0, w: 170.0, h: 16.0 }, 300.0),
+        ];
+        let block = &merge_lines(&lines, 1.0)[0];
+        assert_eq!((block.bg.as_deref(), block.fg.as_deref()), (Some("#1e1e1e"), Some("#c8c9ca")));
+    }
+
+    #[test]
+    fn non_finite_numbers_from_the_sidecar_never_reach_the_blocks() {
+        // JSON 里写不出 NaN，但结构体里能有；一个都不能漏进块里（前端拿到 NaN 会算出整屏的 NaN 坐标）
+        assert_eq!(scaled_rect(Some(OcrInk { x: f64::NAN, y: 0.0, w: 5.0, h: 5.0 }), 1.0), None);
+        assert_eq!(scaled_rect(Some(OcrInk { x: 0.0, y: 0.0, w: f64::INFINITY, h: 5.0 }), 1.0), None);
+        assert_eq!(scaled_rect(Some(OcrInk { x: 0.0, y: 0.0, w: 5.0, h: -1.0 }), 1.0), None);
+        assert_eq!(scaled_rect(Some(OcrInk { x: 0.0, y: 0.0, w: 5.0, h: 5.0 }), 2.0), Some(Rect { x: 0.0, y: 0.0, w: 2.5, h: 2.5 }));
+        assert_eq!(scaled_rect(None, 1.0), None);
+
+        let nan_everywhere = OcrLine {
+            room: Some(f64::NAN),
+            words: vec![OcrWord { t: "ok".into(), w: 12.0 }, OcrWord { t: "bad".into(), w: f64::NAN }, OcrWord { t: "inf".into(), w: f64::INFINITY }],
+            ink: Some(OcrInk { x: 0.0, y: f64::NAN, w: 5.0, h: 5.0 }),
+            ..line("ok bad inf", 0.0, 0.0, 50.0, 10.0)
+        };
+        let block = &merge_lines(&[nan_everywhere], 1.0)[0];
+        assert_eq!((block.room, block.ink), (None, None));
+        assert_eq!(block.words, vec![Word { t: "ok".into(), w: 12.0 }]);
+        assert_eq!(rgb_hex(Some(&vec![f64::NAN, 1.0, 2.0])), None);
+        assert_eq!(rgb_hex(Some(&vec![f64::INFINITY, 1.0, 2.0])), None);
+    }
+
+    #[test]
+    fn the_overlay_is_enlarged_whenever_there_is_a_banner_to_show() {
+        let unchanged = Block { unchanged: true, ..Default::default() };
+        let changed = Block::default();
+        let none: Option<String> = None;
+        let some = Some("x".to_string());
+        assert!(needs_alert_room(&some, &none, &[changed.clone()]), "翻译失败");
+        assert!(needs_alert_room(&none, &some, &[changed.clone()]), "位置不准");
+        assert!(needs_alert_room(&none, &none, &[unchanged.clone(), unchanged.clone()]), "全部原样保留：覆盖层里只有一条说明，选区再小也要放得下");
+        assert!(!needs_alert_room(&none, &none, &[unchanged.clone(), changed.clone()]), "只要有一块要画，就不放大");
+        assert!(!needs_alert_room(&none, &none, &[changed.clone()]));
+        assert!(!needs_alert_room(&none, &none, &[]), "没有任何块（识别失败走别的分支）不算「全部原样」");
+    }
+
+    #[test]
+    fn nonsense_style_values_are_dropped_instead_of_breaking_the_capture() {
+        let broken = OcrLine {
+            bg: Some(vec![1.0, 2.0]), // 少一个通道
+            fg: Some(vec![300.0, -5.0, 12.4]), // 越界：夹进 0–255
+            ink: Some(OcrInk { x: 1.0, y: 1.0, w: 0.0, h: 9.0 }), // 零宽
+            cover: Some(OcrInk { x: 1.0, y: 1.0, w: 5.0, h: -3.0 }), // 负高
+            room: Some(-4.0),
+            words: vec![OcrWord { t: "ok".into(), w: 12.0 }, OcrWord { t: "zero".into(), w: 0.0 }],
+            ..line("ok zero", 0.0, 0.0, 50.0, 10.0)
+        };
+        let block = &merge_lines(&[broken], 1.0)[0];
+        assert_eq!(block.bg, None);
+        assert_eq!(block.fg.as_deref(), Some("#ff000c"));
+        assert_eq!((block.ink, block.cover), (None, None));
+        assert_eq!(block.room, None, "负数的空白没有意义，当没量到");
+        assert_eq!(block.words, vec![Word { t: "ok".into(), w: 12.0 }], "宽度为 0 的词没有信息量，丢掉");
+    }
+
+    #[test]
+    fn shifting_a_block_moves_its_ink_box_too() {
+        let mut block = Block {
+            x: 10.0,
+            y: 20.0,
+            ink: Some(Rect { x: 12.0, y: 22.0, w: 50.0, h: 10.0 }),
+            cover: Some(Rect { x: 10.0, y: 20.0, w: 54.0, h: 14.0 }),
+            ..Default::default()
+        };
+        block.shift(5.0, -3.0);
+        assert_eq!((block.x, block.y), (15.0, 17.0));
+        assert_eq!(block.ink, Some(Rect { x: 17.0, y: 19.0, w: 50.0, h: 10.0 }), "笔画框不跟着挪，覆盖层就盖歪了");
+        assert_eq!(block.cover, Some(Rect { x: 15.0, y: 17.0, w: 54.0, h: 14.0 }), "遮盖范围也要跟着挪");
+        block.ink = None;
+        block.cover = None;
+        block.shift(1.0, 1.0); // 没有笔画框也不能出错
+        assert_eq!((block.x, block.y), (16.0, 18.0));
+    }
+
+    #[test]
+    fn real_ocr_sidecar_passes_its_own_pixel_selftest() {
+        // 像素分析（底色 / 字色 / 笔画包围盒 / 右边的空白）写在 Swift 里，它的逻辑靠辅助程序自带的自检守住。
+        // 没有 swiftc 时 build.rs 放的是占位脚本，这时没东西可测，跳过并说明
+        let Ok(binary) = ocr_binary() else {
+            eprintln!("跳过：找不到 sense-ocr");
+            return;
+        };
+        if std::fs::read(&binary).map(|bytes| bytes.starts_with(b"#!")).unwrap_or(true) {
+            eprintln!("跳过：sense-ocr 是占位脚本，不是真产物");
+            return;
+        }
+        // build.rs 编译失败时只发 cargo:warning 并保留旧产物——这时跑旧产物的自检等于没测新源码，必须报出来
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        if binary.starts_with(manifest.join("binaries")) {
+            let modified = |path: &Path| std::fs::metadata(path).and_then(|meta| meta.modified()).ok();
+            if let (Some(source), Some(product)) = (modified(&manifest.join("tools/ocr.swift")), modified(&binary)) {
+                assert!(
+                    product >= source,
+                    "OCR 辅助程序比 tools/ocr.swift 旧：swiftc 编译失败了（build.rs 只发警告、保留旧产物），这里跑的不是当前源码。先 cargo build 看警告"
+                );
+            }
+        }
+        let mut command = Command::new(&binary);
+        command.arg("--selftest");
+        let (ok, stdout, stderr) = run_with_timeout(command, Duration::from_secs(30)).expect("自检要能跑起来");
+        assert!(ok, "辅助程序自检失败：{}", String::from_utf8_lossy(&stderr));
+        assert!(String::from_utf8_lossy(&stdout).contains("selftest ok"));
     }
 
     #[test]
@@ -1178,6 +1580,38 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    fn plain_block(text: &str) -> Block {
+        Block { text: text.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn translations_are_applied_in_order_and_identical_ones_are_flagged_unchanged() {
+        let mut blocks = vec![plain_block("New task"), plain_block("V5.9.3"), plain_block("git commit -m fix")];
+        apply_translations(&mut blocks, vec!["新建任务".into(), "  V5.9.3 ".into(), "git  commit -m fix".into()]);
+        assert_eq!(blocks[0].text, "新建任务");
+        assert!(blocks[0].translated && !blocks[0].unchanged);
+        assert_eq!(blocks[1].text, "V5.9.3", "两头的空白去掉");
+        assert!(blocks[1].translated && blocks[1].unchanged, "原样保留的版本号：不用重画");
+        assert!(blocks[2].unchanged, "只差空白也算一样");
+    }
+
+    #[test]
+    fn an_empty_translation_keeps_the_original_and_is_not_marked_translated() {
+        let mut blocks = vec![plain_block("Library")];
+        apply_translations(&mut blocks, vec!["   ".into()]);
+        assert_eq!(blocks[0].text, "Library");
+        assert!(!blocks[0].translated, "没有译文就是没译，覆盖层要按「原文」画并带提示");
+        assert!(!blocks[0].unchanged, "没译成不能当成「译文和原文一样」");
+    }
+
+    #[test]
+    fn different_text_is_never_flagged_unchanged() {
+        assert!(same_text("Scheduled", "  Scheduled\n"));
+        assert!(!same_text("Scheduled", "scheduled"), "大小写不同算不同");
+        assert!(!same_text("© Scheduled", "已计划"));
+        assert!(!same_text("a b", "ab"), "空格不能被吃掉");
+    }
+
     #[test]
     fn translation_array_survives_code_fence() {
         let raw = "```json\n[\"甲\",\"乙\"]\n```";
@@ -1194,6 +1628,7 @@ mod tests {
             h: 10.0,
             line_h: 10.0,
             translated: false,
+            ..Default::default()
         }];
         assert_eq!(translate_target(&english), Some("中文"));
     }
