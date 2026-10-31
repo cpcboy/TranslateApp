@@ -48,6 +48,9 @@ use crate::providers::openai_compat;
 use crate::providers as provider_registry;
 use crate::secrets;
 
+// 中文折行段落的判定（纯函数，不碰 OCR / 窗口）：一句话被折成多行时合回一块再翻译
+mod zh_wrap;
+
 /// 结果窗口的 label。
 pub const OVERLAY_WINDOW: &str = "overlay";
 
@@ -184,6 +187,15 @@ fn rgb_hex(color: Option<&Vec<f64>>) -> Option<String> {
     }
     let byte = |value: f64| value.round().clamp(0.0, 255.0) as u8;
     Some(format!("#{:02x}{:02x}{:02x}", byte(channels[0]), byte(channels[1]), byte(channels[2])))
+}
+
+/// 辅助程序给的三个通道值 → 三个数。长度不对、有非有限数就当没有（和 `rgb_hex` 同一个口径，只是不转成字符串）。
+fn rgb_triple(color: Option<&Vec<f64>>) -> Option<[f64; 3]> {
+    let channels = color?;
+    if channels.len() != 3 || channels.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    Some([channels[0], channels[1], channels[2]])
 }
 
 /// 辅助程序给的矩形（图片像素）→ 逻辑像素。有非有限数、宽或高不大于 0 就当没有。
@@ -894,13 +906,32 @@ fn run_ocr(png: &Path) -> Result<Vec<OcrLine>, String> {
     serde_json::from_slice::<Vec<OcrLine>>(&stdout).map_err(|err| format!("OCR 输出解析失败：{err}"))
 }
 
-/// 同一段的多行合回一块：行高接近、竖直间隙小、水平有重叠。
+/// 一行已经把话说完了的末尾字符：英文那套「明显被折断」的判据靠它认出独立的两句话（终端输出、代码、列表），
+/// 中文折行（`zh_wrap`）判「上一行说完了」时也先看它。
+const SENTENCE_END: &str = ".!?。！？:：;；$>|/\\）)】]」』";
+
+/// 同一段的多行合回一块。两条路，前一条沿用以前的判据，后一条是中文折行：
+/// - 英文那套：行高接近、竖直间隙小、同列，并且上一行以逗号 / 连字符结尾或这一行以小写字母开头（明显被折断的一句话）；
+///   只和**上一块**比（顺序里挨着的）
+/// - 中文折行：按版面找「同列里紧挨在上面的那一行」，上一行写满、话没说完、这一对像正文才合（见 `zh_wrap`）；
+///   并进的可能是更早的一块（夹在中间的是别栏的内容）
 fn merge_lines(lines: &[OcrLine], scale: f64) -> Vec<Block> {
     let mut sorted: Vec<&OcrLine> = lines.iter().filter(|line| !line.text.trim().is_empty()).collect();
     sorted.sort_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal));
 
+    // 中文折行：每一行应当并进哪一行（下标对的是 `sorted`）
+    let zh_links = {
+        let geometry: Vec<zh_wrap::LineGeo> = sorted
+            .iter()
+            .map(|line| zh_wrap::LineGeo { x: line.x / scale, y: line.y / scale, w: line.w / scale, h: line.h / scale, text: line.text.trim(), fg: rgb_triple(line.fg.as_ref()) })
+            .collect();
+        zh_wrap::wrap_links(&geometry)
+    };
+
     let mut blocks: Vec<Block> = Vec::new();
-    for line in sorted {
+    // `sorted` 里每一行落进了哪一块：中文折行并进的是「同列上一行」所在的块，不一定是最后一块
+    let mut block_of: Vec<usize> = Vec::with_capacity(sorted.len());
+    for (index, line) in sorted.into_iter().enumerate() {
         let (x, y, w, h) = (line.x / scale, line.y / scale, line.w / scale, line.h / scale);
         let text = line.text.trim().to_string();
         let ink = scaled_rect(line.ink, scale);
@@ -914,7 +945,8 @@ fn merge_lines(lines: &[OcrLine], scale: f64) -> Vec<Block> {
                 .collect::<Vec<_>>()
         };
 
-        if let Some(last) = blocks.last_mut() {
+        // 英文那套：和上一块比
+        let joins_last = blocks.last().is_some_and(|last| {
             let same_column = x >= last.x - last.w * 0.35 && x <= last.x + last.w * 0.35;
             let gap = y - (last.y + last.h);
             let close_enough = gap >= -2.0 && gap < last.h * 0.55;
@@ -926,11 +958,7 @@ fn merge_lines(lines: &[OcrLine], scale: f64) -> Vec<Block> {
                 || previous.ends_with('，')
                 || previous.ends_with('-')
                 || previous.ends_with('—');
-            let ends_sentence = previous
-                .chars()
-                .last()
-                .map(|ch| ".!?。！？:：;；$>|/\\）)】]」』".contains(ch))
-                .unwrap_or(true);
+            let ends_sentence = previous.chars().last().map(|ch| SENTENCE_END.contains(ch)).unwrap_or(true);
             let starts_lower = text
                 .chars()
                 .next()
@@ -938,34 +966,40 @@ fn merge_lines(lines: &[OcrLine], scale: f64) -> Vec<Block> {
                 .unwrap_or(false);
             let wraps = !ends_sentence && (ends_open || starts_lower);
 
-            if same_column && close_enough && similar_height && wraps {
-                let right = (last.x + last.w).max(x + w);
-                let bottom = (last.y + last.h).max(y + h);
-                last.x = last.x.min(x);
-                last.y = last.y.min(y);
-                last.w = right - last.x;
-                last.h = bottom - last.y;
-                last.line_h = last.line_h.max(h);
-                last.text.push(' ');
-                last.text.push_str(&text);
-                last.lines += 1;
-                last.words.extend(words());
-                // 一段里各行的底色、字色是同一套：沿用第一行的，第一行没采到就用后面行的。
-                // 笔画包围盒 / 遮盖范围取并集——但任何一行缺了就整块不给：只剩部分行的框，前端会按它错位一行、漏盖另一行；
-                // 不给的话前端退回按 Vision 的框盖。右边的空白取各行里最窄的（没量到的行不参与）
-                if last.bg.is_none() {
-                    last.bg = rgb_hex(line.bg.as_ref());
-                }
-                if last.fg.is_none() {
-                    last.fg = rgb_hex(line.fg.as_ref());
-                }
-                last.ink = union_all(last.ink, ink);
-                last.cover = union_all(last.cover, cover);
-                last.room = min_known(last.room, room);
-                continue;
+            same_column && close_enough && similar_height && wraps
+        });
+        // 中文折行：并进「同列上一行」所在的块（`block_of` 里一定有：上一行排在前面）
+        let target = if joins_last { Some(blocks.len() - 1) } else { zh_links[index].map(|upper| block_of[upper]) };
+
+        if let Some(position) = target {
+            let last = &mut blocks[position];
+            let right = (last.x + last.w).max(x + w);
+            let bottom = (last.y + last.h).max(y + h);
+            last.x = last.x.min(x);
+            last.y = last.y.min(y);
+            last.w = right - last.x;
+            last.h = bottom - last.y;
+            last.line_h = last.line_h.max(h);
+            last.text = zh_wrap::join_lines(&last.text, &text);
+            last.lines += 1;
+            last.words.extend(words());
+            // 一段里各行的底色、字色是同一套：沿用第一行的，第一行没采到就用后面行的。
+            // 笔画包围盒 / 遮盖范围取并集——但任何一行缺了就整块不给：只剩部分行的框，前端会按它错位一行、漏盖另一行；
+            // 不给的话前端退回按 Vision 的框盖。右边的空白取各行里最窄的（没量到的行不参与）
+            if last.bg.is_none() {
+                last.bg = rgb_hex(line.bg.as_ref());
             }
+            if last.fg.is_none() {
+                last.fg = rgb_hex(line.fg.as_ref());
+            }
+            last.ink = union_all(last.ink, ink);
+            last.cover = union_all(last.cover, cover);
+            last.room = min_known(last.room, room);
+            block_of.push(position);
+            continue;
         }
 
+        block_of.push(blocks.len());
         blocks.push(Block {
             text,
             x,
@@ -991,8 +1025,7 @@ fn merge_lines(lines: &[OcrLine], scale: f64) -> Vec<Block> {
 /// 目标语言：源文以英文为主就译成中文，否则译成英文。
 fn translate_target(blocks: &[Block]) -> Option<&'static str> {
     let sample: String = blocks.iter().map(|block| block.text.as_str()).collect::<Vec<_>>().join(" ");
-    let cjk = sample.chars().filter(|ch| ('\u{4e00}'..='\u{9fff}').contains(ch)).count();
-    let latin = sample.chars().filter(|ch| ch.is_ascii_alphabetic()).count();
+    let (cjk, latin) = zh_wrap::script_counts(&sample);
     if cjk == 0 && latin == 0 {
         return None;
     }
@@ -1104,6 +1137,31 @@ mod tests {
             w,
             h,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_text_color_the_helper_measured_reaches_the_chinese_wrap_check() {
+        // 辅助程序量到的字色（sRGB 三个通道）要原样交给折行判据：任何一个通道差得远——这里每次只有一个通道——就不并
+        let merged = |first: [f64; 3], second: [f64; 3]| {
+            let mut upper = line("所有的文字识别都在本机完成，图片不会离开你的电脑", 22.0, 100.0, 300.0, 20.0);
+            let mut lower = line("只有识别出来的文字会发送给你选择的翻译服务。", 22.0, 126.0, 120.0, 20.0);
+            upper.fg = Some(first.to_vec());
+            lower.fg = Some(second.to_vec());
+            merge_lines(&[upper, lower], 1.0).len()
+        };
+        assert_eq!(merged([30.0, 30.0, 30.0], [30.0, 30.0, 30.0]), 1, "同色：并");
+        assert_eq!(merged([30.0, 30.0, 30.0], [90.0, 30.0, 30.0]), 2, "只有红色通道差得远：不并");
+        assert_eq!(merged([30.0, 30.0, 30.0], [30.0, 90.0, 30.0]), 2, "只有绿色通道差得远：不并");
+        assert_eq!(merged([30.0, 30.0, 30.0], [30.0, 30.0, 90.0]), 2, "只有蓝色通道差得远：不并");
+    }
+
+    #[test]
+    fn a_text_color_that_is_not_three_finite_numbers_counts_as_not_measured() {
+        assert_eq!(rgb_triple(None), None);
+        assert_eq!(rgb_triple(Some(&vec![1.0, 2.0, 3.0])), Some([1.0, 2.0, 3.0]));
+        for broken in [vec![], vec![1.0, 2.0], vec![1.0, 2.0, 3.0, 4.0], vec![f64::NAN, 2.0, 3.0], vec![1.0, f64::INFINITY, 3.0], vec![1.0, 2.0, f64::NEG_INFINITY]] {
+            assert_eq!(rgb_triple(Some(&broken)), None, "{broken:?}");
         }
     }
 
@@ -1239,6 +1297,282 @@ mod tests {
         ];
         let block = &merge_lines(&lines, 1.0)[0];
         assert_eq!((block.bg.as_deref(), block.fg.as_deref()), (Some("#1e1e1e"), Some("#c8c9ca")));
+    }
+
+    /// 块里每一块的 (行数, 文字)，看分块结果用。
+    fn shape(blocks: &[Block]) -> Vec<(u32, &str)> {
+        blocks.iter().map(|block| (block.lines, block.text.as_str())).collect()
+    }
+
+    /// 真 Vision 在 1 倍图上量到的一页文章（标题、三段、脚注）。一段两行、一段三行、一段首行缩进两字（末行 `口和复制粘贴。`）。
+    fn article_lines() -> Vec<OcrLine> {
+        vec![
+            line("SENSE 截屏翻译", 22.0, 20.0, 150.0, 22.0),
+            line("SENSE 是一款运行在 macOS上的 AI 翻译器，可以翻译", 22.0, 56.0, 370.0, 20.0),
+            line("你在屏幕上选中的任何内容。", 22.0, 82.0, 190.0, 20.0),
+            line("为了保护你的隐私，所有的文字识别都在本机完成，图", 22.0, 120.0, 358.0, 20.0),
+            line("片不会离开你的电脑。只有识别出来的文字会发送给你", 24.0, 144.0, 356.0, 22.0),
+            line("选择的翻译服务，而密钥只保存在系统钥匙串里。", 22.0, 170.0, 324.0, 20.0),
+            line("按下快捷键，拖出一个框，译文会直接盖在原文的", 52.0, 208.0, 328.0, 22.0),
+            line("位置上，字号和颜色都和原文一致，不用再来回切换窗", 22.0, 234.0, 358.0, 20.0),
+            line("口和复制粘贴。", 24.0, 260.0, 98.0, 19.0),
+            line("提示：首次使用需要授权屏幕录制。", 24.0, 296.0, 186.0, 16.0),
+        ]
+    }
+
+    #[test]
+    fn a_wrapped_chinese_paragraph_becomes_one_block_with_no_spaces_between_characters() {
+        let blocks = merge_lines(&article_lines(), 1.0);
+        assert_eq!(
+            shape(&blocks),
+            [
+                (1, "SENSE 截屏翻译"),
+                (2, "SENSE 是一款运行在 macOS上的 AI 翻译器，可以翻译你在屏幕上选中的任何内容。"),
+                (3, "为了保护你的隐私，所有的文字识别都在本机完成，图片不会离开你的电脑。只有识别出来的文字会发送给你选择的翻译服务，而密钥只保存在系统钥匙串里。"),
+                (3, "按下快捷键，拖出一个框，译文会直接盖在原文的位置上，字号和颜色都和原文一致，不用再来回切换窗口和复制粘贴。"),
+                (1, "提示：首次使用需要授权屏幕录制。"),
+            ],
+            "标题、三段正文、脚注：段落各合成一块，标题和脚注自己一块"
+        );
+        // 合并后的框是各行的并集，单行行高仍是一行的高度（译文字号靠它，不能变成两倍三倍）
+        let two = &blocks[1];
+        assert_eq!((two.x, two.y, two.w, two.h, two.line_h), (22.0, 56.0, 370.0, 46.0, 20.0));
+        // 首行缩进（52 → 22）：块的左缘取最靠左的
+        let indented = &blocks[3];
+        assert_eq!((indented.x, indented.w, indented.line_h), (22.0, 358.0, 22.0));
+        // 翻译方向仍按整页的汉字 / 字母判（中文为主：译成英文）
+        assert_eq!(translate_target(&blocks), Some("英文"));
+    }
+
+    #[test]
+    fn chinese_menus_sidebars_settings_rows_and_plain_lists_stay_one_block_per_line() {
+        // 真 Vision 量到的一页（语料里的另一页，文字与夹具略有不同）：左边是侧栏菜单，中间是设置页的「标题 + 描述」，下面是一列带逗号的功能列表（宽度只差 14px）。
+        // 它们每行都是独立的一条，一行不许并进别的行
+        let lines = vec![
+            line("新建任务", 14.0, 6.0, 58.0, 20.0),
+            line("界面语言", 182.0, 20.0, 62.0, 18.0),
+            line("设置与偏好", 14.0, 36.0, 72.0, 20.0),
+            line("选择应用的界面语言和显示区域", 182.0, 38.0, 184.0, 18.0),
+            line("使用说明与帮助中", 14.0, 66.0, 114.0, 20.0),
+            line("自动更新", 184.0, 69.0, 62.0, 21.0),
+            line("有新版本时自动下载并在下次启动时安装", 182.0, 90.0, 234.0, 18.0),
+            line("聪手", 14.0, 98.0, 30.0, 18.0),
+            line("隐私模式", 182.0, 122.0, 64.0, 20.0),
+            line("退出", 14.0, 128.0, 30.0, 18.0),
+            line("开启后不会保存任何查询和翻译记录", 182.0, 142.0, 208.0, 18.0),
+            line("通知中心", 14.0, 158.0, 58.0, 19.0),
+            line("隐私与安全设置", 14.0, 186.0, 100.0, 20.0),
+            line("支持中英互译，识别准确率高", 170.0, 202.0, 182.0, 22.0),
+            line("离线识别，不上传任何图片", 170.0, 224.0, 168.0, 20.0),
+            line("译文原位替换到截图上", 170.0, 244.0, 142.0, 20.0),
+            line("查词卡片按常用度排序义项", 170.0, 266.0, 170.0, 18.0),
+        ];
+        let blocks = merge_lines(&lines, 1.0);
+        assert_eq!(blocks.len(), lines.len(), "一行一块：{:?}", shape(&blocks));
+        assert!(blocks.iter().all(|block| block.lines == 1));
+    }
+
+    #[test]
+    fn a_menu_whose_lines_have_equal_widths_is_still_not_merged_when_nothing_in_it_reads_like_prose() {
+        // 宽度完全一样、紧挨着、左对齐、都不以句号结尾——只差一个逗号句号：没有它，几何再像折行也不合
+        let labels = ["管理已授权的应用和设备", "查看所有已保存的搜索记录", "使用说明与帮助中心入口", "屏幕录制与辅助功能权限"];
+        let lines: Vec<OcrLine> = labels.iter().enumerate().map(|(index, label)| line(label, 14.0, 6.0 + 22.0 * index as f64, 168.0, 18.0)).collect();
+        assert_eq!(merge_lines(&lines, 1.0).len(), labels.len());
+    }
+
+    #[test]
+    fn a_sidebar_beside_an_article_does_not_split_the_paragraph_and_blocks_stay_in_reading_order() {
+        // 左边侧栏、右边正文：按 y 排序后两栏的行交错（正文的第二行和第一行之间夹着侧栏的一项）
+        let lines = vec![
+            line("设置与偏好", 14.0, 104.0, 76.0, 20.0),
+            line("所有的文字识别都在本机完成，图片不会离开你的电脑", 200.0, 100.0, 300.0, 20.0),
+            line("使用说明与帮助中心", 14.0, 134.0, 136.0, 20.0),
+            line("只有识别出来的文字会发送给你选择的翻译服务，而", 200.0, 126.0, 296.0, 20.0),
+            line("密钥只保存在系统钥匙串里。", 200.0, 152.0, 150.0, 20.0),
+        ];
+        let blocks = merge_lines(&lines, 1.0);
+        assert_eq!(
+            shape(&blocks),
+            [
+                (3, "所有的文字识别都在本机完成，图片不会离开你的电脑只有识别出来的文字会发送给你选择的翻译服务，而密钥只保存在系统钥匙串里。"),
+                (1, "设置与偏好"),
+                (1, "使用说明与帮助中心"),
+            ],
+            "块按第一行的位置排：正文先，侧栏两项随后"
+        );
+    }
+
+    #[test]
+    fn merged_chinese_lines_follow_the_same_union_rules_as_any_other_merge() {
+        // words / ink / cover / room / 底色 的合并语义不因走了中文这条路而变：沿用第一行的底色，框取并集，空白取最窄
+        let lines = vec![
+            styled("所有的文字识别都在本机完成，图片不会离开你的电脑", 22.0, 100.0, 300.0, 20.0, OcrInk { x: 24.0, y: 102.0, w: 296.0, h: 16.0 }, 120.0),
+            OcrLine {
+                bg: Some(vec![250.0, 250.0, 250.0]),
+                ..styled("只有识别出来的文字会发送给你选择的翻译服务。", 22.0, 126.0, 120.0, 20.0, OcrInk { x: 23.0, y: 128.0, w: 116.0, h: 16.0 }, 300.0)
+            },
+        ];
+        let blocks = merge_lines(&lines, 1.0);
+        assert_eq!(blocks.len(), 1);
+        let block = &blocks[0];
+        assert_eq!(block.lines, 2);
+        assert_eq!(block.text, "所有的文字识别都在本机完成，图片不会离开你的电脑只有识别出来的文字会发送给你选择的翻译服务。");
+        assert_eq!(block.bg.as_deref(), Some("#1e1e1e"), "沿用第一行的底色");
+        assert_eq!(block.ink, Some(Rect { x: 23.0, y: 102.0, w: 297.0, h: 42.0 }), "笔画包围盒取并集");
+        assert_eq!(block.cover, Some(Rect { x: 21.0, y: 100.0, w: 301.0, h: 46.0 }), "遮盖范围取并集");
+        assert_eq!(block.room, Some(120.0), "右边的空白取各行里最窄的");
+        let words: Vec<&str> = block.words.iter().map(|word| word.t.as_str()).collect();
+        assert_eq!(words, ["所有的文字识别都在本机完成，图片不会离开你的电脑", "只有识别出来的文字会发送给你选择的翻译服务。"], "中文行没有空格，一行就是一个词，逐行接上");
+
+        // 有一行没量到笔画框：整块不给（和英文行一样）
+        let mut missing = lines.clone();
+        missing[1].ink = None;
+        missing[1].cover = None;
+        let block = &merge_lines(&missing, 1.0)[0];
+        assert_eq!((block.lines, block.ink, block.cover), (2, None, None));
+    }
+
+    #[test]
+    fn two_chinese_lines_joined_by_the_old_comma_rule_get_no_space_between_the_characters() {
+        // 以 `，` 结尾的两行，英文那条老路照合（诗句、短句都会），只是汉字之间不再塞一个半角空格
+        let lines = vec![line("欲穷千里目，", 10.0, 10.0, 80.0, 20.0), line("更上一层楼。", 10.0, 32.0, 80.0, 20.0)];
+        assert_eq!(shape(&merge_lines(&lines, 1.0)), [(2, "欲穷千里目，更上一层楼。")]);
+    }
+
+    #[test]
+    fn english_merging_is_exactly_what_it_was() {
+        // 英文那条老路一个字不动：连逗号结尾的多行段落只会两两合并（合并后用整块的高度比下一行，第三行就对不上），这里把它钉住
+        let paragraph = vec![
+            line("The quick brown,", 10.0, 10.0, 200.0, 20.0),
+            line("fox jumps over the,", 10.0, 32.0, 190.0, 20.0),
+            line("lazy dog and then,", 10.0, 54.0, 180.0, 20.0),
+            line("runs away quickly", 10.0, 76.0, 170.0, 20.0),
+        ];
+        assert_eq!(shape(&merge_lines(&paragraph, 1.0)), [(2, "The quick brown, fox jumps over the,"), (2, "lazy dog and then, runs away quickly")]);
+        // 下一行小写开头
+        let lowercase = vec![line("Open the settings", 10.0, 10.0, 160.0, 20.0), line("to configure the app.", 10.0, 32.0, 190.0, 20.0)];
+        assert_eq!(shape(&merge_lines(&lowercase, 1.0)), [(2, "Open the settings to configure the app.")]);
+        // 独立的英文行
+        let menu = vec![line("Settings", 10.0, 10.0, 60.0, 20.0), line("Keyboard shortcuts", 10.0, 32.0, 130.0, 20.0), line("About", 10.0, 54.0, 40.0, 20.0)];
+        assert_eq!(merge_lines(&menu, 1.0).len(), 3);
+        // 连字符结尾：与以前一样隔一个空格
+        let hyphen = vec![line("an inter-", 10.0, 10.0, 70.0, 20.0), line("national event", 10.0, 32.0, 110.0, 20.0)];
+        assert_eq!(shape(&merge_lines(&hyphen, 1.0)), [(2, "an inter- national event")]);
+        // 中文行后面跟小写拉丁开头的行：英文那条老路合，边界有拉丁字符，隔一个空格（与以前一样）
+        let mixed = vec![line("使用前请先打开", 10.0, 10.0, 150.0, 20.0), line("macOS 的系统设置", 10.0, 32.0, 130.0, 20.0)];
+        assert_eq!(shape(&merge_lines(&mixed, 1.0)), [(2, "使用前请先打开 macOS 的系统设置")]);
+        // 上一行已经说完（现有那套句末字符里的任何一个）：下一行即便小写开头也是新的一句，不合
+        for end in ".!?。！？:：;；$>|/\\）)】]」』".chars() {
+            let lines = vec![line(&format!("done{end}"), 10.0, 10.0, 80.0, 20.0), line("next one", 10.0, 32.0, 80.0, 20.0)];
+            assert_eq!(merge_lines(&lines, 1.0).len(), 2, "上一行以「{end}」结尾：不合");
+        }
+        // 英文段落和中文段落同在一页：各走各的
+        let page = vec![
+            line("Open the settings", 10.0, 10.0, 160.0, 20.0),
+            line("to configure the app.", 10.0, 32.0, 190.0, 20.0),
+            line("SENSE 是一款运行在 macOS上的 AI 翻译器，可以翻译", 10.0, 80.0, 370.0, 20.0),
+            line("你在屏幕上选中的任何内容。", 10.0, 106.0, 190.0, 20.0),
+        ];
+        assert_eq!(
+            shape(&merge_lines(&page, 1.0)),
+            [(2, "Open the settings to configure the app."), (2, "SENSE 是一款运行在 macOS上的 AI 翻译器，可以翻译你在屏幕上选中的任何内容。")]
+        );
+    }
+
+    #[test]
+    fn each_condition_of_the_english_rule_is_pinned_one_by_one() {
+        // 英文那条老路的子条件（同列、间隙、行高、`ends_open`、`starts_lower`）搬进了闭包：每一条单独钉住。
+        // 基准：上一行以逗号结尾、下一行大写开头（只靠 `ends_open` 合并），几何合格。期望值按老判据逐行移植算出
+        let merged = |first: &str, second: OcrLine| merge_lines(&[line(first, 10.0, 10.0, 200.0, 20.0), second], 1.0).len() == 1;
+        assert!(merged("The quick brown,", line("Fox jumps over", 10.0, 32.0, 190.0, 20.0)), "基准：逗号结尾 + 同列 + 紧挨着 + 行高一样 → 合");
+        // 同列：下一行的左缘要落在上一块左缘 ± 0.35 倍块宽之内
+        assert!(merged("The quick brown,", line("Fox jumps over", 60.0, 32.0, 190.0, 20.0)));
+        assert!(!merged("The quick brown,", line("Fox jumps over", 95.0, 32.0, 190.0, 20.0)), "左缘偏出去 85（> 70）");
+        assert!(merged("The quick brown,", line("Fox jumps over", -40.0, 32.0, 190.0, 20.0)), "往左偏 50（< 70）也算同列");
+        assert!(!merged("The quick brown,", line("Fox jumps over", -70.0, 32.0, 190.0, 20.0)), "往左偏 80（> 70）");
+        // 竖直间隙：≥ −2 且 < 0.55 倍块高（块高 20 → 11）
+        assert!(merged("The quick brown,", line("Fox jumps over", 10.0, 40.0, 190.0, 20.0)), "间隙 10 < 11");
+        assert!(!merged("The quick brown,", line("Fox jumps over", 10.0, 42.0, 190.0, 20.0)), "间隙 12 ≥ 11");
+        assert!(merged("The quick brown,", line("Fox jumps over", 10.0, 28.0, 190.0, 20.0)), "重叠 2 还算");
+        assert!(!merged("The quick brown,", line("Fox jumps over", 10.0, 27.0, 190.0, 20.0)), "重叠 3 不算");
+        // 行高：差 < 较大者的 40%
+        assert!(merged("The quick brown,", line("Fox jumps over", 10.0, 32.0, 190.0, 13.0)), "20 vs 13：差 7 < 8");
+        assert!(!merged("The quick brown,", line("Fox jumps over", 10.0, 32.0, 190.0, 12.0)), "20 vs 12：差 8 不 < 8");
+        // 上一行怎么结尾：逗号、全角逗号、连字符、破折号都算「没说完」，别的（句号、分号、冒号、右括号）不算
+        for open in ["The quick brown,", "The quick brown，", "The quick inter-", "The quick brown—"] {
+            assert!(merged(open, line("Fox jumps over", 10.0, 32.0, 190.0, 20.0)), "「{open}」没说完，下一行大写开头也合");
+        }
+        for closed in ["The quick brown.", "The quick brown;", "The quick brown:", "The quick (brown)", "The quick brown"] {
+            assert!(!merged(closed, line("Fox jumps over", 10.0, 32.0, 190.0, 20.0)), "「{closed}」：既没有逗号 / 连字符，下一行又不是小写开头，不合");
+        }
+        // 下一行小写开头（上一行没有逗号）才合；上一行已说完则不合（上面那个循环已经钉过字符表）
+        assert!(merged("The quick brown", line("fox jumps over", 10.0, 32.0, 190.0, 20.0)));
+        assert!(!merged("The quick brown", line("Fox jumps over", 10.0, 32.0, 190.0, 20.0)));
+        assert!(!merged("The quick brown.", line("fox jumps over", 10.0, 32.0, 190.0, 20.0)), "说完了：小写开头也不合");
+        let blank = merge_lines(&[line("The quick brown,", 10.0, 10.0, 200.0, 20.0), line("   ", 10.0, 32.0, 190.0, 20.0)], 1.0);
+        assert_eq!(shape(&blank), [(1, "The quick brown,")], "空白行直接被丢掉，没有下一行可并");
+    }
+
+    #[test]
+    fn a_merged_block_keeps_the_first_lines_color_and_starts_at_the_leftmost_edge() {
+        // 首行缩进：块的左缘取最靠左的行，宽度从那里量到最右的右缘；各行里字色不同时沿用第一行的（色差在容差内才会合）
+        let mut lines = vec![
+            styled("按下快捷键，拖出一个框，译文会直接盖在原文的", 52.0, 208.0, 328.0, 22.0, OcrInk { x: 54.0, y: 210.0, w: 324.0, h: 17.0 }, 100.0),
+            styled("位置上，字号和颜色都和原文一致，不用再来回切换窗", 22.0, 234.0, 358.0, 20.0, OcrInk { x: 24.0, y: 236.0, w: 354.0, h: 16.0 }, 90.0),
+            styled("口和复制粘贴。", 24.0, 260.0, 98.0, 19.0, OcrInk { x: 26.0, y: 262.0, w: 94.0, h: 15.0 }, 250.0),
+        ];
+        lines[1].fg = Some(vec![210.0, 205.0, 200.0]);
+        lines[2].fg = Some(vec![190.0, 190.0, 190.0]);
+        let block = &merge_lines(&lines, 1.0)[0];
+        assert_eq!(block.lines, 3);
+        assert_eq!((block.x, block.w, block.line_h), (22.0, 358.0, 22.0));
+        assert_eq!(block.fg.as_deref(), Some("#c8c9ca"), "沿用第一行的字色");
+        assert_eq!(block.room, Some(90.0), "空白取最窄的");
+        // 字色差得远（标题 + 灰色的摘要）：不合，各自一块、各用各的字色
+        let mut apart = vec![
+            styled("电科金仓发布 KES AI 数据库，面向多模态场景", 430.0, 462.0, 226.0, 22.0, OcrInk { x: 432.0, y: 464.0, w: 222.0, h: 17.0 }, 100.0),
+            styled("让大模型看懂私有数据。", 430.0, 484.0, 140.0, 20.0, OcrInk { x: 432.0, y: 486.0, w: 136.0, h: 15.0 }, 200.0),
+        ];
+        apart[0].fg = Some(vec![38.0, 38.0, 38.0]);
+        apart[1].fg = Some(vec![127.0, 127.0, 127.0]);
+        assert_eq!(merge_lines(&apart, 1.0).len(), 2, "字色差 89：不是同一段文字");
+        // 字色缺一边（旧版辅助程序、像素分析失败）：不能因为缺数据就不合并
+        apart[1].fg = None;
+        assert_eq!(merge_lines(&apart, 1.0).len(), 1);
+        // 字色不是三个通道 / 有非有限数：当作没有，不影响合并
+        apart[0].fg = Some(vec![38.0, 38.0]);
+        apart[1].fg = Some(vec![127.0, f64::NAN, 127.0]);
+        assert_eq!(merge_lines(&apart, 1.0).len(), 1);
+    }
+
+    #[test]
+    fn the_translation_direction_counts_every_block_not_only_the_first() {
+        let chinese_first = vec![line("你好", 10.0, 10.0, 40.0, 20.0), line("The quick brown fox jumps over the lazy dog and keeps running", 10.0, 200.0, 400.0, 20.0)];
+        assert_eq!(translate_target(&merge_lines(&chinese_first, 1.0)), Some("中文"), "整页英文多：译成中文");
+        let english_first = vec![line("Hi", 10.0, 10.0, 20.0, 20.0), line("这是一整段很长的中文说明文字，用来把汉字的数量堆上去", 10.0, 200.0, 400.0, 20.0)];
+        assert_eq!(translate_target(&merge_lines(&english_first, 1.0)), Some("英文"), "整页中文多：译成英文");
+        assert_eq!(translate_target(&merge_lines(&[line("12345 ——", 10.0, 10.0, 80.0, 20.0)], 1.0)), None, "没有汉字也没有拉丁字母");
+    }
+
+    #[test]
+    fn a_retina_image_groups_lines_exactly_like_the_same_page_at_one_x() {
+        let one_x = article_lines();
+        let two_x: Vec<OcrLine> = one_x.iter().map(|l| line(&l.text, l.x * 2.0, l.y * 2.0, l.w * 2.0, l.h * 2.0)).collect();
+        let (a, b) = (merge_lines(&one_x, 1.0), merge_lines(&two_x, 2.0));
+        assert_eq!(shape(&a), shape(&b));
+        for (left, right) in a.iter().zip(&b) {
+            assert_eq!((left.x, left.y, left.w, left.h, left.line_h), (right.x, right.y, right.w, right.h, right.line_h));
+        }
+    }
+
+    #[test]
+    fn the_input_order_does_not_matter_and_empty_or_blank_lines_are_ignored() {
+        let mut shuffled = article_lines();
+        shuffled.reverse();
+        shuffled.push(line("   ", 22.0, 100.0, 50.0, 20.0));
+        shuffled.push(line("", 22.0, 101.0, 50.0, 20.0));
+        assert_eq!(shape(&merge_lines(&shuffled, 1.0)), shape(&merge_lines(&article_lines(), 1.0)));
+        assert!(merge_lines(&[], 1.0).is_empty());
     }
 
     #[test]
@@ -1439,6 +1773,90 @@ mod tests {
             .count();
         assert!(found >= 4, "只读出了 {found} 个菜单项，中文菜单要读得出来：\n{text}");
         assert_eq!(translate_target(&merge_lines(&lines, 1.0)), Some("英文"), "中文菜单要译成英文：\n{text}");
+    }
+
+    /// 两个汉字之间夹着空格（行与行接起来时不该有）。
+    fn has_space_between_han(text: &str) -> bool {
+        let chars: Vec<char> = text.chars().collect();
+        chars.windows(3).any(|w| w[1] == ' ' && ('\u{4e00}'..='\u{9fff}').contains(&w[0]) && ('\u{4e00}'..='\u{9fff}').contains(&w[2]))
+    }
+
+    /// 夹具里读出来的某一行：按一小段关键字找（4–6 个字）。读歪的字只要落在关键字之外就不影响；落在关键字里，这一行就找不到，用例会红。
+    fn ocr_line<'a>(lines: &'a [OcrLine], anchor: &str) -> &'a OcrLine {
+        lines.iter().find(|line| line.text.contains(anchor)).unwrap_or_else(|| panic!("没有读出含「{anchor}」的一行：\n{}", joined(lines)))
+    }
+
+    #[test]
+    fn real_ocr_lines_of_a_wrapped_chinese_paragraph_are_merged_into_one_block_per_paragraph() {
+        // 一页文章：标题、三段正文（一段两行、一段三行、一段首行缩进两字）、脚注。没有合并之前，一句话会在词中间被切成两条各译一遍
+        //（`…可以翻译` / `你在屏幕上选中的任何内容。`）；现在每段合成一块，标题和脚注自己一块，汉字之间没有空格。
+        // 断言只认短锚点（每段开头一个、末尾一个，同一块里都有 = 整段合上了）和块的结构，不比整行文字：Vision 偶尔读歪一两个字不该让它变红
+        if real_sidecar().is_none() {
+            return;
+        }
+        let lines = recognized_lines("ocr-zh-paragraph.png");
+        let text = joined(&lines);
+        let blocks = merge_lines(&lines, 1.0);
+        assert!(lines.len() >= 9, "这一页至少读出 9 行（标题、三段共 8 行、脚注），只有 {} 行：\n{text}", lines.len());
+        let summary = || blocks.iter().map(|b| (b.lines, b.text.as_str())).collect::<Vec<_>>();
+        let block_with = |needle: &str| blocks.iter().find(|block| block.text.contains(needle)).unwrap_or_else(|| panic!("没有哪一块里有「{needle}」：{:?}", summary()));
+
+        // 前提：这一页真的有「会折行」的几何——每段的第一行读成一条、末行读成另一条
+        for (first, last) in [("可以翻译", "任何内容"), ("保护你的", "钥匙串"), ("按下快捷", "复制粘")] {
+            let (a, b) = (ocr_line(&lines, first), ocr_line(&lines, last));
+            assert!(a.y < b.y, "「{first}」与「{last}」要在不同的两行里：\n{text}");
+        }
+        // 每段：开头的锚点和末尾的锚点落在同一块里，行数不少于它折成的行数
+        for (first, last, at_least) in [("可以翻译", "任何内容", 2), ("保护你的", "钥匙串", 3), ("按下快捷", "复制粘", 3)] {
+            let block = block_with(first);
+            assert!(block.text.contains(last) && block.lines >= at_least, "「{first}」到「{last}」应当合成一块、至少 {at_least} 行：{:?}", summary());
+        }
+        // 三段各是一块，标题和脚注各自一块；块与块之间不串
+        assert_eq!(blocks.iter().filter(|block| block.lines > 1).count(), 3, "只有三段正文是多行块：{:?}", summary());
+        assert_eq!(block_with("截屏翻").lines, 1, "标题自己一块");
+        assert_eq!(block_with("首次使用").lines, 1, "脚注自己一块");
+        for block in &blocks {
+            assert!(!has_space_between_han(&block.text), "汉字之间不该有空格：{:?}", block.text);
+        }
+        // 合并后的块是各行的并集，单行行高仍是一行的高度（译文字号靠它）；方向仍是中文 → 英文
+        let intro = block_with("可以翻译");
+        assert!(intro.h > intro.line_h * 1.8 && intro.line_h < 30.0, "框高 {}、行高 {}", intro.h, intro.line_h);
+        assert_eq!(translate_target(&blocks), Some("英文"));
+    }
+
+    #[test]
+    fn real_ocr_lines_of_a_chinese_sidebar_settings_page_and_list_stay_one_block_per_line() {
+        // 一页界面：侧栏菜单、设置页的「标题 + 描述」、一列带逗号的功能列表——每行都是独立的一条。
+        // 其中侧栏下半是四行宽度几乎一样、紧挨着、左对齐的标签（几何上最像折行），没有逗号句号；
+        // 功能列表里有逗号，但最宽的一行（第四条）把列的最右缘撑开，前面几条都不算写满。一行都不许并进别的行
+        if real_sidecar().is_none() {
+            return;
+        }
+        let lines = recognized_lines("ocr-zh-sidebar.png");
+        let text = joined(&lines);
+        assert!(lines.len() >= 15, "这一页有 19 行，只读出 {} 行：\n{text}", lines.len());
+
+        // 前提一：四行紧凑的等宽标签各是独立的一条 OCR 行，右缘相差不到半个行高、间隙不到 0.55 个行高、左缘对齐——
+        // 也就是说，除了没有逗号句号，它们在几何上和折行一模一样；Vision 要是把它们读成一行，这条用例就什么也没守住
+        let tight = ["屏幕录制", "已授权的", "已保存的", "帮助中心入口"];
+        let rows: Vec<&OcrLine> = tight.iter().map(|anchor| ocr_line(&lines, anchor)).collect();
+        for pair in rows.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            let h = a.h.max(b.h);
+            assert!(b.y > a.y, "四行标签要按这个顺序各占一行：\n{text}");
+            assert!(((a.x + a.w) - (b.x + b.w)).abs() <= 0.5 * h, "「{}」与「{}」的右缘要几乎齐（这是这条用例的前提）", a.text, b.text);
+            assert!((b.y - (a.y + a.h)) <= 0.55 * h && (b.x - a.x).abs() <= 0.6 * h, "「{}」与「{}」要紧挨着、左对齐", a.text, b.text);
+        }
+        // 前提二：功能列表里有一行比其它宽出一大截（把列的最右缘撑开），并且每条都带逗号或本身很短
+        let widest = ocr_line(&lines, "一目了然");
+        let first = ocr_line(&lines, "中英互译");
+        assert!(widest.w - first.w > 0.5 * widest.h.max(first.h), "功能列表的最后一条要明显比第一条宽：\n{text}");
+        assert!(text.contains('，'), "功能列表里的逗号要读出来：\n{text}");
+
+        let blocks = merge_lines(&lines, 1.0);
+        assert_eq!(blocks.len(), lines.len(), "一行一块：\n{:?}", blocks.iter().map(|b| (b.lines, b.text.as_str())).collect::<Vec<_>>());
+        assert!(blocks.iter().all(|block| block.lines == 1));
+        assert_eq!(translate_target(&blocks), Some("英文"));
     }
 
     /// 英文截图里的图标、星级会被中文优先的那一遍读成汉字（见 ocr.swift 的 `pickRecognition`）：
