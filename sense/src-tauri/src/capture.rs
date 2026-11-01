@@ -819,17 +819,33 @@ fn ocr_binary() -> Result<PathBuf, String> {
     }
 
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries");
-    if let Ok(entries) = std::fs::read_dir(&manifest) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = path.file_name().and_then(|item| item.to_str()).unwrap_or("");
-            if name.starts_with("sense-ocr") && path.exists() {
-                return Ok(path);
-            }
-        }
-    }
+    pick_dev_sidecar(&manifest, std::env::consts::ARCH)
+        .ok_or_else(|| "找不到 OCR 组件（sense-ocr），重新构建一次应用".to_string())
+}
 
-    Err("找不到 OCR 组件（sense-ocr），重新构建一次应用".to_string())
+/// 在开发目录（src-tauri/binaries/）里挑辅助程序。
+///
+/// 发布时两种芯片的产物都会编出来放在这里：先认和当前进程同芯片的那份（`sense-ocr-<arch>-apple-darwin`）。
+/// 否则 `read_dir` 的顺序决定跑哪一份——在 Apple 芯片上挑到 Intel 的那份要靠 Rosetta，
+/// 识别结果还和原生的不完全一样，开发和测试都会变得时好时坏。
+/// 没有同芯片的那份时退回老办法：名字以 `sense-ocr` 开头的第一个（按名字排序，结果固定；占位脚本也算）。
+fn pick_dev_sidecar(dir: &Path, arch: &str) -> Option<PathBuf> {
+    let own = dir.join(format!("sense-ocr-{arch}-apple-darwin"));
+    if own.exists() {
+        return Some(own);
+    }
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("sense-ocr"))
+        })
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next()
 }
 
 /// OCR 子进程最多跑这么久，超时就杀掉并如实报错：一直卡着的话，这次截屏会悄无声息地没有下文。
@@ -2206,5 +2222,54 @@ mod tests {
             ..Default::default()
         }];
         assert_eq!(translate_target(&english), Some("中文"));
+    }
+
+    // ---------- 开发目录里挑辅助程序 ----------
+
+    fn sidecar_dir(name: &str, files: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sense-sidecar-pick-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in files {
+            std::fs::write(dir.join(file), "x").unwrap();
+        }
+        dir
+    }
+
+    fn picked(dir: &Path, arch: &str) -> Option<String> {
+        pick_dev_sidecar(dir, arch).map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn dev_sidecar_prefers_the_one_built_for_this_processs_architecture() {
+        // 发布时两种芯片的产物都在 binaries/ 里，再加上构建留下的隐藏戳文件：
+        // 不管 read_dir 按什么顺序给，Apple 芯片挑 aarch64 那份，Intel 挑 x86_64 那份，戳文件永远不被挑中
+        let dir = sidecar_dir(
+            "both",
+            &[
+                "sense-ocr-x86_64-apple-darwin",
+                "sense-ocr-aarch64-apple-darwin",
+                ".sense-ocr-aarch64-apple-darwin.recipe",
+                ".sense-ocr-x86_64-apple-darwin.recipe",
+            ],
+        );
+        assert_eq!(picked(&dir, "aarch64").as_deref(), Some("sense-ocr-aarch64-apple-darwin"));
+        assert_eq!(picked(&dir, "x86_64").as_deref(), Some("sense-ocr-x86_64-apple-darwin"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dev_sidecar_falls_back_to_whatever_is_there_and_ignores_unrelated_files() {
+        // 只有另一种芯片的产物：总比找不到强（Apple 芯片上能靠 Rosetta 跑）
+        let only_intel = sidecar_dir("intel", &["sense-ocr-x86_64-apple-darwin", ".gitkeep", "other-tool"]);
+        assert_eq!(picked(&only_intel, "aarch64").as_deref(), Some("sense-ocr-x86_64-apple-darwin"));
+        let _ = std::fs::remove_dir_all(&only_intel);
+
+        // 只有隐藏的戳文件、别的工具：没有辅助程序，如实说找不到
+        let none = sidecar_dir("none", &[".sense-ocr-aarch64-apple-darwin.recipe", "other-tool"]);
+        assert_eq!(picked(&none, "aarch64"), None);
+        let _ = std::fs::remove_dir_all(&none);
+
+        assert_eq!(pick_dev_sidecar(&std::env::temp_dir().join("sense-no-such-dir-xyz"), "aarch64"), None);
     }
 }
