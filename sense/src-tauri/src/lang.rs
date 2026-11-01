@@ -64,6 +64,11 @@ pub fn lang_by_code(code: &str) -> Option<&'static Lang> {
     LANGS.iter().find(|lang| lang.code == code)
 }
 
+/// 这种语言是从右往左排的（目前表里只有阿拉伯语、希伯来语）。截屏翻译的覆盖层据此给译文定方向，见 `capture::Block::target_rtl`。
+pub fn is_rtl(code: &str) -> bool {
+    matches!(code, "ar" | "he")
+}
+
 /// 表里一定有的代码（`known` 的调用点都是写死的字面量，单测逐个盯着）。
 fn known(code: &str) -> &'static Lang {
     lang_by_code(code).expect("语言表里必须有这个代码")
@@ -978,6 +983,13 @@ mod tests {
 
     fn code(text: &str) -> Option<&'static str> {
         detect(text).lang.map(|lang| lang.code)
+    }
+
+    #[test]
+    fn only_arabic_and_hebrew_are_right_to_left() {
+        let rtl: Vec<&str> = LANGS.iter().filter(|lang| is_rtl(lang.code)).map(|lang| lang.code).collect();
+        assert_eq!(rtl, ["ar", "he"], "语言表里从右往左的语言");
+        assert!(!is_rtl("") && !is_rtl("auto") && !is_rtl("fa"), "不在表里的代码不算");
     }
 
     #[test]

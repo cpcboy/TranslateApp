@@ -1,0 +1,58 @@
+<!doctype html><html lang="zh"><head><meta charset="utf-8"><style>body{margin:0;font:18px/1.4 "Songti SC", serif;background:#1e1e1e;color:#eee}</style></head><body><div style="padding:8px 12px">品吕回</div><script>// 逐行真值：遍历页面里所有可见文字，按「视觉行」切开，给出每行的文字和包围盒（CSS 像素）。
+// 同一视觉行上相邻的片段（不同文本节点，间距不大）并成一行；带 data-notruth 的元素（图标）不算。
+window.__truth = function () {
+  const frags = [];
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  const range = document.createRange();
+  let node, order = 0;
+  while ((node = walker.nextNode())) {
+    const text = node.nodeValue;
+    if (!text.trim()) continue;
+    const el = node.parentElement;
+    if (!el || el.closest("[data-notruth]")) continue;
+    const cs = getComputedStyle(el);
+    if (cs.visibility === "hidden" || cs.display === "none" || parseFloat(cs.opacity) === 0) continue;
+    const rtl = cs.direction === "rtl";
+    const pe = el.closest("[data-pid]"); let pid; if (pe) pid = pe.getAttribute("data-pid"); else { const bk = el.closest("p,div,li,td,th,h1,h2,h3,h4,label,button") || el; if (!window.__bk) window.__bk = new Map(); if (!window.__bk.has(bk)) window.__bk.set(bk, "b" + (window.__bk.size + 1)); pid = window.__bk.get(bk); } const fs = parseFloat(cs.fontSize); const ff = cs.fontFamily;
+    let cur = null;
+    const flush = () => { if (cur && cur.t.trim()) frags.push(cur); cur = null; };
+    for (let i = 0; i < text.length; ) {
+      const cp = text.codePointAt(i);
+      const len = cp > 0xffff ? 2 : 1;
+      const ch = text.slice(i, i + len);
+      range.setStart(node, i); range.setEnd(node, i + len);
+      i += len;
+      const all = Array.from(range.getClientRects()); let rects = all.filter((r) => r.width > 0); if (!rects.length) rects = all.filter((r) => r.height > 0);
+      if (!rects.length) { if (cur) cur.t += ch; continue; }
+      const r = rects[0];
+      const cy = (r.top + r.bottom) / 2;
+      if (cur && !(cy > cur.y - cur.h * 0.2 && cy < cur.y + cur.h * 1.2)) flush();
+      if (!cur) cur = { t: "", x: r.left, y: r.top, r: r.right, b: r.bottom, h: r.height, rtl, pid, fs, ff, order: order++ };
+      cur.t += ch;
+      if (ch.trim()) {
+        cur.x = Math.min(cur.x, r.left); cur.r = Math.max(cur.r, r.right);
+        cur.y = Math.min(cur.y, r.top); cur.b = Math.max(cur.b, r.bottom);
+        cur.h = cur.b - cur.y;
+      }
+    }
+    flush();
+  }
+  // 同一视觉行、间距不大的片段并成一行（保持 DOM 顺序 = 逻辑顺序）
+  const lines = [];
+  for (const f of frags) {
+    const cy = (f.y + f.b) / 2;
+    const near = lines.find((l) => {
+      const lcy = (l.y + l.b) / 2;
+      if (Math.abs(lcy - cy) > Math.min(l.h, f.h) * 0.45) return false;
+      const gap = Math.max(f.x - l.r, l.x - f.r);
+      return gap < Math.max(l.h, f.h) * 1.1 && l.rtl === f.rtl;
+    });
+    if (near) {
+      near.t += " " + f.t; near.x = Math.min(near.x, f.x); near.r = Math.max(near.r, f.r);
+      near.y = Math.min(near.y, f.y); near.b = Math.max(near.b, f.b); near.h = near.b - near.y;
+    } else lines.push({ ...f });
+  }
+  return lines.map((l) => ({ t: l.t.replace(/\s+/g, " ").trim(), x: l.x, y: l.y, w: l.r - l.x, h: l.h, rtl: l.rtl, pid: l.pid, fs: l.fs, ff: l.ff }))
+    .filter((l) => l.t && l.w > 0.5 && l.h > 0.5 && l.x >= -0.5 && l.y >= -0.5 && l.x + l.w <= innerWidth + 0.5 && l.y + l.h <= innerHeight + 0.5);
+};
+</script></body></html>

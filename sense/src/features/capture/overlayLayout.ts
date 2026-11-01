@@ -319,12 +319,28 @@ export type BlockPlan = {
   lineHeight: number;
   /** 已经折好的行，一行一个元素 */
   lines: string[];
-  /** 第一行文字框的左上角 */
+  /** 第一行文字框的位置：`anchor` 是 left 时 x 是文字框的左边缘，是 right 时 x 是文字框的右边缘 */
   x: number;
   y: number;
+  /**
+   * 文字框贴着 x 的哪一边。从右往左的原文（阿拉伯文、希伯来文）顶着笔画的右边起笔、往左边的空白里延伸，
+   * 并且各行靠右对齐；其余照旧从笔画的左边起笔。
+   */
+  anchor: "left" | "right";
+  /** 每一行的排版方向，见 `textDirection` */
+  dir: "ltr" | "rtl";
   /** 译文被截断了（缩到底也放不下） */
   truncated: boolean;
 };
+
+/**
+ * 这一块要画的文字每一行的排版方向：译文由目标语言定（阿拉伯语、希伯来语从右往左），没译成时画的是识别出的原文，由原文的方向定。
+ * 不靠首个强字符猜（`dir="auto"`）：阿拉伯文译文以 `Wi-Fi`、`iCloud` 这样的品牌名开头很常见，猜成从左往右，括号、句点就跑到错的一边；
+ * 同一块里各行的对齐也会不一致。
+ */
+export function textDirection(block: Pick<Partial<OverlayBlock>, "translated" | "rtl" | "target_rtl">): "ltr" | "rtl" {
+  return (block.translated === true ? block.target_rtl : block.rtl) === true ? "rtl" : "ltr";
+}
 
 const finite = (value: number) => Number.isFinite(value);
 
@@ -414,9 +430,14 @@ export function planBlock(
   const minSize = Math.max(MIN_SIZE, Math.floor(fontSize * FLOOR_RATIO));
   const text = joinLines(typeof block.text === "string" ? block.text : "");
 
-  // 多行的段落按段宽折行；单行的可以往右边的空白里延伸（room 是笔画右边一直到下一个非底色像素的距离）
-  const room = lineCount === 1 ? Math.max(0, finiteOr(block.room, 0) - 6) : 0;
-  const available = Math.max(body.w, Math.min(bounds.w - 2, body.x + body.w + room) - body.x);
+  // 多行的段落按段宽折行；单行的可以往空白里延伸：从左往右的原文往右边延伸（room 是笔画右边一直到下一个非底色像素的距离），
+  // 从右往左的原文（阿拉伯文、希伯来文）顶着右边、空白在左边，往左边延伸（room_left），并且不能越过窗口的左边（和右边一样留 2 像素）
+  const rtl = block.rtl === true;
+  const room = lineCount === 1 ? Math.max(0, finiteOr(rtl ? block.room_left : block.room, 0) - 6) : 0;
+  const right = body.x + body.w;
+  const available = rtl
+    ? Math.max(body.w, Math.min(right - 2, body.w + room))
+    : Math.max(body.w, Math.min(bounds.w - 2, right + room) - body.x);
   const fit = fitText(text, fontSize, available, lineCount, minSize, measure);
 
   // 竖直对齐：单行取笔画框的中心；多行时第一行的笔画从框顶起，行距 = (块高 − 一行笔画高) / (行数 − 1)
@@ -440,8 +461,10 @@ export function planBlock(
     fontSize: fit.size,
     lineHeight,
     lines: fit.lines,
-    x: body.x,
+    x: rtl ? right : body.x,
     y: firstCenter - lineHeight / 2,
+    anchor: rtl ? "right" : "left",
+    dir: textDirection(block),
     truncated: fit.truncated,
   };
 }
@@ -472,6 +495,8 @@ export function plainPlan(raw: OverlayBlock | null | undefined, rawBounds: { w: 
     lines: [typeof block.text === "string" ? block.text : ""],
     x,
     y: y + (h - lineHeight) / 2,
+    anchor: "left",
+    dir: textDirection(block),
     truncated: false,
   };
 }

@@ -5,6 +5,9 @@
 // 不联网、不上传图片、不花钱。
 //
 // 识别语言：中文优先、英文优先各识别一遍，图里有真中文用前一遍，否则用后一遍，见 `pickRecognition`。
+// 前两遍没把图里的字读明白时（文字区域检测器找到的区域大半没被读出来），再补第三遍（自动识别语言）：
+// 日文假名、韩文、阿拉伯文、泰文只有它读得出来，读出了真的这几种文字才改用它，见 `shouldTryAutomaticLanguage` / `hasForeignText`。
+// 希伯来文、印地文、希腊文 Vision 不支持，哪种设置都读不出来。
 //
 // 用法：sense-ocr <png 路径>
 //       sense-ocr --selftest        （自检像素分析与语言挑选，不碰 Vision）
@@ -14,8 +17,9 @@
 //         "bg":[r,g,b], "fg":[r,g,b],              // 这一行底下的底色与文字颜色（sRGB）
 //         "ink":{"x":...,"y":...,"w":...,"h":...}, // 原文笔画的紧包围盒（含越出 Vision 框的部分）
 //         "room": <像素>,                          // 笔画右边到下一个非底色像素的空白宽度
+//         "room_left": <像素>,                     // 笔画左边的空白宽度（从右往左的文字的译文往这边延伸）
 //         "cover":{"x":...,"y":...,"w":...,"h":...}}] // 允许遮盖的范围：笔画外扩一点，碰到别的东西就停
-// words / bg / fg / ink / room / cover 都可能缺省：分析不出来就不给，使用方要能退回旧做法。
+// words / bg / fg / ink / room / room_left / cover 都可能缺省：分析不出来就不给，使用方要能退回旧做法。
 
 import AppKit
 import Foundation
@@ -95,6 +99,8 @@ struct LineStyle {
     var room: Int
     /// 允许遮盖的范围：笔画外扩一点（盖住抗锯齿的毛边），但每一侧只扩到下一个非底色像素为止
     var cover: PixelRect?
+    /// 笔画左边到上一个非底色像素的空白宽度。从右往左的文字（阿拉伯文、希伯来文）的译文要往这片空白里延伸
+    var roomLeft: Int = 0
 }
 
 @inline(__always)
@@ -356,6 +362,14 @@ func analyzeLine(_ raster: Raster, box: PixelRect) -> LineStyle? {
         column += 1
     }
 
+    // 5b. 左边的空白：同上，从笔画左端往左数。从右往左的文字顶着右边，空白在左边
+    var roomLeft = 0
+    var leftColumn = ink.x - 1
+    while leftColumn >= 0, !columnHasAnyInk(leftColumn, ink.y, ink.bottom) {
+        roomLeft += 1
+        leftColumn -= 1
+    }
+
     // 6. 允许遮盖的范围：笔画往外扩一点（盖住抗锯齿的毛边），外扩量按行高定（最少 2 像素），
     //    但每一侧只扩到下一个非底色像素为止——遮盖块只许盖原文，不许盖到隔壁的色块、分隔线、图标上
     var padLeft = 0, padRight = 0, padTop = 0, padBottom = 0
@@ -364,7 +378,7 @@ func analyzeLine(_ raster: Raster, box: PixelRect) -> LineStyle? {
     while padTop < pad, ink.y - padTop - 1 >= 0, !rowHasAnyInk(ink.y - padTop - 1, ink.x, ink.right) { padTop += 1 }
     while padBottom < pad, ink.bottom + padBottom < raster.height, !rowHasAnyInk(ink.bottom + padBottom, ink.x, ink.right) { padBottom += 1 }
     let cover = PixelRect(x: ink.x - padLeft, y: ink.y - padTop, w: ink.w + padLeft + padRight, h: ink.h + padTop + padBottom)
-    return LineStyle(bg: bg, fg: foreground, ink: ink, room: room, cover: cover)
+    return LineStyle(bg: bg, fg: foreground, ink: ink, room: room, cover: cover, roomLeft: roomLeft)
 }
 
 // MARK: - 识别语言的挑选
@@ -578,6 +592,310 @@ func chooseRecognition<T>(chineseFirst: [T]?, englishFirst: [T]?, line: (T) -> P
     }
 }
 
+// MARK: - 日文、韩文、阿拉伯文、泰文：补第三遍（自动识别语言）
+
+/// 前两遍的语言列表里只有 `en-US`、`zh-Hans`。Vision 以第一个语言为主（列表里后面的语言完全不起作用），实测（macOS 26.6，渲染出的界面页）：
+///  · 拉丁字母（法、德、西、葡、意、荷、波、土、印尼、越南）和西里尔字母（俄、乌克兰）英文优先那遍就读得出来，
+///    与「该语言优先」那遍逐行相同，不用补；
+///  · 日文假名、韩文、阿拉伯文、泰文英文优先、中文优先都读成乱码或丢掉（字符错误率 90% 以上）；
+///    只有把该语言放在第一位、或者打开 `automaticallyDetectsLanguage` 才读得出来，两种办法的结果几乎一样，
+///    后者不用先知道是哪种语言，一遍就覆盖所有这几种，所以补的这一遍用它；
+///  · 希伯来文、印地文、希腊文 Vision 根本不支持（`supportedRecognitionLanguages` 里没有），哪种设置都读不出来。
+/// 补这一遍要多花一遍的时间（真外文页上比前两遍合起来还贵），所以只在「前两遍没把图里的字读明白」时才补，见 `shouldTryAutomaticLanguage`；
+/// 补完之后只有读出了「真的」日文假名、韩文、阿拉伯文、泰文才改用它，见 `hasForeignText`——否则一切照旧，输出与补这一遍之前完全一样。
+/// 补这一遍有两道保险，见 `canAffordAutomaticPass`、`automaticPassDeadlineSeconds`：前两遍用了很久就不补；补的时候超过期限就放弃，保住前两遍的结果。
+enum ForeignScript {
+    case kana, hangul, arabic, thai
+}
+
+/// 一个字符在「外文证据」里的角色。
+enum ForeignGlyph: Equatable {
+    /// 字母：算进「连着几个」
+    case letter(ForeignScript)
+    /// 附在字母上的记号：片假名的长音符 `ー`、假名的浊点、阿拉伯文的延长符 `ـ` 和元音符号、泰文的声调与元音符号。
+    /// 夹在一段字母之中时这一段接着算，但自己不算个数——图标、笔画被读歪时最常冒出这些
+    case joiner(ForeignScript)
+}
+
+/// 这个字符在这几种文字里是字母、附在字母上的记号，还是都不是（标点、数字、符号、没有分配的码位、别的文字）。
+/// 先按区块认文字，再按 Unicode 的 general category 分字母和记号——表现形式区里的括号、货币符号、宗教套语符号都不是字母。
+/// 谚文兼容字母（`ㅡ` `ㅣ` `ㅁ` `ㅇ`……长得和横线、竖线、方框、圆圈一样）不认：真韩文里只有 `ㅋㅋ` 这样的网络用语才用到。
+func foreignGlyph(of scalar: Unicode.Scalar) -> ForeignGlyph? {
+    let script: ForeignScript
+    switch scalar.value {
+    case 0x3041...0x30FF, 0x31F0...0x31FF, 0xFF66...0xFF9F: script = .kana
+    case 0x1100...0x11FF, 0xAC00...0xD7A3: script = .hangul
+    case 0x0600...0x06FF, 0x0750...0x077F, 0x08A0...0x08FF, 0xFB50...0xFDFF, 0xFE70...0xFEFF: script = .arabic
+    case 0x0E00...0x0E7F: script = .thai
+    default: return nil
+    }
+    switch scalar.properties.generalCategory {
+    case .otherLetter: return .letter(script)
+    case .modifierLetter, .nonspacingMark, .spacingMark, .enclosingMark: return .joiner(script)
+    default: return nil
+    }
+}
+
+/// 一行文字里同一种文字紧挨着连续出现的字母：最长一段的字母数、其中除假名以外的最长一段的字母数，
+/// 和字母数 ≥ 2 的段的个数（单个字母不算段）。字母数按**不同的字母**算：`うううううううううううううううう` 是 1 个，
+/// 小字、图标、噪点被读成一长串同一个假名（或 `ههههه`）并不是在读字，真词里的字母不会这么重复。
+/// 空格、标点、数字、换了另一种文字都会打断「连续」；附在字母上的记号（见 `ForeignGlyph.joiner`）接着算这一段，但自己不算个数，
+/// 单独出现（没有字母在前）不起头。
+struct ForeignRuns: Equatable {
+    var longest = 0
+    var longestOutsideKana = 0
+    var segments = 0
+}
+
+func foreignRuns(_ text: String) -> ForeignRuns {
+    var result = ForeignRuns()
+    var letters = Set<Unicode.Scalar>()
+    var current: ForeignScript?
+    func endRun() {
+        if letters.count >= 2 { result.segments += 1 }
+        letters = []
+        current = nil
+    }
+    for scalar in text.unicodeScalars {
+        switch foreignGlyph(of: scalar) {
+        case .letter(let script)?:
+            if script != current { endRun() }
+            current = script
+            letters.insert(scalar)
+            result.longest = max(result.longest, letters.count)
+            if script != .kana { result.longestOutsideKana = max(result.longestOutsideKana, letters.count) }
+        case .joiner(let script)? where script == current:
+            break
+        default:
+            endRun()
+        }
+    }
+    endRun()
+    return result
+}
+
+/// 长得和片假名一模一样的汉字（第三遍把中文读成片假名时，读出来的几乎都是这几个）。键是假名，值是它的汉字形近字。
+let kanaLookalikes: [Unicode.Scalar: Unicode.Scalar] = [
+    "カ": "力", "オ": "才", "ハ": "八", "ロ": "口", "エ": "工", "タ": "夕", "ト": "卜",
+    "ニ": "二", "チ": "千", "ル": "儿", "ミ": "三", "ナ": "十", "ー": "一",
+]
+
+/// 第三遍读出的一行假名，能不能用中文优先那遍解释：中文优先在同一位置（框重叠过半）读出了汉字，
+/// 而这一行里的每个假名都是其中某个汉字的形近字、每个汉字都在其中——`才一` 读成 `オー`、`力一八一` 读成 `カーハー` 都是这样。
+/// 解释得了，这一行就是把中文读歪了，不能当「真的日文」。中文优先在这个位置什么也没读到、或者读出来对不上，就解释不了。
+func isExplainedByChinese(_ line: PassLine, chineseFirst: [PassLine]) -> Bool {
+    let area = Double(line.box.width * line.box.height)
+    guard area > 0 else { return false }
+    var han = Set<Unicode.Scalar>()
+    for other in chineseFirst {
+        let common = line.box.intersection(other.box)
+        guard !common.isNull, Double(common.width * common.height) >= 0.5 * area else { continue }
+        han.formUnion(other.text.unicodeScalars.filter(isHan))
+    }
+    var kana = 0
+    for scalar in line.text.unicodeScalars {
+        switch foreignGlyph(of: scalar) {
+        case .letter(.kana)?, .joiner(.kana)?:
+            kana += 1
+            guard let partner = kanaLookalikes[scalar], han.contains(partner) else { return false }
+        case nil:
+            if isHan(scalar), !han.contains(scalar) { return false }
+        default:
+            return false
+        }
+    }
+    return kana > 0
+}
+
+/// 中文优先那遍在同一位置（框重叠过半）读出的汉字个数。很小的图里放宽的那条用它：谚文、阿拉伯文、泰文的字母不比同一位置的汉字多，
+/// 多半是把中文读歪了（`品吕回` 读成 `마음 미`），不是外文。
+func chineseHanCount(at box: CGRect, chineseFirst: [PassLine]) -> Int {
+    let area = Double(box.width * box.height)
+    guard area > 0 else { return 0 }
+    var count = 0
+    for other in chineseFirst {
+        let common = box.intersection(other.box)
+        guard !common.isNull, Double(common.width * common.height) >= 0.5 * area else { continue }
+        count += other.text.unicodeScalars.filter(isHan).count
+    }
+    return count
+}
+
+/// 英文优先那遍在同一位置读出的纯拉丁字母串（不夹数字、标点、空格），字母数与 `count` 相差不超过 1：
+/// 泰文的 `ท` `น` `พ` 和拉丁小写 `n` `u` `w` 几乎同形，`nu` 会被第三遍读成 `ทน`；英文优先读得对时是纯字母串。
+func englishReadsPlainLetters(at box: CGRect, count: Int, englishFirst: [PassLine]) -> Bool {
+    let area = Double(box.width * box.height)
+    guard area > 0 else { return false }
+    for other in englishFirst where other.confidence >= 0.5 {
+        let common = box.intersection(other.box)
+        guard !common.isNull, Double(common.width * common.height) >= 0.5 * area else { continue }
+        let scalars = Array(other.text.unicodeScalars)
+        if !scalars.isEmpty, scalars.allSatisfy({ ($0.value >= 0x41 && $0.value <= 0x5A) || ($0.value >= 0x61 && $0.value <= 0x7A) }), abs(scalars.count - count) <= 1 { return true }
+    }
+    return false
+}
+
+/// 太小的框（像素高度）不是能读的字：Retina 图上正文高 16 像素以上，1 倍图上 8 像素以上。
+let minForeignLineHeight = 7.0
+
+/// 一行文字里的字母：假名、谚文、阿拉伯文、泰文的（`foreign`），汉字的（`han`），其余的（拉丁、西里尔……，`other`）。附在字母上的记号、标点、数字都不算。
+struct LetterCounts: Equatable {
+    var foreign = 0
+    var han = 0
+    var other = 0
+    var all: Int { foreign + han + other }
+}
+
+func letterCounts(_ text: String) -> LetterCounts {
+    var counts = LetterCounts()
+    for scalar in text.unicodeScalars {
+        switch foreignGlyph(of: scalar) {
+        case .letter?: counts.foreign += 1
+        case .joiner?: break
+        case nil:
+            if isHan(scalar) { counts.han += 1; continue }
+            switch scalar.properties.generalCategory {
+            case .uppercaseLetter, .lowercaseLetter, .titlecaseLetter, .modifierLetter, .otherLetter: counts.other += 1
+            default: break
+            }
+        }
+    }
+    return counts
+}
+
+/// 这一行里外文字母不少于其它字母（拉丁、西里尔……；汉字不算：日文、韩文里的汉字很常见）。
+/// 选区把上一行切了一半，Vision 把剩下的半截读成一行拉丁乱码，碰巧夹着 3 个泰文字母（`uan Supe oi6 เมา m kba`）——这不是泰文。
+func isCoherentForeignLine(_ text: String) -> Bool {
+    let counts = letterCounts(text)
+    return counts.foreign >= counts.other
+}
+
+/// 第三遍的结果里有没有「真的」日文、韩文、阿拉伯文、泰文——有，整张图才改用第三遍。
+///
+/// 图标、符号被读歪时英文页和中文页里也会冒出个别假名、谚文、阿拉伯字母（`う`、`스`、`ー`、`นรนท์`），多半是 1–2 个字、置信度 0.3–0.5；
+/// 把中文读成片假名更常见：有十几个汉字长得和片假名一模一样（`力` `カ`、`才` `オ`、`一` `ー`），很短的中文选区（`才一`）会被读成置信度 1.0 的 `オー`。
+/// 真正读出来的整词不是这样，所以要求（只看置信度 ≥ 0.5、框高 ≥ 7 像素、并且外文字母不少于其它字母（`isCoherentForeignLine`）的行；个数只数字母，见 `foreignRuns`）：
+///  · 有一行连着 ≥ 3 个同一种文字的不同字母，或者
+///  · 有一行连着 ≥ 2 个、并且置信度 ≥ 0.99（`설정`、`ホーム`：很短的选区，一个词就两三个字，置信度是满的），或者
+///  · 图很小（`tiny`）时，韩文、阿拉伯文、泰文有一行连着 ≥ 2 个、置信度 ≥ 0.5：很短的选区里一个词就两个字，第三遍给的置信度多半只有 0.5。
+///    假名不放宽，长得像片假名的汉字最容易在这里冒出来；并且整张图里（置信度 ≥ 0.5 的行）这几种文字的字母要占一半以上——
+///    一行中文里夹着两个被读成谚文的杂点（`1102mm래퍼`）不是韩文，或者
+///  · 至少有两段（每段连着 ≥ 2 个字母，可以在不同的行里）。
+/// 含假名的行如果能用中文优先那遍解释（`isExplainedByChinese`），那是把中文读歪了，这一行不算证据。
+func hasForeignText(_ lines: [PassLine], imageHeight: Double, tiny: Bool = false, chineseFirst: [PassLine] = [], englishFirst: [PassLine] = []) -> Bool {
+    let readable = lines.filter { $0.confidence >= 0.5 && Double($0.box.height) * imageHeight >= minForeignLineHeight }
+    var segments = 0
+    for line in readable {
+        let runs = foreignRuns(line.text)
+        guard runs.longest >= 1, isCoherentForeignLine(line.text), !isExplainedByChinese(line, chineseFirst: chineseFirst) else { continue }
+        if runs.longest >= 3 || (runs.longest >= 2 && line.confidence >= 0.99) { return true }
+        if tiny, runs.longestOutsideKana >= 2, foreignDominates(readable),
+           chineseHanCount(at: line.box, chineseFirst: chineseFirst) < letterCounts(line.text).foreign,
+           !englishReadsPlainLetters(at: line.box, count: letterCounts(line.text).foreign, englishFirst: englishFirst) { return true }
+        segments += runs.segments
+    }
+    return segments >= 2
+}
+
+/// 这些行里假名、谚文、阿拉伯文、泰文的字母占所有字母的一半以上。
+func foreignDominates(_ lines: [PassLine]) -> Bool {
+    var foreign = 0, all = 0
+    for line in lines {
+        let counts = letterCounts(line.text)
+        foreign += counts.foreign
+        all += counts.all
+    }
+    return foreign * 2 >= all
+}
+
+/// 补第三遍是锦上添花，不能把已经读出来的结果搭进去（Rust 那边一到 60 秒就杀掉整个辅助程序，前两遍的结果也跟着丢了）：
+///  · 前两遍已经用了这么久（慢机器、超大的图），第三遍比它们合起来还贵，就不补了；
+///  · 补的时候，到辅助程序启动后这么久还没出结果就放弃（那个线程留在后台，进程退出时一起结束），保留前两遍的结果。
+let automaticPassFirstPassLimitSeconds = 15.0
+let automaticPassDeadlineSeconds = 40.0
+func canAffordAutomaticPass(firstPassSeconds: Double) -> Bool {
+    firstPassSeconds < automaticPassFirstPassLimitSeconds
+}
+
+/// 在后台线程里跑 `work`，最多等 `seconds` 秒。返回是不是在期限内跑完了；超时的话线程留在后台。
+func finishesWithin(_ seconds: Double, _ work: @escaping () -> Void) -> Bool {
+    let finished = DispatchSemaphore(value: 0)
+    DispatchQueue.global(qos: .userInitiated).async {
+        work()
+        finished.signal()
+    }
+    return finished.wait(timeout: .now() + max(0, seconds)) == .success
+}
+
+/// 检测到的文字区域（归一化坐标）里，被置信度 ≥ `minConfidence` 的行盖住的面积比例。没有检测到文字区域返回 nil。
+func textCoverage(rects: [CGRect], lines: [PassLine], minConfidence: Float) -> Double? {
+    var total = 0.0, covered = 0.0
+    for rect in rects {
+        let area = Double(rect.width * rect.height)
+        guard area > 0 else { continue }
+        total += area
+        var common = 0.0
+        for line in lines where line.confidence >= minConfidence {
+            let overlap = rect.intersection(line.box)
+            if !overlap.isNull { common += Double(overlap.width * overlap.height) }
+        }
+        covered += min(area, common)
+    }
+    return total > 0 ? covered / total : nil
+}
+
+/// 文字区域被读出来的比例低于这个，就认为图里有前两遍没读明白的字。
+/// 实测（渲染出的界面页）：拉丁语系、西里尔字母、英文、中文的页面这个比例几乎都在 0.9 以上，
+/// 日、韩、阿拉伯、泰文的页面多数在 0.5 以下。
+let textCoverageFloor = 0.8
+/// 算比例时认置信度不低于这个的行。读歪的乱码多半只有 0.3–0.5，算进去就会把读不出来的文字当成「读出来了」；
+/// 但带图标、表情的中文菜单、很小的字本来就常常只有 0.3–0.5，大图里这样的行很多，全不认的话会白补很多遍。
+/// 所以只在不大的图里（补一遍不太贵）认 0.5，大图里放宽到 0.3——大图里的外文页文字很多，覆盖比例本来就低得明显；
+/// 放宽带来的漏网（置信度 0.3 的整页乱码也算「盖住了」）由 `lowConfidenceShare` 兜底。
+let strictCoverageConfidence: Float = 0.5
+let relaxedCoverageConfidence: Float = 0.3
+let strictCoverageMaxMegapixels = 2.5
+/// 检测器没找到文字区域时，前两遍读出来的行里最高的置信度低于这个，也算没读明白。
+let lowConfidenceCeiling: Float = 0.7
+/// 很小的选区（一个按钮、一个词，约 500×500 像素以内）：补一遍只要几十到一百多毫秒，而前两遍的信号在这里最不可靠——
+/// 检测器常常一块区域也找不到；英文优先会把 `ホーム` 读成置信度 1.0 的 `*-4`、把阿拉伯文读成置信度 1.0 的 `15, Lies`，被当成「读明白了」。
+/// 所以一律补，靠采信那一关把关。
+let tinyImageMaxMegapixels = 0.25
+/// 最终用的是英文优先那遍、读出 ≥ 4 行、其中置信度不到 0.5 的占这么多以上，也算没读明白：英文页上的行几乎都是 1.0（偶尔 0.5），
+/// 整页外文被它读成乱码时行行都是 0.3。大图里不能只靠「盖住的面积」（0.3 的乱码行也盖得住），一整页阿拉伯文就这样漏过；
+/// 也不能让一行读得很好的日期把整页外文挡在门外（「最高置信度 < 0.7」）。
+/// 用中文优先那遍时不看这一条：带图标、表情的中文菜单，行行都只有 0.3。
+let lowConfidenceShare = 0.6
+let lowConfidenceShareMinLines = 4
+
+/// 前两遍有没有把图里的字读明白；没有就补第三遍（自动识别语言）。
+/// 补之前不知道图里是什么文字，读不出来的字没法认，所以用「没读明白」当条件：
+///  · 很小的选区一律补；
+///  · 前两遍都什么也没读到；
+///  · 最终用的是英文优先那遍，而它读出的行大多置信度很低；
+///  · 文字区域大半没被读出来（不论哪一遍读出来都算：中文页是中文优先那遍读出来的，英文页是英文优先那遍）。
+/// 文字区域靠检测器找（`textRects`，要跑一次检测，所以前几种情况已经定了就不调用）。
+/// 误触发（图标多、置信度低的真文字）只是多花一遍的时间，结果仍要过 `hasForeignText` 这一关。
+func shouldTryAutomaticLanguage(
+    chineseFirst: [PassLine]?, englishFirst: [PassLine]?,
+    chosen: [PassLine], chosenIsChinese: Bool,
+    megapixels: Double, textRects: () -> [CGRect]
+) -> Bool {
+    if megapixels <= tinyImageMaxMegapixels { return true }
+    let lines = (chineseFirst ?? []) + (englishFirst ?? [])
+    if lines.isEmpty { return true }
+    if !chosenIsChinese, chosen.count >= lowConfidenceShareMinLines,
+       Double(chosen.filter { $0.confidence < 0.5 }.count) / Double(chosen.count) >= lowConfidenceShare { return true }
+    let rects = textRects()
+    if rects.isEmpty { return (lines.map { $0.confidence }.max() ?? 0) < lowConfidenceCeiling }
+    let confidence = megapixels <= strictCoverageMaxMegapixels ? strictCoverageConfidence : relaxedCoverageConfidence
+    let coverage = [chineseFirst, englishFirst]
+        .compactMap { $0 }
+        .compactMap { textCoverage(rects: rects, lines: $0, minConfidence: confidence) }
+        .max() ?? 0
+    return coverage < textCoverageFloor
+}
+
 // MARK: - 自检
 
 /// `--selftest`：用合成的图片核对像素分析、用字符串核对语言挑选，不碰 Vision。失败时往 stderr 说清哪一条，退出码非 0。
@@ -751,6 +1069,7 @@ func runSelfTest() -> Never {
         check(style?.ink?.x == 50 && style?.ink?.y == 20 && style?.ink?.w == 40 && style?.ink?.h == 8,
               "深色底：紧包围盒 \(String(describing: style?.ink))")
         check(style?.room == 110, "右边一直空到图边：room 应为 110，实际 \(String(describing: style?.room))")
+        check(style?.roomLeft == 50, "左边一直空到图边：roomLeft 应为 50（笔画从 x=50 起），实际 \(String(describing: style?.roomLeft))")
         // 框高 16 → 外扩 2 像素，四周都是底色，扩满
         check(style?.cover?.x == 48 && style?.cover?.y == 18 && style?.cover?.w == 44 && style?.cover?.h == 12,
               "遮盖范围应是笔画外扩 2 像素：(48,18,44,12)，实际 \(String(describing: style?.cover))")
@@ -763,7 +1082,34 @@ func runSelfTest() -> Never {
     ]) {
         let style = analyzeLine(raster, box: PixelRect(x: 46, y: 16, w: 48, h: 16))
         check(style?.room == 60, "右边 150 处有别的东西：room 应为 60，实际 \(String(describing: style?.room))")
+        check(style?.roomLeft == 50, "左边什么也没有：roomLeft 应为 50，实际 \(String(describing: style?.roomLeft))")
     } else { check(false, "合成图 2 画不出来") }
+
+    // 2b. 左边有别的东西：左边的空白停在它后面（从右往左的文字顶着右边，空白在左）
+    if let raster = makeImage(width: 200, height: 60, bg: (30, 30, 30), rects: [
+        (PixelRect(x: 110, y: 20, w: 60, h: 8), (200, 200, 200)),
+        (PixelRect(x: 20, y: 18, w: 10, h: 12), (90, 140, 255)),     // 左边 x 20..<30 有个图标
+    ]) {
+        let style = analyzeLine(raster, box: PixelRect(x: 106, y: 16, w: 68, h: 16))
+        check(style?.ink?.x == 110 && style?.ink?.right == 170, "2b：笔画 x 110..<170，实际 \(String(describing: style?.ink))")
+        check(style?.roomLeft == 80, "左边 20..<30 处有图标：roomLeft 应为 110 − 30 = 80，实际 \(String(describing: style?.roomLeft))")
+        check(style?.room == 30, "右边一直空到图边（170..<200）：room 应为 30，实际 \(String(describing: style?.room))")
+    } else { check(false, "合成图 2b 画不出来") }
+    // 2c. 笔画贴着图的左边：左边没有空白
+    if let raster = makeImage(width: 200, height: 60, bg: (30, 30, 30), rects: [
+        (PixelRect(x: 0, y: 20, w: 40, h: 8), (200, 200, 200)),
+    ]) {
+        let style = analyzeLine(raster, box: PixelRect(x: 0, y: 16, w: 44, h: 16))
+        check(style?.roomLeft == 0, "笔画顶着图的左边：roomLeft 应为 0，实际 \(String(describing: style?.roomLeft))")
+    } else { check(false, "合成图 2c 画不出来") }
+    // 2d. 左边有一条贯穿的竖分隔线（侧栏与正文之间）：左边的空白停在它后面，从右往左的译文不能越过它延伸
+    if let raster = makeImage(width: 200, height: 60, bg: (30, 30, 30), rects: [
+        (PixelRect(x: 110, y: 20, w: 60, h: 8), (200, 200, 200)),
+        (PixelRect(x: 40, y: 0, w: 1, h: 60), (90, 90, 90)),
+    ]) {
+        let style = analyzeLine(raster, box: PixelRect(x: 106, y: 16, w: 68, h: 16))
+        check(style?.roomLeft == 69, "左边 x=40 有竖线：roomLeft 应为 110 − 41 = 69，实际 \(String(describing: style?.roomLeft))")
+    } else { check(false, "合成图 2d 画不出来") }
 
     // 3. 笔画越出 Vision 框：往外长到空列为止，但最多长「行高的 1/8」（这里框高 16 → 2 像素）
     if let raster = makeImage(width: 200, height: 60, bg: (30, 30, 30), rects: [
@@ -1088,6 +1434,226 @@ func runSelfTest() -> Never {
         }
     } else { check(false, "合成图 7 画不出来") }
 
+
+    // 其它文字（日文假名、韩文、阿拉伯文、泰文）：补第三遍的触发条件与采信条件
+    // 区块边界：每个区间的头尾都钉住，往外一格就不是；同一区块里再按 general category 分字母和记号
+    func glyph(_ value: UInt32) -> ForeignGlyph? { foreignGlyph(of: Unicode.Scalar(value)!) }
+    let letters: [(ForeignScript, [UInt32])] = [
+        (.kana, [0x3041, 0x3096, 0x309F, 0x30A1, 0x30FA, 0x30FF, 0x31F0, 0x31FF, 0xFF66, 0xFF6F, 0xFF71, 0xFF9D]),
+        (.hangul, [0x1100, 0x11FF, 0xAC00, 0xD7A3]),
+        (.arabic, [0x0621, 0x063F, 0x0641, 0x064A, 0x0671, 0x06D3, 0x06D5, 0x06EE, 0x06FF, 0x0750, 0x077F, 0x08A0, 0xFB50, 0xFD3D, 0xFDFA, 0xFE70, 0xFEFC]),
+        (.thai, [0x0E01, 0x0E2F, 0x0E30, 0x0E32, 0x0E33, 0x0E40, 0x0E44, 0x0E45]),
+    ]
+    for (script, points) in letters {
+        for point in points { check(glyph(point) == .letter(script), "foreignGlyph：U+\(String(point, radix: 16, uppercase: true)) 应是 \(script) 的字母，实际 \(String(describing: glyph(point)))") }
+    }
+    let joiners: [(ForeignScript, [UInt32])] = [
+        (.kana, [0x3099, 0x309A, 0x309D, 0x309E, 0x30FC, 0x30FD, 0x30FE, 0xFF70, 0xFF9E, 0xFF9F]),
+        (.arabic, [0x0640, 0x064B, 0x065F, 0x0670, 0x08FF]),
+        (.thai, [0x0E31, 0x0E34, 0x0E3A, 0x0E46, 0x0E47, 0x0E4E]),
+    ]
+    for (script, points) in joiners {
+        for point in points { check(glyph(point) == .joiner(script), "foreignGlyph：U+\(String(point, radix: 16, uppercase: true)) 应是 \(script) 的记号，实际 \(String(describing: glyph(point)))") }
+    }
+    // 不是：没分配的码位、标点、数字、符号、货币、谚文兼容字母、半角中点与半角谚文填充符，以及别的文字
+    for point: UInt32 in [
+        0x3040, 0x3097, 0x309B, 0x30A0, 0x30FB, 0x31EF, 0xFF65, 0xFFA0, 0x10FF, 0x3131, 0x3164, 0x318E, 0xD7A4,
+        0x0600, 0x060C, 0x0660, 0x066A, 0x06D4, 0x06DD, 0x06F0, 0x0780, 0xFD3E, 0xFD3F, 0xFDFC, 0xFDFD, 0xFDFF, 0xFE6F, 0xFEFD, 0xFEFF,
+        0x0E00, 0x0E3B, 0x0E3F, 0x0E4F, 0x0E50, 0x0E7F,
+    ] {
+        // 0x0780（它拿字母）、0x3131（谚文兼容字母）、0x3164（谚文填充符）虽然是字母，但不在要认的区块里
+        check(glyph(point) == nil, "foreignGlyph：U+\(String(point, radix: 16, uppercase: true)) 不是补第三遍要认的字母，实际 \(String(describing: glyph(point)))")
+    }
+    for text in ["日", "A", "1", " ", "।", "א", "α", "я", "ñ", "★", "，", "़"] {
+        check(glyph(text.unicodeScalars.first!.value) == nil, "foreignGlyph：「\(text)」不是补第三遍要认的文字")
+    }
+    func runs(_ text: String) -> String { let r = foreignRuns(text); return "\(r.longest)/\(r.longestOutsideKana)/\(r.segments)" }
+    check(runs("") == "0/0/0" && runs("Hello 世界") == "0/0/0", "foreignRuns：没有这几种文字：\(runs("Hello 世界"))")
+    check(runs("ありがとう") == "5/0/1", "foreignRuns：一整段假名：\(runs("ありがとう"))")
+    check(runs("ホーム") == "2/0/1", "foreignRuns：长音符接着算这一段，但自己不算个数：\(runs("ホーム"))")
+    check(runs("ー") == "0/0/0" && runs("ーホ") == "1/0/0" && runs("a ー b") == "0/0/0", "foreignRuns：长音符自己不起头：\(runs("ー")) \(runs("ーホ"))")
+    check(runs("ｰｰｰ") == "0/0/0" && runs("ｱｰｲ") == "2/0/1", "foreignRuns：半角长音符也是记号：\(runs("ｰｰｰ")) \(runs("ｱｰｲ"))")
+    check(runs("ゔ゛") == "1/0/0" && runs("か\u{3099}き") == "2/0/1", "foreignRuns：假名的浊点是记号：\(runs("か\u{3099}き"))")
+    check(runs("いすゞず") == "3/0/1", "foreignRuns：重复符号接着算、不算个数、不打断：\(runs("いすゞず"))")
+    check(runs("設定をする") == "3/0/1", "foreignRuns：汉字打断，假名各算各的：\(runs("設定をする"))")
+    check(runs("あい\u{064B}う") == "2/0/1", "foreignRuns：别种文字的记号（阿拉伯文元音符号）打断假名：\(runs("あい\u{064B}う"))")
+    check(runs(String(repeating: "う", count: 17)) == "1/0/0" && runs("ههههه") == "1/1/0", "foreignRuns：同一个字母重复一长串只算 1 个：\(runs(String(repeating: "う", count: 17)))")
+    check(runs("ああいい") == "2/0/1" && runs("ココア") == "2/0/1" && runs("ううつつううつつ") == "2/0/1", "foreignRuns：按不同的字母算：\(runs("ああいい")) \(runs("ココア"))")
+    check(runs("ありがとう あい") == "5/0/2", "foreignRuns：最长的一段不被后面短的覆盖：\(runs("ありがとう あい"))")
+    check(runs("う 설 ع ก") == "1/1/0", "foreignRuns：单个字不算段：\(runs("う 설 ع ก"))")
+    check(runs("うつ 설정") == "2/2/2", "foreignRuns：两段各 2 个：\(runs("うつ 설정"))")
+    check(runs("あいう한국어") == "3/3/2", "foreignRuns：换了一种文字就断开：\(runs("あいう한국어"))")
+    check(runs("ةمـلك") == "4/4/1" && runs("ـ") == "0/0/0", "foreignRuns：延长符在一段之中接着算、不算个数：\(runs("ةمـلك")) \(runs("ـ"))")
+    check(runs("ก็ตั้งค่า") == "5/5/1", "foreignRuns：泰文的声调、元音符号接着算、不算个数：\(runs("ก็ตั้งค่า"))")
+    check(runs("ที่") == "1/1/0" && runs("\u{064B}\u{064C}\u{064D}") == "0/0/0" && runs("بَ") == "1/1/0", "foreignRuns：一个泰文音节、只有元音符号的串都不够：\(runs("ที่")) \(runs("بَ"))")
+    check(runs("ㅡㅡㅡ ㅣㅣㅣ ㅁㅁㅁ ㅋㅋㅋ") == "0/0/0" && runs("﴾﴿﴾ ﷼﷽") == "0/0/0", "foreignRuns：谚文兼容字母、装饰括号、货币与宗教套语符号不是字母")
+    check(runs("あ1い2う") == "1/0/0", "foreignRuns：数字打断：\(runs("あ1い2う"))")
+
+    func foreign(_ text: String, _ confidence: Float, _ box: CGRect = CGRect(x: 0.1, y: 0.5, width: 0.2, height: 0.04)) -> PassLine {
+        PassLine(text: text, box: box, confidence: confidence)
+    }
+    func evidence(_ lines: [PassLine], imageHeight: Double = 1000, tiny: Bool = false, chinese: [PassLine] = [], english: [PassLine] = []) -> Bool {
+        hasForeignText(lines, imageHeight: imageHeight, tiny: tiny, chineseFirst: chinese, englishFirst: english)
+    }
+    check(evidence([foreign("ありがとう", 0.5)]), "hasForeignText：连着 3 个以上、置信度 0.5：采信")
+    check(evidence([foreign("ダウンロード", 0.5)]), "hasForeignText：ダウンロード 连着 5 个字母（长音符不算个数）：采信")
+    check(evidence([foreign("あいう", 0.5)]) && evidence([foreign("حفظ", 0.5)]) && evidence([foreign("บันทึก", 0.5)]), "hasForeignText：正好连着 3 个不同的字母、置信度 0.5：采信")
+    check(!evidence([foreign(String(repeating: "う", count: 17), 0.5)]) && !evidence([foreign("Vううううううううううううううううう", 0.5)], tiny: true), "hasForeignText：同一个假名重复一长串（小字、噪点）：不采信（真实网页里 8 像素高的一行被读成 17 个 `う`）")
+    check(!evidence([foreign("ココア", 0.5)]) && evidence([foreign("ココア", 0.99)]), "hasForeignText：ココア 是 2 个不同的字母：要置信度满才采信")
+    check(evidence([foreign("설정", 1)]), "hasForeignText：只有 2 个字、置信度满：采信（很短的选区）")
+    check(evidence([foreign("ホーム", 1)]), "hasForeignText：ホーム 2 个字母、置信度满：采信")
+    check(!evidence([foreign("ホーム", 0.5)]), "hasForeignText：ホーム 2 个字母、置信度 0.5：不采信（长音符不算个数）")
+    check(!evidence([foreign("オー", 1)]), "hasForeignText：只有 1 个字母 + 长音符：不采信（`才一` 被读成 `オー`）")
+    check(!evidence([foreign("オー", 1)], tiny: true), "hasForeignText：很小的图里也一样")
+    check(!evidence([foreign("설정", 0.5)]), "hasForeignText：只有 2 个字、置信度 0.5：不采信（图标读歪的 `うつ` 就是这样）")
+    check(!evidence([foreign("설정", 0.98)]), "hasForeignText：置信度 0.98 不算满")
+    check(evidence([foreign("설정", 0.99)]), "hasForeignText：置信度 0.99 算满")
+    check(!evidence([foreign("ありがとう", 0.3)]), "hasForeignText：置信度 0.3 的行不看")
+    check(!evidence([foreign("ありがとう", 0.49)]), "hasForeignText：置信度 0.49 的行不看")
+    check(!evidence([foreign("う", 1), foreign("스", 1), foreign("ー", 1), foreign("ع", 1)]), "hasForeignText：单个字、一堆也不采信")
+    check(evidence([foreign("うつ", 0.5), foreign("설정", 0.5)]), "hasForeignText：两段（各 2 个字，在不同的行里）：采信")
+    check(!evidence([foreign("うつ", 0.5), foreign("う", 0.5)]), "hasForeignText：一段 2 个字 + 单个字：不够")
+    check(!evidence([foreign("ありがとう", 1, CGRect(x: 0.1, y: 0.5, width: 0.2, height: 0.006))]), "hasForeignText：框高 6 像素（1000 × 0.006）不是能读的字")
+    check(evidence([foreign("ありがとう", 1, CGRect(x: 0.1, y: 0.5, width: 0.2, height: 0.007))]), "hasForeignText：框高 7 像素够了")
+    check(!evidence([foreign("ありがとう", 1)], imageHeight: 100), "hasForeignText：同一个框在 100 像素高的图里只有 4 像素：不采信")
+    check(!evidence([]) && !evidence([foreign("Hello 世界", 1)]), "hasForeignText：没有这几种文字：不采信")
+    check(!evidence([foreign("ㅡㅡㅡ", 1), foreign("ㅣㅣㅣ", 1), foreign("﴾﴿﴾", 1), foreign("\u{3164}\u{3164}\u{3164}", 1), foreign("ｰｰｰ", 1), foreign("ًٌٍ", 1)]),
+          "hasForeignText：线条、方框、装饰括号、不可见填充符、记号堆在一起不是字母")
+    check(!evidence([foreign("ที่", 1), foreign("بَ", 1)]), "hasForeignText：一个泰文音节（声调符号）、一个带元音符号的阿拉伯字母：每行只有 1 个字母，不采信")
+    // 很小的图：韩文、阿拉伯文、泰文两个字母、置信度 0.5 也采信；假名不放宽
+    check(evidence([foreign("설정", 0.5)], tiny: true), "hasForeignText：很小的图里，韩文 2 个字、置信度 0.5：采信")
+    check(evidence([foreign("ลบ", 0.5)], tiny: true) && evidence([foreign("حفظ", 0.5)], tiny: true), "hasForeignText：很小的图里，泰文、阿拉伯文也一样")
+    check(!evidence([foreign("うつ", 0.5)], tiny: true) && !evidence([foreign("ホーム", 0.5)], tiny: true), "hasForeignText：很小的图里，假名不放宽（形近的汉字最容易在这里冒出来）")
+    check(!evidence([foreign("설", 0.5)], tiny: true) && !evidence([foreign("설정", 0.49)], tiny: true), "hasForeignText：很小的图里，1 个字、置信度不到 0.5 也不采信")
+    // 放宽的那条还要求外文占多数：一行中文里夹着两个被读成谚文的杂点不是韩文
+    check(!evidence([foreign("4.10.3途川作・・・・・・・", 0.5), foreign("1102mm래퍼", 0.5), foreign("1.", 0.5)], tiny: true), "hasForeignText：很小的图里，中文行 + 两个杂点（谚文 2 个、其余字母 5 个）：不采信")
+    let hanPlace = CGRect(x: 0.1, y: 0.5, width: 0.2, height: 0.04)
+    check(!evidence([foreign("마음 미", 0.5, hanPlace)], tiny: true, chinese: [pass("品吕回", hanPlace, 0.5)]) && evidence([foreign("마음 미", 0.5, hanPlace)], tiny: true, chinese: [pass("品吕", hanPlace, 0.5)]) && evidence([foreign("마음 미", 0.5, hanPlace)], tiny: true), "hasForeignText：很小的图里，中文优先在同一位置读出的汉字不少于谚文字母：是把中文读歪了")
+    check(!evidence([foreign("ทน", 0.5, hanPlace)], tiny: true, english: [pass("nu", hanPlace, 1)]) && !evidence([foreign("ทนท", 0.5, hanPlace)], tiny: true, english: [pass("nun", hanPlace, 1)])
+          && evidence([foreign("ทน", 0.5, hanPlace)], tiny: true, english: [pass("15, Lies", hanPlace, 1)]) && evidence([foreign("ทน", 0.5, hanPlace)], tiny: true, english: [pass("nuxyz", hanPlace, 1)]) && evidence([foreign("ทน", 0.5, hanPlace)], tiny: true),
+          "hasForeignText：很小的图里，英文优先在同一位置读出字母数相当的纯拉丁字母串（`nu`）：是英文，不是泰文")
+    check(evidence([foreign("설정", 0.5), foreign("Wi", 1)], tiny: true), "hasForeignText：很小的图里，外文字母正好占一半：采信")
+    check(evidence([foreign("설정", 0.5), foreign("Settings and more text", 0.3)], tiny: true), "hasForeignText：算占比时置信度不到 0.5 的行不看（和采信看的是同一批行）")
+    check(evidence([foreign("설정", 0.5), foreign("Settings and more text", 1, CGRect(x: 0.1, y: 0.2, width: 0.2, height: 0.005))], tiny: true), "hasForeignText：框高不到 7 像素的行也不看")
+    check(!evidence([foreign("설정", 0.5), foreign("Wif", 1)], tiny: true), "hasForeignText：外文字母 2 个、其它 3 个：不到一半，不采信")
+    check(evidence([foreign("설정", 0.5), foreign("12:30", 1)], tiny: true), "hasForeignText：数字不算字母")
+    check(!evidence([foreign("설정", 0.5), foreign("取消取消", 0.5)], tiny: true) && evidence([foreign("설정", 0.99), foreign("取消取消取消", 0.5)], tiny: true), "hasForeignText：汉字算字母（占多数就不采信）；置信度满的另算，不看占比")
+    func counts(_ text: String) -> String { let c = letterCounts(text); return "\(c.foreign)/\(c.han)/\(c.other)" }
+    check(counts("1102mm래퍼") == "2/0/2" && counts("ホーム") == "2/0/0" && counts("設定を") == "1/2/0" && counts("12:30 ٣٠") == "0/0/0" && counts("Hello 世界") == "0/2/5" && counts("Привет ñ") == "0/0/7" && counts("a\u{02BC}b") == "0/0/3",
+          "letterCounts：\(counts("1102mm래퍼")) \(counts("ホーム")) \(counts("設定を")) \(counts("Hello 世界")) \(counts("Привет ñ"))")
+    // 每一行要连贯：外文字母不少于其它字母（汉字不算）
+    check(isCoherentForeignLine("ありがとう") && isCoherentForeignLine("設定を保存") && isCoherentForeignLine("ab あい") && !isCoherentForeignLine("abc あい") && isCoherentForeignLine("あい abc 日本語") == false,
+          "isCoherentForeignLine：外文字母 ≥ 其它字母（汉字不算）")
+    check(!evidence([foreign("uan Supe oi6 เมา m kba nu uan ibu nu m pn", 0.5)]) && !evidence([foreign("uan Supe oi6 เมา m kba nu uan ibu nu m pn", 0.5)], tiny: true), "hasForeignText：一行拉丁乱码里碰巧夹着 3 个泰文字母：不采信（选区切掉上一行的一半）")
+    check(evidence([foreign("เมา", 0.5)]) && evidence([foreign("abc เมา", 0.5)]) && !evidence([foreign("abcd เมา", 0.5)]), "hasForeignText：行里外文字母不少于其它字母才算（3 个对 3 个够，3 个对 4 个不够）")
+    check(evidence([foreign("Bluetoothデバイスを接続", 0.5), foreign("ありがとう", 0.5)]) && !evidence([foreign("Bluetoothデバイスを接続", 0.99)]), "hasForeignText：夹着英文词的整行不连贯，不单独当证据；同一页里别的行连贯就行")
+    check(!evidence([foreign("설정", 0.5)], tiny: false), "hasForeignText：不小的图里不放宽")
+    // 形近字：第三遍把中文读成片假名，中文优先在同一位置读出了那几个汉字
+    let place = CGRect(x: 0.1, y: 0.5, width: 0.2, height: 0.04)
+    func explained(_ text: String, _ chinese: [PassLine]) -> Bool { isExplainedByChinese(foreign(text, 1, place), chineseFirst: chinese) }
+    check(explained("オー", [pass("才一", place, 0.5)]), "形近字：`才一` 读成 `オー`：解释得了")
+    check(explained("カーハー", [pass("力一八一", place, 0.5)]) && explained("@カー", [pass("@力一", place, 0.5)]), "形近字：`力一八一`、`@力一` 也是")
+    check(explained("吉トカ", [pass("吉卜力", place, 0.3)]), "形近字：汉字和假名混着，汉字也在中文那遍的结果里：解释得了")
+    check(!explained("オー", []) && !explained("オー", [pass("才一", rect(0.1, 0.2), 0.5)]), "形近字：中文优先没读到、或读在别处：解释不了")
+    check(!explained("オー", [pass("J-", place, 0.5)]), "形近字：中文优先读成了别的东西：解释不了")
+    check(!explained("カーハー", [pass("力一", place, 0.5)]), "形近字：有一个假名（ハ）在中文那遍里找不到形近的汉字：解释不了")
+    check(!explained("ホーム", [pass("术一么", place, 0.5)]), "形近字：ホ、ム 没有长得一模一样的汉字：解释不了，真的日文照常采信")
+    check(!explained("吉トカ", [pass("卜力", place, 0.3)]), "形近字：混在里面的汉字（吉）不在中文那遍的结果里：解释不了")
+    check(!explained("설정", [pass("设置", place, 0.5)]) && !explained("Hello", [pass("设置", place, 0.5)]), "形近字：不含假名的行不归它管")
+    check(!explained("オー설정", [pass("才一", place, 0.5)]), "形近字：夹着韩文：解释不了")
+    check(!isExplainedByChinese(foreign("オー", 1, CGRect(x: 0.1, y: 0.5, width: 0, height: 0.04)), chineseFirst: [pass("才一", place, 0.5)]), "形近字：没有面积的框不解释")
+    let half = CGRect(x: 0.1, y: 0.5, width: 0.1, height: 0.04)   // 只盖住这一行的一半：不算「同一位置」的下限
+    check(isExplainedByChinese(foreign("オー", 1, place), chineseFirst: [pass("才一", half, 0.5)]), "形近字：中文那一行盖住这一行的一半：算同一位置")
+    check(!isExplainedByChinese(foreign("オー", 1, place), chineseFirst: [pass("才一", CGRect(x: 0.1, y: 0.5, width: 0.0999, height: 0.04), 0.5)]), "形近字：盖不到一半：不算")
+    for (kana, han) in kanaLookalikes {
+        check((glyph(kana.value) == .letter(.kana) || glyph(kana.value) == .joiner(.kana)) && isHan(han) && kana != han, "形近字表：\(kana) → \(han) 要是一个假名和一个汉字")
+    }
+    // 评审里的那批：形近字的两两组合在中文优先读对了的前提下全部解释得了
+    check(evidence([foreign("カーハー", 1, place)], chinese: [pass("力一八一", place, 0.5)]) == false, "hasForeignText：`力一八一` 读成 `カーハー`（置信度满）：不采信")
+    check(evidence([foreign("カーハー", 1, place)], chinese: []) == true, "hasForeignText：中文优先什么也没读到时 `カーハー`（2 个字母、置信度满）：照常采信")
+    check(evidence([foreign("エロカタトハニチミ", 0.5, place)], chinese: [pass("工口力夕卜八二千三", place, 0.5)]) == false, "hasForeignText：9 个形近字读成 9 个片假名：不采信")
+    check(evidence([foreign("エロカタトハニチミ", 0.5, place)], chinese: [pass("工口力夕卜", place, 0.5)]) == true, "hasForeignText：中文那遍只读出一部分，剩下的解释不了：采信")
+
+    // 文字区域的覆盖比例
+    let region = rect(0.1, 0.5, 0.2)
+    func cover(_ lines: [PassLine], _ confidence: Float = 0.5, _ regions: [CGRect]? = nil) -> Double? {
+        textCoverage(rects: regions ?? [region], lines: lines, minConfidence: confidence)
+    }
+    check(cover([]) == 0 && cover([pass("x", region)]) == 1, "textCoverage：全盖住是 1、没有行是 0")
+    check(abs((cover([pass("x", rect(0.1, 0.5, 0.1))]) ?? -1) - 0.5) < 1e-9, "textCoverage：盖一半是 0.5：\(String(describing: cover([pass("x", rect(0.1, 0.5, 0.1))])))")
+    check(cover([pass("x", region, 0.3)]) == 0 && cover([pass("x", region, 0.3)], 0.3) == 1, "textCoverage：置信度不够的行不算")
+    check(cover([pass("x", region), pass("y", region)]) == 1, "textCoverage：几行叠在一起也不超过 1")
+    check(cover([pass("x", rect(0.1, 0.9, 0.2))]) == 0, "textCoverage：没碰到")
+    check(cover([pass("x", region)], 0.5, []) == nil && cover([pass("x", region)], 0.5, [CGRect.zero]) == nil, "textCoverage：没有（有面积的）文字区域是 nil")
+    let twoRegions = [rect(0.1, 0.5, 0.1), rect(0.5, 0.5, 0.3)]   // 面积 1 : 3
+    check(abs((cover([pass("x", rect(0.1, 0.5, 0.1))], 0.5, twoRegions) ?? -1) - 0.25) < 1e-9, "textCoverage：按面积加权")
+
+    // 要不要补第三遍
+    func tries(_ chinese: [PassLine]?, _ english: [PassLine]?, rects: [CGRect], mp: Double = 1, chosen: [PassLine]? = nil, chosenIsChinese: Bool = false) -> Bool {
+        shouldTryAutomaticLanguage(
+            chineseFirst: chinese, englishFirst: english, chosen: chosen ?? (english ?? []), chosenIsChinese: chosenIsChinese,
+            megapixels: mp, textRects: { rects }
+        )
+    }
+    let okLine = pass("Hello", region, 1)
+    check(tries([], [], rects: [region]), "触发：两遍都什么也没读到")
+    check(tries(nil, [], rects: []), "触发：一遍失败、另一遍什么也没读到")
+    check(!tries(nil, [okLine], rects: [region]), "不触发：一遍失败、另一遍盖住了文字区域")
+    check(!tries([], [okLine], rects: [region]), "不触发：英文优先盖住了文字区域")
+    check(!tries([pass("设置", region, 1)], [pass("X#5127", other)], rects: [region], chosen: [pass("设置", region, 1)], chosenIsChinese: true), "不触发：中文优先盖住了文字区域（中文页）")
+    check(tries([pass("麥更", rect(0.1, 0.5, 0.05), 0.5)], [pass("BESTA", rect(0.1, 0.9), 0.5)], rects: [region]), "触发：两遍都只盖住一小块")
+    check(tries([], [pass("BESTA", region, 0.3)], rects: [region]), "触发：盖住了，但置信度只有 0.3（读歪的乱码）")
+    check(!tries([], [pass("Hello", rect(0.1, 0.5, 0.17), 0.5)], rects: [region]), "不触发：覆盖 0.85 ≥ 0.8")
+    check(tries([], [pass("Hello", rect(0.1, 0.5, 0.15), 0.5)], rects: [region]), "触发：覆盖 0.75 < 0.8")
+    check(tries([], [pass("Hi", row, 0.5)], rects: []), "触发：没检测到区域、置信度只有 0.5")
+    check(tries([], [pass("Hi", row, 0.65)], rects: []), "触发：没检测到区域、置信度 0.65 < 0.7")
+    check(tries([], [pass("Hi", row, 0.69)], rects: []), "触发：没检测到区域、置信度 0.69 < 0.7")
+    check(!tries([], [pass("Hi", row, 0.7)], rects: []), "不触发：没检测到区域、置信度 0.7")
+    check(!tries([], [pass("Hi", row, 0.3), pass("Yo", other, 1)], rects: []), "不触发：没检测到区域，最高置信度 1")
+    // 不大的图（≤ 2.5 百万像素）里置信度 0.3 的行不算盖住；大图里放宽到 0.3
+    check(tries([], [pass("设置", region, 0.3)], rects: [region], mp: 2.5), "触发：2.5 百万像素还算不大的图，0.3 的行不算盖住")
+    check(!tries([], [pass("设置", region, 0.3)], rects: [region], mp: 2.51), "不触发：超过 2.5 百万像素，0.3 的行算盖住了")
+    check(tries([], [pass("设置", rect(0.1, 0.5, 0.05), 0.3)], rects: [region], mp: 20), "触发：大图里也要盖得住（只盖住 25%）")
+    // 很小的选区一律补；检测器只在需要时才跑
+    check(tries([], [okLine], rects: [region], mp: 0.25), "触发：很小的选区（0.25 百万像素）一律补，哪怕前两遍读得很好")
+    check(!tries([], [okLine], rects: [region], mp: 0.2501), "不触发：比 0.25 百万像素大一点就按覆盖比例判断")
+    var detectorCalls = 0
+    func countingTries(_ chinese: [PassLine]?, _ english: [PassLine]?, mp: Double, chosen: [PassLine], chosenIsChinese: Bool = false, rects: [CGRect] = [region]) -> Bool {
+        shouldTryAutomaticLanguage(chineseFirst: chinese, englishFirst: english, chosen: chosen, chosenIsChinese: chosenIsChinese, megapixels: mp, textRects: { detectorCalls += 1; return rects })
+    }
+    _ = countingTries([], [], mp: 1, chosen: [])
+    _ = countingTries([], [okLine], mp: 0.1, chosen: [okLine])
+    check(detectorCalls == 0, "检测器：很小的选区、两遍都没读到的图用不着它，实际调用 \(detectorCalls) 次")
+    _ = countingTries([], [okLine], mp: 1, chosen: [okLine])
+    check(detectorCalls == 1, "检测器：其余情况调用一次，实际 \(detectorCalls) 次")
+    // 读出的行大多置信度很低（整页外文被读成乱码）：不看覆盖比例也补。
+    // 下面的图文字区域都被盖住（大图里 0.3 的行也算盖住），能触发的只有「低置信度占比」这一条
+    func rows(_ confidences: [Float]) -> [PassLine] {
+        confidences.enumerated().map { pass("Line\($0.offset)", rect(0.1, 0.1 * Double($0.offset) + 0.1, 0.3), $0.element) }
+    }
+    func lowShare(_ lines: [PassLine], chosenIsChinese: Bool = false) -> Bool {
+        detectorCalls = 0
+        let result = countingTries([], lines, mp: 3.34, chosen: lines, chosenIsChinese: chosenIsChinese, rects: lines.map { $0.box })
+        return result && detectorCalls == 0   // 触发了，并且是在调检测器之前就定了
+    }
+    check(lowShare(rows([0.3, 0.3, 0.3, 0.3, 0.3])), "触发：5 行都是 0.3 的乱码（大图里也盖得住）：不用检测器就补")
+    check(lowShare(rows([0.3, 0.3, 0.3, 1])), "触发：4 行里 3 行不到 0.5（占 0.75；正好 4 行就够）")
+    check(lowShare(rows([0.3, 0.3, 0.3, 1, 1])), "触发：5 行里 3 行不到 0.5（占 0.6，正好够）")
+    check(lowShare(rows([0.3, 0.49, 0.3, 1, 1])), "触发：0.49 也算低")
+    check(!lowShare(rows([0.3, 0.3, 1, 1])) && !countingTries([], rows([0.3, 0.3, 1, 1]), mp: 3.34, chosen: rows([0.3, 0.3, 1, 1]), rects: rows([0.3, 0.3, 1, 1]).map { $0.box }), "不触发：4 行里 2 行不到 0.5（占 0.5）")
+    check(!countingTries([], rows([0.3, 0.3, 0.3]), mp: 3.34, chosen: rows([0.3, 0.3, 0.3]), rects: rows([0.3, 0.3, 0.3]).map { $0.box }), "不触发：只有 3 行乱码，不够 4 行（大图里 0.3 的行算盖住了）")
+    check(!countingTries([], rows([0.5, 0.5, 0.5, 0.5, 0.5]), mp: 3.34, chosen: rows([0.5, 0.5, 0.5, 0.5, 0.5]), rects: rows([0.5, 0.5, 0.5, 0.5, 0.5]).map { $0.box }), "不触发：置信度正好 0.5 的行不算「低」")
+    check(!countingTries([], rows([0.3, 0.3, 0.3, 0.3, 0.3]), mp: 3.34, chosen: rows([0.3, 0.3, 0.3, 0.3, 0.3]), chosenIsChinese: true, rects: rows([0.3, 0.3, 0.3, 0.3, 0.3]).map { $0.box }),
+          "不触发：用的是中文优先那遍时不看这一条（带表情的中文菜单行行都是 0.3）")
+    let mixed = rows([0.3, 0.3, 0.3, 0.3, 0.3]) + [pass("08:30 2026/10/31", rect(0.1, 0.8, 0.3), 1)]
+    detectorCalls = 0
+    check(countingTries([], mixed, mp: 0.84, chosen: mixed, rects: []) && detectorCalls == 0, "触发：5 行乱码 + 1 行置信度 1 的日期（检测器 0 块、最高置信度 1 也挡不住）：补")
+    // 时间预算
+    check(canAffordAutomaticPass(firstPassSeconds: 0) && canAffordAutomaticPass(firstPassSeconds: 14.99) && !canAffordAutomaticPass(firstPassSeconds: 15), "时间预算：前两遍用了 15 秒以上就不补第三遍")
+    check(finishesWithin(2) { }, "期限：很快跑完的活在期限内")
+    let waitStarted = Date()
+    check(!finishesWithin(0.05) { Thread.sleep(forTimeInterval: 0.6) } && Date().timeIntervalSince(waitStarted) < 0.4, "期限：超过期限就放手，不等它跑完（用了 \(Date().timeIntervalSince(waitStarted)) 秒）")
+
     if failures.isEmpty {
         print("selftest ok")
         exit(0)
@@ -1100,6 +1666,9 @@ func runSelfTest() -> Never {
 
 let args = CommandLine.arguments
 if args.count >= 2 && args[1] == "--selftest" { runSelfTest() }
+
+/// 辅助程序启动的时刻：第三遍的期限从这里算起（Rust 那边的 60 秒也是从启动算起）
+let processStarted = Date()
 
 guard args.count >= 2,
       let image = NSImage(contentsOfFile: args[1]),
@@ -1114,7 +1683,7 @@ else {
 let width = CGFloat(cg.width)
 let height = CGFloat(cg.height)
 
-// 两遍识别：Vision 以 recognitionLanguages 的第一个语言为主，只放一种顺序总有一头不行（见 `pickRecognition`）。
+// 前两遍：Vision 以 recognitionLanguages 的第一个语言为主，只放一种顺序总有一头不行（见 `pickRecognition`）。
 // 关掉自动语言检测，省一点时间；两种语言都明确给了。
 func makeRequest(languages: [String]) -> VNRecognizeTextRequest {
     let request = VNRecognizeTextRequest()
@@ -1128,8 +1697,20 @@ func makeRequest(languages: [String]) -> VNRecognizeTextRequest {
 let englishFirst = makeRequest(languages: ["en-US", "zh-Hans"])
 let chineseFirst = makeRequest(languages: ["zh-Hans", "en-US"])
 
+/// 第三遍：自动识别语言，只在前两遍没把字读明白时才跑（见 `shouldTryAutomaticLanguage`）。
+/// 日文假名、韩文、阿拉伯文、泰文只有它读得出来。
+/// 语言纠错保持打开：关掉它，日、韩、阿拉伯、泰文的字符错误率不变（调参用的页面与留出的测试页上都一样），这一遍的耗时少四成以上。
+/// 但 Vision 给的置信度整体低了一档（泰文置信度 1.0 的行从 88% 降到 11%），`hasForeignText` 要求的 0.5 就会把少数真外文页挡在门外
+/// （留出的泰文页 60 张里 3–4 张）。要提速，得连同采信的门槛一起重新调、重新量，这次没动。
+func makeAutomaticRequest() -> VNRecognizeTextRequest {
+    let request = makeRequest(languages: ["en-US", "zh-Hans"])
+    request.automaticallyDetectsLanguage = true
+    return request
+}
+
 let handler = VNImageRequestHandler(cgImage: cg, options: [:])
 var performError: Error?
+let firstPassStarted = Date()
 do {
     // 两个请求放在同一次 perform 里；分成两次 perform 并不更快。代价是识别时间变长：典型的小图（360×190 到 1100×780）
     // 约 1.3–2.3 倍（0.35–0.8 秒 → 0.5–1.8 秒）；CPU 时间英文页约 2 倍，中文大图 3–4 倍（旧程序根本读不出那些字，
@@ -1139,6 +1720,8 @@ do {
     // 一个请求失败时 perform 会抛出，但另一个请求的结果已经有了，见 chooseRecognition
     performError = error
 }
+
+let firstPassSeconds = Date().timeIntervalSince(firstPassStarted)
 
 // 像素分析读不出来（极端的图片格式）就不给 bg / fg / ink / room，使用方退回旧做法
 let raster = Raster(cgImage: cg)
@@ -1151,13 +1734,75 @@ func usableLines(_ request: VNRecognizeTextRequest) -> [(VNRecognizedTextObserva
     }
 }
 
-guard let chosen = chooseRecognition(
-    chineseFirst: usableLines(chineseFirst),
-    englishFirst: usableLines(englishFirst),
-    line: { PassLine(text: $0.1.string, box: $0.0.boundingBox, confidence: $0.1.confidence) }
-) else {
+typealias RecognizedLine = (VNRecognizedTextObservation, VNRecognizedText)
+func passLine(_ item: RecognizedLine) -> PassLine {
+    PassLine(text: item.1.string, box: item.0.boundingBox, confidence: item.1.confidence)
+}
+
+let chineseLines = usableLines(chineseFirst)
+let englishLines = usableLines(englishFirst)
+guard var chosen = chooseRecognition(chineseFirst: chineseLines, englishFirst: englishLines, line: passLine) else {
     FileHandle.standardError.write("OCR 失败: \(performError.map { "\($0)" } ?? "没有识别结果")\n".data(using: .utf8)!)
     exit(3)
+}
+
+// 补第三遍：前两遍没把图里的字读明白，而且补的这遍读出了真的日文 / 韩文 / 阿拉伯文 / 泰文，才改用它；
+// 否则 `chosen` 原样不动，输出与补这一遍之前完全一样。
+let chineseForTrigger = chineseLines.map { $0.map(passLine) }
+let englishForTrigger = englishLines.map { $0.map(passLine) }
+let chosenForTrigger = chosen.map(passLine)
+/// 中文优先那遍读出的全部行（不论置信度）：`isExplainedByChinese` 要看它在同一位置读出了哪些汉字，读歪的汉字置信度常常很低
+let chineseEverything: [PassLine] = (chineseFirst.results ?? []).compactMap { observation in
+    observation.topCandidates(1).first.map { PassLine(text: $0.string, box: observation.boundingBox, confidence: $0.confidence) }
+}
+let megapixels = Double(width * height) / 1_000_000
+
+/// 文字区域检测器：独立一次 perform，不碰前两遍。只在触发条件需要它时才跑（见 `shouldTryAutomaticLanguage`）
+var detectedRectCount = -1
+func detectTextRects() -> [CGRect] {
+    let detector = VNDetectTextRectanglesRequest()
+    let rects = (try? handler.perform([detector])) != nil ? (detector.results ?? []).map { $0.boundingBox } : []
+    detectedRectCount = rects.count
+    return rects
+}
+
+let environment = ProcessInfo.processInfo.environment
+// 仅供测试：SENSE_OCR_PASSES=2 只做前两遍、不补第三遍——用来核对「中文、英文截图补了第三遍也不改输出」
+let thirdPassAllowed = environment["SENSE_OCR_PASSES"] != "2"
+// 仅供测试：SENSE_OCR_THIRD_PASS_BUDGET_MS 把第三遍的期限改成这么多毫秒——用来走「超时放弃」那条路
+let thirdPassBudgetOverride = environment["SENSE_OCR_THIRD_PASS_BUDGET_MS"].flatMap(Double.init).map { $0 / 1000 }
+
+/// 第三遍在后台线程里跑，结果交回来：线程写、等到信号之后主线程读
+final class AutomaticPassOutcome: @unchecked Sendable {
+    var performed = false
+}
+
+var usedAutomatic = false
+var automaticTimedOut = false
+let triedAutomatic = thirdPassAllowed && canAffordAutomaticPass(firstPassSeconds: firstPassSeconds)
+    && shouldTryAutomaticLanguage(
+        chineseFirst: chineseForTrigger, englishFirst: englishForTrigger,
+        chosen: chosenForTrigger, chosenIsChinese: chineseForTrigger == chosenForTrigger,
+        megapixels: megapixels, textRects: detectTextRects
+    )
+if triedAutomatic {
+    let automatic = makeAutomaticRequest()
+    let outcome = AutomaticPassOutcome()
+    // 剩下的时间在这里才量：前面的检测器也要花时间
+    let budget = thirdPassBudgetOverride ?? max(0, automaticPassDeadlineSeconds - Date().timeIntervalSince(processStarted))
+    if finishesWithin(budget, { outcome.performed = (try? handler.perform([automatic])) != nil }) {
+        if outcome.performed,
+           let lines = usableLines(automatic),
+           hasForeignText(lines.map(passLine), imageHeight: Double(height), tiny: megapixels <= tinyImageMaxMegapixels, chineseFirst: chineseEverything, englishFirst: englishForTrigger ?? []) {
+            chosen = lines
+            usedAutomatic = true
+        }
+    } else {
+        automaticTimedOut = true
+    }
+}
+if environment["SENSE_OCR_TRACE"] != nil {
+    FileHandle.standardError.write("trace: rects=\(detectedRectCount) triedAutomatic=\(triedAutomatic) usedAutomatic=\(usedAutomatic) timedOut=\(automaticTimedOut)\n".data(using: .utf8)!)
 }
 
 var out: [[String: Any]] = []
@@ -1214,6 +1859,7 @@ for (observation, candidate) in chosen {
         if let ink = style.ink {
             line["ink"] = ["x": ink.x, "y": ink.y, "w": ink.w, "h": ink.h]
             line["room"] = style.room
+            line["room_left"] = style.roomLeft
         }
         if let cover = style.cover { line["cover"] = ["x": cover.x, "y": cover.y, "w": cover.w, "h": cover.h] }
     }

@@ -253,10 +253,14 @@ function TextView({ plan, translated }: { plan: BlockPlan; translated: boolean }
       data-role="text"
       data-size={plan.fontSize}
       data-truncated={plan.truncated ? "true" : undefined}
+      data-anchor={plan.anchor}
       className="absolute"
       style={{
         left: plan.x,
         top: plan.y,
+        // 从右往左的原文：文字框的右边缘贴着 x，各行靠右
+        transform: plan.anchor === "right" ? "translateX(-100%)" : undefined,
+        textAlign: plan.anchor === "right" ? "right" : undefined,
         fontSize: plan.fontSize,
         lineHeight: `${plan.lineHeight}px`,
         color: plan.fg,
@@ -264,8 +268,9 @@ function TextView({ plan, translated }: { plan: BlockPlan; translated: boolean }
         opacity: translated ? 1 : 0.82,
       }}
     >
+      {/* dir 由目标语言定（见 textDirection）：阿拉伯语、希伯来语的译文从右往左，括号、句点、夹着的英文才不会跑到错的一边；其余照旧从左往右 */}
       {plan.lines.map((line, index) => (
-        <div key={index} style={{ height: plan.lineHeight }}>
+        <div key={index} dir={plan.dir} style={{ height: plan.lineHeight }}>
           {line}
         </div>
       ))}

@@ -95,6 +95,12 @@ export type OverlayBlock = {
   cover?: OverlayRect | null;
   /** 笔画右边的空白宽度，0 = 不知道或没有 */
   room?: number | null;
+  /** 笔画左边的空白宽度：从右往左的原文（阿拉伯文、希伯来文）的译文往这边延伸 */
+  room_left?: number | null;
+  /** 原文是从右往左的文字：译文顶着笔画的右边起笔、往左边的空白里延伸 */
+  rtl?: boolean;
+  /** 目标语言是从右往左的（阿拉伯语、希伯来语）：译文每一行按从右往左排版 */
+  target_rtl?: boolean;
   /** 原文的逐词宽度 */
   words?: OverlayWord[];
 };

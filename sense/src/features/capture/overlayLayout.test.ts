@@ -18,6 +18,7 @@ import {
   planOverlay,
   sanitizeBlocks,
   snapSizes,
+  textDirection,
   weightedMedian,
   wrapText,
   type Measure,
@@ -317,6 +318,110 @@ describe("排一块译文", () => {
   it("字号被夹在 9–72 之间", () => {
     expect(planBlock(base, 2, ruler, BOUNDS).fontSize).toBe(9);
     expect(planBlock(base, 500, ruler, { w: 4000, h: 3000 }).fontSize).toBeLessThanOrEqual(72);
+  });
+});
+
+describe("从右往左的原文（阿拉伯文、希伯来文）：译文顶着笔画的右边，往左边的空白里延伸", () => {
+  // 笔画 x 从 200 到 296（宽 96），左边 200 像素的空白、右边紧贴着容器的边（room 0）
+  const ink = { x: 200, y: 22, w: 96, h: 12 };
+  const rtl = block({ ink, bg: "#ffffff", fg: "#222222", room: 0, room_left: 200, lines: 1, rtl: true, text: "Settings" });
+  const LONG = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // 13px 下宽 169，比笔画（96）宽
+
+  it("从笔画的右边缘起笔：anchor 是 right，x 是笔画的右边", () => {
+    const plan = planBlock(rtl, 13, ruler, BOUNDS);
+    expect(plan.anchor).toBe("right");
+    expect(plan.x).toBe(296);
+  });
+
+  it("译文比原文长：往左边的空白里延伸，字号不变（右边没有空白，从左往右的原文这里要缩小）", () => {
+    const plan = planBlock({ ...rtl, text: LONG }, 13, ruler, BOUNDS);
+    expect(plan.fontSize).toBe(13);
+    expect(plan.lines).toEqual([LONG]);
+    expect(plan.truncated).toBe(false);
+    const sameWithoutRtl = planBlock({ ...rtl, text: LONG, rtl: false }, 13, ruler, BOUNDS);
+    expect(sameWithoutRtl.fontSize, "对照：同样的数据不是从右往左的原文，右边没有空白就只能缩小").toBeLessThan(13);
+    expect(sameWithoutRtl.anchor).toBe("left");
+    expect(sameWithoutRtl.x).toBe(200);
+  });
+
+  it("左边也没有空白（room_left 是 0）：缩小字号，缩到底还放不下才截断并标出来；右边的空白不能拿来用", () => {
+    const plan = planBlock({ ...rtl, text: LONG, room: 500, room_left: 0 }, 13, ruler, BOUNDS);
+    expect(plan.fontSize).toBeLessThan(13);
+    expect(plan.truncated).toBe(true);
+    expect(plan.lines[0].endsWith("…")).toBe(true);
+  });
+
+  it("空白再大，也不会伸出窗口的左边，并且和右边一样留 2 像素", () => {
+    const edge = block({ ...rtl, ink: { x: 20, y: 22, w: 90, h: 12 }, text: LONG, room_left: 5000 });
+    const plan = planBlock(edge, 13, ruler, BOUNDS);
+    const width = Math.max(...plan.lines.map((line) => ruler(line, plan.fontSize)));
+    expect(plan.x - width).toBeGreaterThanOrEqual(2 - 1e-6);
+    expect(plan.x).toBe(110);
+    // 正好卡在边上：13px 下宽 109.2（≤ 笔画右边缘 110，> 110 − 2），顶到窗口边的话字号不用缩；留 2 像素就得缩一点
+    const snug = planBlock({ ...edge, text: "ABCDEFGHIJK  一 二" }, 13, ruler, BOUNDS);
+    expect(ruler("ABCDEFGHIJK  一 二", 13)).toBeCloseTo(109.2, 6);
+    expect(snug.fontSize).toBeLessThan(13);
+    expect(snug.x - Math.max(...snug.lines.map((line) => ruler(line, snug.fontSize)))).toBeGreaterThanOrEqual(2 - 1e-6);
+  });
+
+  it("room_left 缺省 / 为负 / NaN：当没有空白，不出错", () => {
+    for (const bad of [undefined, null, -30, Number.NaN]) {
+      const plan = planBlock({ ...rtl, text: LONG, room_left: bad }, 13, ruler, BOUNDS);
+      expect(plan.anchor).toBe("right");
+      expect(Number.isFinite(plan.x) && Number.isFinite(plan.y)).toBe(true);
+      expect(plan.fontSize).toBeLessThan(13);
+    }
+  });
+
+  it("多行的段落：不往空白里延伸，按段宽折行，仍顶着右边", () => {
+    const paragraph = block({ ...rtl, text: "一".repeat(12), ink: { x: 200, y: 20, w: 52, h: 52.35 }, lines: 3, room_left: 500 });
+    const plan = planBlock(paragraph, 13, ruler, BOUNDS);
+    expect(plan.lines).toEqual(["一一一一", "一一一一", "一一一一"]);
+    expect(plan.anchor).toBe("right");
+    expect(plan.x).toBe(252);
+  });
+
+  it("不是从右往左的原文（缺省或 false）：照旧从左边起笔，room_left 不参与", () => {
+    for (const flag of [undefined, false]) {
+      const plan = planBlock({ ...rtl, rtl: flag, room: 200, room_left: 0, text: LONG }, 13, ruler, BOUNDS);
+      expect(plan.anchor).toBe("left");
+      expect(plan.x).toBe(200);
+      expect(plan.fontSize).toBe(13);
+    }
+  });
+
+  it("兜底排版（plainPlan）永远从左边起笔", () => {
+    expect(plainPlan({ ...rtl }, BOUNDS).anchor).toBe("left");
+  });
+});
+
+describe("textDirection：每一行的排版方向由目标语言定，不靠首个强字符猜", () => {
+  it("译成了：看目标语言是不是从右往左（阿拉伯语、希伯来语），和原文的方向无关", () => {
+    expect(textDirection({ translated: true, target_rtl: true, rtl: false })).toBe("rtl"); // 中文页译成阿拉伯语
+    expect(textDirection({ translated: true, target_rtl: false, rtl: true })).toBe("ltr"); // 阿拉伯文页译成中文
+    expect(textDirection({ translated: true, target_rtl: true, rtl: true })).toBe("rtl");
+    expect(textDirection({ translated: true, target_rtl: false, rtl: false })).toBe("ltr");
+  });
+
+  it("没译成（画的是识别出的原文）：看原文的方向", () => {
+    expect(textDirection({ translated: false, target_rtl: true, rtl: false })).toBe("ltr");
+    expect(textDirection({ translated: false, target_rtl: false, rtl: true })).toBe("rtl");
+  });
+
+  it("旧版后端（没有这两个字段）、字段类型不对：从左往右，和以前一样", () => {
+    expect(textDirection({})).toBe("ltr");
+    expect(textDirection({ translated: true })).toBe("ltr");
+    expect(textDirection({ translated: true, target_rtl: "yes" as unknown as boolean })).toBe("ltr");
+    expect(textDirection({ translated: "yes" as unknown as boolean, target_rtl: true, rtl: false })).toBe("ltr");
+  });
+
+  it("planBlock / plainPlan 把方向带进排版结果", () => {
+    const base = block({ ink: { x: 20, y: 22, w: 90, h: 12 }, bg: "#ffffff", fg: "#222222", room: 0, lines: 1 });
+    expect(planBlock(base, 13, ruler, BOUNDS).dir).toBe("ltr");
+    expect(planBlock({ ...base, target_rtl: true }, 13, ruler, BOUNDS).dir).toBe("rtl");
+    expect(planBlock({ ...base, target_rtl: true, translated: false }, 13, ruler, BOUNDS).dir).toBe("ltr");
+    expect(plainPlan({ ...base, target_rtl: true }, BOUNDS).dir).toBe("rtl");
+    expect(plainPlan(null, BOUNDS).dir).toBe("ltr");
   });
 });
 

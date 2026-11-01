@@ -13,6 +13,8 @@ const plan = (overrides: Partial<BlockPlan> = {}): BlockPlan => ({
   lines: ["新建任务"],
   x: 12,
   y: 19,
+  anchor: "left",
+  dir: "ltr",
   truncated: false,
   ...overrides,
 });
@@ -65,8 +67,30 @@ describe("OverlayLayers：覆盖层的画层", () => {
   it("多行译文一行一个元素，浏览器不再自己折行", () => {
     const html = renderToStaticMarkup(<OverlayLayers blocks={[block()]} plans={[plan({ lines: ["第一行", "第二行", "第三行"], lineHeight: 20 })]} />);
     expect(html).toContain("white-space:pre");
-    expect(count(html, '<div style="height:20px">')).toBe(3); // 每行一个固定行高的元素（外层的 line-height 不算）
+    expect(count(html, '<div dir="ltr" style="height:20px">')).toBe(3); // 每行一个固定行高的元素（外层的 line-height 不算）
     for (const text of ["第一行", "第二行", "第三行"]) expect(html).toContain(text);
+  });
+
+  it("从右往左的原文：文字框的右边缘贴着 x（translateX(-100%)）、各行靠右；其余照旧从左边起笔", () => {
+    const right = renderToStaticMarkup(<OverlayLayers blocks={[block()]} plans={[plan({ anchor: "right", x: 296 })]} />);
+    expect(right).toContain('data-anchor="right"');
+    expect(right).toContain("left:296px");
+    expect(right).toContain("transform:translateX(-100%)");
+    expect(right).toContain("text-align:right");
+    const left = renderToStaticMarkup(<OverlayLayers blocks={[block()]} plans={[plan()]} />);
+    expect(left).toContain('data-anchor="left"');
+    expect(left).not.toContain("translateX");
+    expect(left).not.toContain("text-align");
+  });
+
+  it("每一行的 dir 由排版结果定（目标语言），不再用 dir=auto 去猜首个强字符", () => {
+    const lines = ["Wi-Fi متصل (2)", "iCloud: تم الحفظ."]; // 以拉丁品牌名开头的阿拉伯文：dir=auto 会判成从左往右，括号、句点跑到错的一边
+    const rtl = renderToStaticMarkup(<OverlayLayers blocks={[block()]} plans={[plan({ lines, dir: "rtl" })]} />);
+    expect(count(rtl, 'dir="rtl"')).toBe(2);
+    expect(rtl).not.toContain('dir="auto"');
+    const ltr = renderToStaticMarkup(<OverlayLayers blocks={[block()]} plans={[plan({ lines })]} />);
+    expect(count(ltr, 'dir="ltr"')).toBe(2);
+    expect(ltr).not.toContain('dir="auto"');
   });
 
   it("被截断的译文如实标出来（data-truncated），不让半截译文冒充完整的", () => {

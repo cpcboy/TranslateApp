@@ -91,6 +91,9 @@ struct OcrLine {
     /// 笔画右边到下一个非底色像素的空白宽度
     #[serde(default)]
     room: Option<f64>,
+    /// 笔画左边的空白宽度：从右往左的文字（阿拉伯文、希伯来文）的译文往这边延伸
+    #[serde(default)]
+    room_left: Option<f64>,
     /// 允许遮盖的范围：笔画外扩一点，每一侧只扩到下一个非底色像素为止（不会盖到隔壁的色块、分隔线上）
     #[serde(default)]
     cover: Option<OcrInk>,
@@ -165,6 +168,14 @@ pub struct Block {
     /// 笔画右边的空白宽度；None = 没量到（0 是「量到了，紧贴着别的东西」）。
     /// 译文比原文长时可以往这片空白里延伸，不必缩小字号
     pub room: Option<f64>,
+    /// 笔画左边的空白宽度，含义同 `room`，方向相反；没量到是 None
+    pub room_left: Option<f64>,
+    /// 原文是从右往左的文字（阿拉伯文、希伯来文）：译文要顶着笔画的右边起笔、往左边的空白里延伸
+    pub rtl: bool,
+    /// 目标语言是从右往左的（阿拉伯语、希伯来语）：译文每一行按从右往左排版。
+    /// 由目标语言定，不让浏览器按首个强字符去猜——阿拉伯文译文以 `Wi-Fi`、`iCloud` 这样的品牌名开头很常见，猜成从左往右，括号、句点就跑到错的一边。
+    /// 没译成（画的是识别出的原文）时覆盖层不看它，看 `rtl`
+    pub target_rtl: bool,
     /// 原文的逐词宽度，前端靠它反推原文的字号
     pub words: Vec<Word>,
 }
@@ -178,6 +189,14 @@ impl Block {
             rect.x += dx;
             rect.y += dy;
         }
+    }
+}
+
+/// 把目标语言的书写方向记到每一块上（译文要按这个方向排版，见 `Block::target_rtl`）。
+fn set_target_direction(blocks: &mut [Block], target: &Lang) {
+    let rtl = lang::is_rtl(target.code);
+    for block in blocks {
+        block.target_rtl = rtl;
     }
 }
 
@@ -634,7 +653,7 @@ pub async fn run_with_image(
     // 翻译失败也把原文盖上去，至少让用户看到识别结果；
     // 但失败原因必须一起交给覆盖层，不能让原文冒充译文。
     let mut failure = None;
-    match capture_target(&blocks, load_pref(app)) {
+    match choose_target(&mut blocks, load_pref(app)) {
         Some(target) => {
             if let Err(err) = translate_blocks(app, &mut blocks, target.name).await {
                 eprintln!("[sense] 截图翻译失败：{err}");
@@ -837,7 +856,8 @@ fn ocr_binary() -> Result<PathBuf, String> {
 /// OCR 子进程最多跑这么久，超时就杀掉并如实报错：一直卡着的话，这次截屏会悄无声息地没有下文。
 ///
 /// 辅助程序对每张图做两遍识别，中文的大图更慢：5120×2880 的密集中文页在 M4 上要 12 秒左右，慢两倍多的机器就逼近 30 秒了，
-/// 所以放宽到 60 秒——这个上限防的是卡死，不是慢。
+/// 所以放宽到 60 秒——这个上限防的是卡死，不是慢。前两遍没读明白的图（日文、韩文、阿拉伯文、泰文……）还要补第三遍，
+/// 但前两遍已经花了 20 秒以上时辅助程序自己就不补了（`canAffordAutomaticPass`）；第三遍与前两遍里较慢的那遍差不多贵，所以最坏约 20 + 20 秒，仍在这个上限之内。
 const OCR_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 跑一个子进程，带超时；返回 (是否成功退出, stdout, stderr)。
@@ -908,6 +928,24 @@ fn run_ocr(png: &Path) -> Result<Vec<OcrLine>, String> {
     serde_json::from_slice::<Vec<OcrLine>>(&stdout).map_err(|err| format!("OCR 输出解析失败：{err}"))
 }
 
+/// 这个字符属于从右往左的文字（希伯来文、阿拉伯文，含它们的扩展与表现形式）。
+fn is_rtl_char(ch: char) -> bool {
+    matches!(ch as u32, 0x0590..=0x05FF | 0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF)
+}
+
+/// 文字是不是从右往左的：这两种文字的字母过半。数字、标点、夹在中间的拉丁字母（`Wi-Fi`、`iCloud`）不影响——
+/// 阿拉伯文、希伯来文的界面里夹英文品牌名是常态，整行仍然是从右往左排的。
+fn is_rtl_text(text: &str) -> bool {
+    let (mut rtl, mut letters) = (0usize, 0usize);
+    for ch in text.chars().filter(|ch| ch.is_alphabetic()) {
+        letters += 1;
+        if is_rtl_char(ch) {
+            rtl += 1;
+        }
+    }
+    letters > 0 && rtl * 2 > letters
+}
+
 /// 一行已经把话说完了的末尾字符：英文那套「明显被折断」的判据靠它认出独立的两句话（终端输出、代码、列表），
 /// 中文折行（`zh_wrap`）判「上一行说完了」时也先看它。
 const SENTENCE_END: &str = ".!?。！？:：;；$>|/\\）)】]」』";
@@ -939,6 +977,7 @@ fn merge_lines(lines: &[OcrLine], scale: f64) -> Vec<Block> {
         let ink = scaled_rect(line.ink, scale);
         let cover = scaled_rect(line.cover, scale);
         let room = line.room.filter(|value| value.is_finite() && *value >= 0.0).map(|value| value / scale);
+        let room_left = line.room_left.filter(|value| value.is_finite() && *value >= 0.0).map(|value| value / scale);
         let words = || {
             line.words
                 .iter()
@@ -997,12 +1036,15 @@ fn merge_lines(lines: &[OcrLine], scale: f64) -> Vec<Block> {
             last.ink = union_all(last.ink, ink);
             last.cover = union_all(last.cover, cover);
             last.room = min_known(last.room, room);
+            last.room_left = min_known(last.room_left, room_left);
             block_of.push(position);
             continue;
         }
 
         block_of.push(blocks.len());
         blocks.push(Block {
+            rtl: is_rtl_text(&text),
+            target_rtl: false,
             text,
             x,
             y,
@@ -1017,6 +1059,7 @@ fn merge_lines(lines: &[OcrLine], scale: f64) -> Vec<Block> {
             ink,
             cover,
             room,
+            room_left,
             words: words(),
         });
     }
@@ -1031,11 +1074,19 @@ fn merge_lines(lines: &[OcrLine], scale: f64) -> Vec<Block> {
 /// 手选了别的语言就译成它（原文本身就是那种语言时退回默认）。
 /// 一个字母都没有（只有数字、符号）返回 None，没什么可译的。
 ///
-/// 识别（OCR）本身目前只读中英文，其它语言的截图读不准——这是 OCR 的限制，不是翻译这边的。
+/// 能不能把图里的字读出来是 OCR 的事（`tools/ocr.swift`），不是翻译这边的：拉丁字母、西里尔字母的页面（法、德、西、葡、意、荷、波、土、印尼、越南、俄、乌克兰）
+/// 前两遍就读得出来，日文假名、韩文、阿拉伯文、泰文靠补的第三遍（自动识别语言）；希伯来文、印地文、希腊文 Vision 不支持，读出来是乱码。
 fn capture_target(blocks: &[Block], pref: &str) -> Option<&'static Lang> {
     let sample: String = blocks.iter().map(|block| block.text.as_str()).collect::<Vec<_>>().join(" ");
     let plan = lang::plan(&sample, pref);
     plan.source.letters.then_some(plan.target)
+}
+
+/// 定目标语言（`capture_target`），并把它的书写方向记到每一块上（`set_target_direction`）：覆盖层靠它给译文定方向。
+fn choose_target(blocks: &mut [Block], pref: &str) -> Option<&'static Lang> {
+    let target = capture_target(blocks, pref)?;
+    set_target_direction(blocks, target);
+    Some(target)
 }
 
 /// 一次请求翻译全部块，顺序对齐；失败就保留原文。
@@ -1246,6 +1297,77 @@ mod tests {
                 Word { t: "task".into(), w: 36.0 },
             ]
         );
+    }
+
+    #[test]
+    fn the_left_room_is_carried_in_logical_pixels_and_merged_like_the_right_room() {
+        // 从右往左的文字：空白在笔画的左边。辅助程序给 room_left（图片像素），换算和合并方式与 room 一样
+        let raw = r#"[{"text":"Hello world,","x":10,"y":20,"w":100,"h":16,"conf":1,"room":8,"room_left":410},
+                       {"text":"and more","x":10,"y":38,"w":90,"h":16,"conf":1,"room":20,"room_left":120}]"#;
+        let lines: Vec<OcrLine> = serde_json::from_str(raw).expect("新格式要能解析");
+        let blocks = merge_lines(&lines, 2.0);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!((blocks[0].room, blocks[0].room_left), (Some(4.0), Some(60.0)), "两边各取各行里最窄的，按 2 倍图换算");
+        // 旧版辅助程序没有这个字段：当没量到
+        let old: Vec<OcrLine> = serde_json::from_str(r#"[{"text":"hi","x":1,"y":2,"w":30,"h":10,"conf":1,"room":5}]"#).unwrap();
+        assert_eq!(merge_lines(&old, 1.0)[0].room_left, None);
+        // 负数、非有限数没有意义，当没量到；量到的 0 要保留（紧贴着别的东西）
+        let bad = |value: &str| -> Option<f64> {
+            let raw = format!(r#"[{{"text":"hi","x":1,"y":2,"w":30,"h":10,"conf":1,"room_left":{value}}}]"#);
+            merge_lines(&serde_json::from_str::<Vec<OcrLine>>(&raw).unwrap(), 1.0)[0].room_left
+        };
+        assert_eq!((bad("-4"), bad("0"), bad("null")), (None, Some(0.0), None));
+    }
+
+    #[test]
+    fn right_to_left_text_is_flagged_on_the_block_from_its_original_text() {
+        let flag = |text: &str| merge_lines(&[line(text, 10.0, 10.0, 100.0, 16.0)], 1.0)[0].rtl;
+        assert!(flag("الإعدادات"), "阿拉伯文");
+        assert!(flag("הגדרות"), "希伯来文");
+        assert!(flag("Wi-Fi الشبكة"), "夹着英文品牌名的阿拉伯文：拉丁字母 4 个、阿拉伯字母 6 个，仍是从右往左");
+        assert!(flag("إعدادات 12:30 ٣٠٪"), "数字、标点不算");
+        assert!(!flag("Settings"), "英文");
+        assert!(!flag("设置与偏好"), "中文");
+        assert!(!flag("設定 Wi-Fi"), "日文");
+        assert!(!flag("설정"), "韩文");
+        assert!(!flag("Настройки"), "西里尔字母是从左往右的");
+        assert!(!flag("Settings الشبكة"), "拉丁字母 8 个、阿拉伯字母 6 个：不过半");
+        assert!(!flag("12:30 !!"), "没有字母");
+        assert!(flag("ا"), "只有一个阿拉伯字母也是从右往左");
+        assert!(flag("ࢠࢡࢢ"), "阿拉伯文扩展 A（U+08A0 起）");
+        assert!(flag("ݐݑݒ"), "阿拉伯文补充（U+0750 起）");
+        assert!(flag("ﭐﻉﻊ"), "阿拉伯文的表现形式（U+FB50 起、U+FE70 起）");
+        assert!(flag("\u{FB2A}\u{FB2B}"), "希伯来文的表现形式（U+FB1D 起，预组合的带点 שׁ שׂ）");
+        assert!(flag("\u{06CC}\u{06D5}\u{06FF}"), "阿拉伯文主区间靠后的字母（波斯文 ی、库尔德文 ە、U+06FF）");
+        assert!(!flag("abc ابج"), "拉丁字母 3 个、阿拉伯字母 3 个：要过半，平局不算");
+        assert!(flag("abc ابجد"), "拉丁字母 3 个、阿拉伯字母 4 个：过半");
+    }
+
+    #[test]
+    fn every_block_records_whether_the_target_language_is_right_to_left() {
+        // 译文每一行的排版方向由目标语言定（阿拉伯语、希伯来语从右往左），和原文的方向无关：中文页译成阿拉伯语也是从右往左
+        let fresh = || merge_lines(&[line("设置", 10.0, 10.0, 40.0, 16.0), line("通知", 10.0, 40.0, 40.0, 16.0)], 1.0);
+        let mut blocks = fresh();
+        assert!(blocks.iter().all(|block| !block.target_rtl), "刚合出来的块默认从左往右");
+        for (pref, expected_code, rtl) in [("ar", "ar", true), ("he", "he", true), ("en", "en", false), (lang::AUTO, "en", false), ("ja", "ja", false)] {
+            let mut blocks = fresh();
+            let target = choose_target(&mut blocks, pref).expect("中文页有目标语言");
+            assert_eq!(target.code, expected_code, "偏好 {pref}");
+            assert!(blocks.len() == 2 && blocks.iter().all(|block| block.target_rtl == rtl), "偏好 {pref}：target_rtl 应为 {rtl}");
+        }
+        // 原文是阿拉伯文、目标是中文：块的 rtl（原文方向）为 true，target_rtl 为 false
+        let mut arabic = merge_lines(&[line("الإعدادات", 10.0, 10.0, 80.0, 16.0)], 1.0);
+        assert_eq!(choose_target(&mut arabic, lang::AUTO).map(|lang| lang.code), Some("zh"));
+        assert!(arabic[0].rtl && !arabic[0].target_rtl, "原文从右往左、译文是中文");
+        // 一个字母都没有：没有目标语言，不动块
+        let mut digits = merge_lines(&[line("12:30", 10.0, 10.0, 40.0, 16.0)], 1.0);
+        assert!(choose_target(&mut digits, "ar").is_none() && !digits[0].target_rtl);
+        // 换回英语要清掉，不能留着上一次的
+        set_target_direction(&mut blocks, lang::lang_by_code("ar").unwrap());
+        set_target_direction(&mut blocks, lang::lang_by_code("en").unwrap());
+        assert!(blocks.iter().all(|block| !block.target_rtl));
+        let json = serde_json::to_value(&blocks[0]).unwrap();
+        assert_eq!(json["target_rtl"], false, "序列化的字段名是 target_rtl（前端 OverlayBlock 靠它）");
     }
 
     #[test]
@@ -1712,6 +1834,28 @@ mod tests {
         run_ocr(&png).expect("识别要能跑完")
     }
 
+    /// 直接跑辅助程序一次，可带环境变量：返回 stdout 解析成的 JSON 和 stderr（带 `SENSE_OCR_TRACE=1` 时里面有 trace 行）。
+    /// 比较两次运行时比的是解析后的整个 JSON（置信度、逐词框、像素分析全在里面），不是关键字。
+    fn sidecar_run(fixture: &str, envs: &[(&str, &str)]) -> (serde_json::Value, String) {
+        let png = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(fixture);
+        assert!(png.exists(), "缺测试图片 {}", png.display());
+        let mut command = Command::new(ocr_binary().expect("找得到 sense-ocr"));
+        command.arg(&png).envs(envs.iter().copied());
+        let (ok, stdout, stderr) = run_with_timeout(command, OCR_TIMEOUT).expect("识别要能跑完");
+        let stderr = String::from_utf8_lossy(&stderr).to_string();
+        assert!(ok, "{fixture}：辅助程序失败：{stderr}");
+        (serde_json::from_slice(&stdout).unwrap_or_else(|err| panic!("{fixture}：输出不是 JSON：{err}")), stderr)
+    }
+
+    /// 只做前两遍（`SENSE_OCR_PASSES=2`，仅供测试）时的输出
+    fn two_pass_run(fixture: &str) -> serde_json::Value {
+        sidecar_run(fixture, &[("SENSE_OCR_PASSES", "2")]).0
+    }
+
+    fn third_pass_used(trace: &str) -> bool {
+        trace.contains("usedAutomatic=true")
+    }
+
     fn joined(lines: &[OcrLine]) -> String {
         lines.iter().map(|line| line.text.as_str()).collect::<Vec<_>>().join("\n")
     }
@@ -1776,6 +1920,24 @@ mod tests {
     }
 
     #[test]
+    fn real_ocr_keeps_short_chinese_selections_made_of_katakana_lookalikes_as_chinese() {
+        // 有十几个汉字长得和片假名一模一样（`力` `カ`、`才` `オ`、`八` `ハ`、`一` `ー`）：第三遍（自动识别语言）会把只有两三个字的中文选区
+        // 读成置信度 1.0 的 `オー`、`カー`——翻译方向从「中→英」变成「日→中」，读到的东西也不对。
+        // 这三张是评审时抓到的：`才一`（2 倍）、`@力一`（提及一个叫「力一」的人，2 倍）、`力一 八一`（1 倍）。
+        if real_sidecar().is_none() {
+            return;
+        }
+        for (fixture, expected, scale) in [("ocr-zh-lookalike-1.png", "才一", 2.0), ("ocr-zh-lookalike-2.png", "力一", 2.0), ("ocr-zh-lookalike-3.png", "八一", 1.0)] {
+            let lines = recognized_lines(fixture);
+            let text = joined(&lines);
+            assert!(text.contains(expected), "{fixture}：要读成汉字「{expected}」：\n{text}");
+            let kana = count_chars(&text, &['\u{3041}'..='\u{3096}', '\u{30a1}'..='\u{30fa}']);
+            assert_eq!(kana, 0, "{fixture}：读成了假名：\n{text}");
+            assert_eq!(target_of(&lines, scale), Some("en"), "{fixture}：中文选区要译成英文：\n{text}");
+        }
+    }
+
+    #[test]
     fn real_ocr_reads_a_chinese_menu_decorated_with_emoji() {
         // 每行都夹着表情符号的中文菜单：Vision 给每一行的置信度都是 0.3（表情把识别拖低了），
         // 单看置信度会把它当成图标读歪的杂音。要靠「弱证据行多、汉字多」才认得出来（ocr.swift 的 `pickRecognition`）
@@ -1790,6 +1952,189 @@ mod tests {
             .count();
         assert!(found >= 4, "只读出了 {found} 个菜单项，中文菜单要读得出来：\n{text}");
         assert_eq!(translate_target(&merge_lines(&lines, 1.0)), Some("英文"), "中文菜单要译成英文：\n{text}");
+    }
+
+    /// 把识别出的行合成块，再看译成什么语言（默认方向：中文以外的页面译成中文）。
+    fn target_of(lines: &[OcrLine], scale: f64) -> Option<&'static str> {
+        capture_target(&merge_lines(lines, scale), lang::AUTO).map(|lang| lang.code)
+    }
+
+    fn count_chars(text: &str, ranges: &[std::ops::RangeInclusive<char>]) -> usize {
+        text.chars().filter(|ch| ranges.iter().any(|range| range.contains(ch))).count()
+    }
+
+    #[test]
+    fn real_ocr_reads_a_japanese_screenshot() {
+        // 日文假名在中文优先、英文优先那两遍里读成乱码或者直接丢掉（旧程序读出 7 行：`通知 許可`、`保存`……），
+        // 补的第三遍（自动识别语言）才读得出来。2 倍图，一页设置：侧栏 + 标题 + 三行「标题 + 说明」+ 两个按钮。
+        if real_sidecar().is_none() {
+            return;
+        }
+        let lines = recognized_lines("ocr-ja-settings.png");
+        let text = joined(&lines);
+        for expected in ["通知の設定", "プライバシー", "キーボード", "サウンド", "キャンセル", "お知らせします"] {
+            assert!(text.contains(expected), "识别结果里没有「{expected}」：\n{text}");
+        }
+        let kana = count_chars(&text, &['\u{3041}'..='\u{3096}', '\u{30a1}'..='\u{30fa}']);
+        assert!(kana >= 40, "假名只读出 {kana} 个：\n{text}");
+        assert_eq!(target_of(&lines, 2.0), Some("zh"), "日文页要译成中文：\n{text}");
+    }
+
+    #[test]
+    fn real_ocr_lines_of_a_wrapped_japanese_paragraph_are_merged_conservatively_and_never_across_paragraphs() {
+        // 日文折行：中文折行判据（`zh_wrap`）对日文照样起作用——汉字 + 假名按「中文为主」算，`。` 算正文标点；
+        // 但日文的逗号 `、` 和中文的顿号一样不算，所以句中没有 `。` 的头一对常常合不上。要点是「宁可漏合、不可错合」：
+        // 标题、脚注自己一块，段落之间不会被并成一块。（日文页上量过：68 页 716 对折行合并了 51%，0 次误合并，见 CHANGELOG。）
+        if real_sidecar().is_none() {
+            return;
+        }
+        let lines = recognized_lines("ocr-ja-paragraph.png");
+        let text = joined(&lines);
+        assert!(lines.len() >= 7, "日文段落要读成一行行的：\n{text}");
+        let blocks = merge_lines(&lines, 2.0);
+        assert!(blocks.len() < lines.len(), "至少有一对折行被合并了：{} 行 {} 块\n{text}", lines.len(), blocks.len());
+        let first = |needle: &str| blocks.iter().position(|block| block.text.contains(needle)).unwrap_or_else(|| panic!("没有包含「{needle}」的块：\n{text}"));
+        let (title, paragraph_one, paragraph_two, footnote) = (first("通知センターについて"), first("新しいメッセージ"), first("アプリごとに"), first("次回の起動時"));
+        let mut distinct = vec![title, paragraph_one, paragraph_two, footnote];
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 4, "标题、两段正文、脚注要分在四个不同的块里：\n{text}");
+        for block in &blocks {
+            assert!(!(block.text.contains("通知センターについて") && block.text.contains("新しいメッセージ")), "标题并进了正文：{}", block.text);
+            assert!(!(block.text.contains("ことができま") && block.text.contains("アプリごとに")), "两段正文并成了一块：{}", block.text);
+            assert!(!(block.text.contains("ご覧ください") && block.text.contains("次回の起動時")), "正文和脚注并成了一块：{}", block.text);
+            assert!(!has_space_between_han(&block.text), "汉字之间不该夹空格：{}", block.text);
+        }
+    }
+
+    #[test]
+    fn real_ocr_reads_a_short_japanese_selection() {
+        // 选区只有一行两个按钮：旧程序只读出 `保存`（中文优先那遍读出了汉字），假名的 `キャンセル` 两遍都没读出来
+        if real_sidecar().is_none() {
+            return;
+        }
+        let text = joined(&recognized_lines("ocr-ja-short.png"));
+        assert!(text.contains("キャンセル") && text.contains("保存"), "两个按钮都要读出来：\n{text}");
+    }
+
+    #[test]
+    fn real_ocr_reads_korean_text_in_a_screenshot() {
+        if real_sidecar().is_none() {
+            return;
+        }
+        let lines = recognized_lines("ocr-ko-chat.png");
+        let text = joined(&lines);
+        for expected in ["안녕하세요", "회의는", "시작합니다", "감사합니다", "메시지를 입력하세요"] {
+            assert!(text.contains(expected), "识别结果里没有「{expected}」：\n{text}");
+        }
+        assert_eq!(target_of(&lines, 2.0), Some("zh"), "韩文页要译成中文：\n{text}");
+    }
+
+    #[test]
+    fn real_ocr_reads_arabic_text_and_marks_the_blocks_right_to_left() {
+        // 阿拉伯文：读出来的字符串是逻辑顺序（从右往左读的顺序），块要带上 rtl，覆盖层据此顶着右边起笔
+        if real_sidecar().is_none() {
+            return;
+        }
+        let lines = recognized_lines("ocr-ar-settings.png");
+        let text = joined(&lines);
+        for expected in ["الإشعارات", "الخصوصية", "لوحة المفاتيح", "إعدادات الإشعارات", "السماح بالإشعارات"] {
+            assert!(text.contains(expected), "识别结果里没有「{expected}」：\n{text}");
+        }
+        let blocks = merge_lines(&lines, 2.0);
+        let right_to_left = blocks.iter().filter(|block| block.rtl).count();
+        assert!(right_to_left >= 8, "只有 {right_to_left} 块被标成从右往左（共 {} 块）：\n{text}", blocks.len());
+        // 整页的笔画都顶着窗口右边的一列：左边的空白（译文往那边延伸）要量得出来、而且不小
+        let with_room = blocks.iter().filter(|block| block.rtl && block.room_left.is_some_and(|room| room > 20.0)).count();
+        assert!(with_room >= 6, "左边的空白没量出来（{with_room} 块）");
+        assert_eq!(target_of(&lines, 2.0), Some("zh"), "阿拉伯文页要译成中文：\n{text}");
+    }
+
+    #[test]
+    fn real_ocr_reads_thai_text_even_when_the_text_detector_finds_nothing() {
+        // 泰文：前两遍一行都读不到（检测器也没找到文字区域），这时直接补第三遍
+        if real_sidecar().is_none() {
+            return;
+        }
+        let lines = recognized_lines("ocr-th-menu.png");
+        let text = joined(&lines);
+        for expected in ["หน้าหลัก", "การตั้งค่า", "การแจ้งเตือน", "ความเป็นส่วนตัว", "ช่วยเหลือ"] {
+            assert!(text.contains(expected), "识别结果里没有「{expected}」：\n{text}");
+        }
+        assert_eq!(target_of(&lines, 2.0), Some("zh"), "泰文页要译成中文：\n{text}");
+    }
+
+    #[test]
+    fn real_ocr_reads_cyrillic_and_accented_latin_pages_the_same_with_or_without_the_third_pass() {
+        // 俄文、法文（重音字母）英文优先那遍就读得很好，用不着第三遍；这两张守住「别因为加了新逻辑反而读坏」：
+        // 关键字读得出来，并且补不补第三遍输出逐项一样、不采信第三遍
+        if real_sidecar().is_none() {
+            return;
+        }
+        let russian = recognized_lines("ocr-ru-article.png");
+        let text = joined(&russian);
+        for expected in ["Настройки уведомлений", "Новые сообщения будут отображаться", "выбрать другой способ", "Не беспокоить"] {
+            assert!(text.contains(expected), "识别结果里没有「{expected}」：\n{text}");
+        }
+        assert_eq!(target_of(&russian, 1.0), Some("zh"));
+        let french = recognized_lines("ocr-fr-form.png");
+        let text = joined(&french);
+        for expected in ["Paramètres du compte", "Adresse e-mail", "Déconnexion"] {
+            assert!(text.contains(expected), "重音字母要原样读出来，识别结果里没有「{expected}」：\n{text}");
+        }
+        assert_eq!(target_of(&french, 1.0), Some("zh"));
+        for fixture in ["ocr-ru-article.png", "ocr-fr-form.png"] {
+            let (default, trace) = sidecar_run(fixture, &[("SENSE_OCR_TRACE", "1")]);
+            assert!(!third_pass_used(&trace), "{fixture}：不该采信第三遍：{trace}");
+            assert_eq!(default, two_pass_run(fixture), "{fixture}：补第三遍改了输出");
+        }
+    }
+
+    #[test]
+    fn real_ocr_chinese_and_english_screenshots_come_out_exactly_as_with_two_passes() {
+        // 硬承诺：补第三遍只许改变日文、韩文、阿拉伯文、泰文的截图。中文、英文截图不论第三遍补没补、读出了什么，
+        // 输出都和只做前两遍时逐项一样——比解析后的整个 JSON（文字、位置、置信度、逐词框、底色、空白），不是比关键字。
+        // 上一轮在 4031 张图上这样比过；这十五张是留在仓库里的代表，含很短的中文选区（`才一` 曾被读成 `オー`）和图标 / 星级的英文图
+        // （补第三遍时里面会冒出汉字）。关键字级别的断言守不住这条：第三遍采信了也能读出关键字。
+        if real_sidecar().is_none() {
+            return;
+        }
+        let fixtures = [
+            "ocr-zh-en.png", "ocr-zh-icon-label.png", "ocr-zh-mixed-line.png", "ocr-zh-emoji.png", "ocr-zh-paragraph.png", "ocr-zh-sidebar.png",
+            "ocr-zh-lookalike-1.png", "ocr-zh-lookalike-2.png", "ocr-zh-lookalike-3.png", "ocr-zh-lookalike-4.png", "ocr-en-lookalike-nu.png",
+            "ocr-en-icons.png", "ocr-en-stepper.png", "ocr-en-icons-boxed.png", "ocr-en-stars-one-line.png", "ocr-en-stars-svg.png", "ocr-en-stars.png",
+        ];
+        for fixture in fixtures {
+            let (default, trace) = sidecar_run(fixture, &[("SENSE_OCR_TRACE", "1")]);
+            assert!(!third_pass_used(&trace), "{fixture}：中文、英文截图不该采信第三遍：{trace}");
+            assert_eq!(default, two_pass_run(fixture), "{fixture}：补第三遍改了中文 / 英文截图的输出（trace：{trace}）");
+        }
+    }
+
+    #[test]
+    fn real_ocr_third_pass_is_what_reads_japanese_korean_arabic_and_thai() {
+        // 反过来：这几张日 / 韩 / 阿拉伯 / 泰文的图，补第三遍并且采信了，输出和只做前两遍时不一样
+        if real_sidecar().is_none() {
+            return;
+        }
+        for fixture in ["ocr-ja-settings.png", "ocr-ja-short.png", "ocr-ja-paragraph.png", "ocr-ko-chat.png", "ocr-ar-settings.png", "ocr-th-menu.png"] {
+            let (default, trace) = sidecar_run(fixture, &[("SENSE_OCR_TRACE", "1")]);
+            assert!(third_pass_used(&trace), "{fixture}：该采信第三遍：{trace}");
+            assert_ne!(default, two_pass_run(fixture), "{fixture}：采信了第三遍，输出却和前两遍一样");
+        }
+    }
+
+    #[test]
+    fn real_ocr_third_pass_gives_up_at_its_deadline_and_keeps_the_first_two_passes() {
+        // 补第三遍不能把已经读出来的结果搭进去：到期限还没出结果就放弃，保住前两遍的结果（不然 Rust 这边 60 秒一到整个杀掉）。
+        // 期限改成 1 毫秒（仅供测试的开关），第三遍一定赶不上：输出和只做前两遍时逐项一样，trace 里 timedOut=true
+        if real_sidecar().is_none() {
+            return;
+        }
+        let fixture = "ocr-ja-settings.png";
+        let (late, trace) = sidecar_run(fixture, &[("SENSE_OCR_TRACE", "1"), ("SENSE_OCR_THIRD_PASS_BUDGET_MS", "1")]);
+        assert!(trace.contains("triedAutomatic=true") && trace.contains("timedOut=true") && !third_pass_used(&trace), "要走超时放弃那条路：{trace}");
+        assert_eq!(late, two_pass_run(fixture), "超时放弃之后输出应与只做前两遍时一样");
     }
 
     /// 两个汉字之间夹着空格（行与行接起来时不该有）。
