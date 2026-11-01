@@ -25,3 +25,11 @@ dist-ssr
 
 # OCR sidecar：src-tauri/build.rs 用 swiftc 现编，每次字节都不同，不入库
 src-tauri/binaries/
+
+# 更新包构建产物（tools/release.sh）
+dist-release/
+
+# 更新签名私钥只放在 ~/.tauri/，绝不进仓库（仓库是公开的，一次 git add -A 就泄露了）。
+# tools/release.sh 还会拒绝放在仓库目录里的私钥路径
+*.key
+sense-updater*

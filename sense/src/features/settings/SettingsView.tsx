@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type HotkeyView, type ProviderView } from "../../lib/ipc";
+import { UpdateCard } from "../update/UpdateCard";
+import type { UpdateController } from "../update/useUpdate";
 import { isUnsavedForm } from "./form";
 
-export function SettingsView({ onBack }: { onBack: () => void }) {
+export function SettingsView({ onBack, update }: { onBack: () => void; update: UpdateController }) {
   const [providers, setProviders] = useState<ProviderView[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [baseUrl, setBaseUrl] = useState("");
@@ -331,6 +333,8 @@ export function SettingsView({ onBack }: { onBack: () => void }) {
             至少包含 ⌃ 或 ⌘，主键支持字母、数字、空格。改完立刻生效，不用重启。
           </p>
         </div>
+
+        <UpdateCard update={update} />
 
         <p className="text-[13.5px] leading-relaxed text-subtle">
           Key 只写进 macOS 钥匙串，不会出现在界面、日志或配置文件里。

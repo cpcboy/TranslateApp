@@ -1,0 +1,169 @@
+{
+  "idle": {
+    "seq": 7,
+    "current_version": "0.1.0",
+    "unavailable": null,
+    "auto_update": true,
+    "phase": {
+      "state": "idle"
+    },
+    "checked_at": null,
+    "notes": null,
+    "last_error": null,
+    "error_kind": null,
+    "last_update": null
+  },
+  "checking": {
+    "seq": 7,
+    "current_version": "0.1.0",
+    "unavailable": null,
+    "auto_update": true,
+    "phase": {
+      "state": "checking"
+    },
+    "checked_at": 1767225600000,
+    "notes": null,
+    "last_error": null,
+    "error_kind": null,
+    "last_update": null
+  },
+  "up_to_date": {
+    "seq": 7,
+    "current_version": "0.1.0",
+    "unavailable": null,
+    "auto_update": true,
+    "phase": {
+      "state": "up_to_date"
+    },
+    "checked_at": 1767225600000,
+    "notes": null,
+    "last_error": null,
+    "error_kind": null,
+    "last_update": null
+  },
+  "downloading": {
+    "seq": 7,
+    "current_version": "0.1.0",
+    "unavailable": null,
+    "auto_update": true,
+    "phase": {
+      "state": "downloading",
+      "version": "0.1.1",
+      "downloaded": 2097152,
+      "total": 9437184
+    },
+    "checked_at": 1767225600000,
+    "notes": "修了几个 bug",
+    "last_error": null,
+    "error_kind": null,
+    "last_update": null
+  },
+  "downloading_unknown_size": {
+    "seq": 7,
+    "current_version": "0.1.0",
+    "unavailable": null,
+    "auto_update": true,
+    "phase": {
+      "state": "downloading",
+      "version": "0.1.1",
+      "downloaded": 512,
+      "total": null
+    },
+    "checked_at": 1767225600000,
+    "notes": null,
+    "last_error": null,
+    "error_kind": null,
+    "last_update": null
+  },
+  "ready": {
+    "seq": 7,
+    "current_version": "0.1.0",
+    "unavailable": null,
+    "auto_update": true,
+    "phase": {
+      "state": "ready",
+      "version": "0.1.1"
+    },
+    "checked_at": 1767225600000,
+    "notes": "修了几个 bug",
+    "last_error": null,
+    "error_kind": null,
+    "last_update": {
+      "from": "0.0.9",
+      "to": "0.1.0",
+      "at": 1767139200000
+    }
+  },
+  "installing": {
+    "seq": 7,
+    "current_version": "0.1.0",
+    "unavailable": null,
+    "auto_update": true,
+    "phase": {
+      "state": "installing",
+      "version": "0.1.1"
+    },
+    "checked_at": 1767225600000,
+    "notes": null,
+    "last_error": null,
+    "error_kind": null,
+    "last_update": null
+  },
+  "failed_check": {
+    "seq": 7,
+    "current_version": "0.1.0",
+    "unavailable": null,
+    "auto_update": true,
+    "phase": {
+      "state": "idle"
+    },
+    "checked_at": 1767225600000,
+    "notes": null,
+    "last_error": "连不上 GitHub（网络不通；注意：更新检查不读系统代理）",
+    "error_kind": "check",
+    "last_update": null
+  },
+  "unavailable": {
+    "seq": 7,
+    "current_version": "0.1.0",
+    "unavailable": "开发版（debug 构建）不检查更新",
+    "auto_update": false,
+    "phase": {
+      "state": "idle"
+    },
+    "checked_at": null,
+    "notes": null,
+    "last_error": null,
+    "error_kind": null,
+    "last_update": null
+  },
+  "failed_install": {
+    "seq": 7,
+    "current_version": "0.1.0",
+    "unavailable": null,
+    "auto_update": true,
+    "phase": {
+      "state": "idle"
+    },
+    "checked_at": 1767225600000,
+    "notes": null,
+    "last_error": "安装中途失败，而且旧版本没能放回原位。旧版本在 /Applications/SENSE (previous version).app，请手动把它拖回「应用程序」文件夹",
+    "error_kind": "install",
+    "last_update": null
+  },
+  "ready_install_failed": {
+    "seq": 7,
+    "current_version": "0.1.0",
+    "unavailable": null,
+    "auto_update": true,
+    "phase": {
+      "state": "ready",
+      "version": "0.1.1"
+    },
+    "checked_at": 1767225600000,
+    "notes": "修了几个 bug",
+    "last_error": "没能替换「应用程序」里的 SENSE：可能是你取消了管理员授权，也可能是当前账户没有权限（请用管理员账户登录，或手动安装新版本）",
+    "error_kind": "install",
+    "last_update": null
+  }
+}

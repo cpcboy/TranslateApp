@@ -632,7 +632,7 @@ fn work_area_top(window: &WebviewWindow) -> Option<f64> {
 }
 
 /// 窗口操作只对主窗口开放；截屏译文窗口（overlay）不该被这些命令挪动。
-fn ensure_main(window: &WebviewWindow) -> Result<(), String> {
+pub(crate) fn ensure_main(window: &WebviewWindow) -> Result<(), String> {
     if window.label() == MAIN_WINDOW {
         Ok(())
     } else {
