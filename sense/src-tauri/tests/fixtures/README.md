@@ -39,3 +39,10 @@ Vision 给的框宽、框高随系统版本可能差几个像素，判据里的�
 夹具重新渲染、换行位置差一个字，`real_ocr_lines_of_a_wrapped_chinese_paragraph…` 就可能变红——先看 `sense-ocr` 读出的各行文字，不要先改阈值。
 2026-10-31 重做时的两种语言顺序对照：`ocr-zh-paragraph.png` 英文优先 1 行 / 0 个汉字、中文优先 10 行 / 158 个汉字；
 `ocr-zh-sidebar.png` 英文优先 0 行、中文优先 19 行 / 173 个汉字。
+
+## 截屏翻译的提示词原文（不是图片）
+
+`capture-prompt.to-en.txt` / `capture-prompt.to-zh.txt`：截屏翻译发给模型的系统提示词（译成英文 / 译成中文），**评测用的就是这两份原文**。
+`capture.rs` 里的 `the_prompt_is_the_wording_that_was_evaluated_byte_for_byte` 逐字节核对它们，所以提示词一个字不能顺手改：
+改措辞要连同 CHANGELOG「截屏翻译：整页『译文条数对不上』改成带编号的协议」里的评测重新量一遍（样本外页面、按页口径；至少两个**不同**的模型——`deepseek-chat` 是 `deepseek-flash` 的别名，不算两个），再有意识地更新这两份文件。
+文件末尾没有换行，不要让编辑器自动补。
