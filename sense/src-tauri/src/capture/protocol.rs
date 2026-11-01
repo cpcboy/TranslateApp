@@ -67,7 +67,8 @@ pub(super) fn user_message(texts: &[&str], ids: impl IntoIterator<Item = usize>)
     serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
 }
 
-/// 回复里的一个元素。`lenient` = 严格解析失败、靠逐元素扫描捞回来的。
+/// 回复里的一个元素。`lenient` = 这个元素是靠宽松规则收下的（严格解析失败后逐元素扫描：译文里有裸引号 / 未知转义，
+/// 或最后一项少了 `}`）；生产代码不读它，测试靠它确认走了哪条路。
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Entry {
     pub i: i64,
@@ -176,6 +177,7 @@ fn element_header(bytes: &[u8], at: usize) -> Option<(i64, usize)> {
 
 /// 逐元素扫描：找每个 `{"i":N,"t":"` 的位置，元素的值延伸到下一个元素头（或末尾）之前、
 /// 最后一个「引号 + 可选空白 + }」。没有收尾的（被截断）记进 `dropped`。只在严格解析失败时用。
+/// 例外：最后一个元素少了 `}`、但数组已经闭合时也收下，并且先于「引号 + }」判断（见 `unclosed_last_quote`）。
 fn lenient_scan(text: &str) -> Parsed {
     let bytes = text.as_bytes();
     let heads: Vec<(usize, i64, usize)> = bytes
@@ -189,14 +191,17 @@ fn lenient_scan(text: &str) -> Parsed {
     for (index, (_, id, value_start)) in heads.iter().enumerate() {
         let limit = heads.get(index + 1).map_or(bytes.len(), |next| next.0);
         let region = &text[*value_start..limit.max(*value_start)];
-        match closing_quote(region.as_bytes()) {
+        // 最后一个元素先看是不是「少了 `}` 但数组已经闭合」：那是一段干净的译文 + 引号 + `]`，译文里即便带着 `\"}` 也不会被当成收尾
+        let unclosed = (index + 1 == heads.len()).then(|| unclosed_last_quote(region.as_bytes())).flatten();
+        let repaired = unclosed.is_some();
+        match unclosed.or_else(|| closing_quote(region.as_bytes())) {
             Some(close) => {
                 let (decoded, lenient) = decode_inner(&region[..close]);
                 // 认不出的元素头会被上一个元素吞进去：译文里带着 JSON 碎片就是被吞了，宁可当没译成，不能当译文
                 if has_element_debris(&decoded) {
                     parsed.dropped.push(*id);
                 } else {
-                    parsed.entries.push(Entry { i: *id, t: decoded, lenient });
+                    parsed.entries.push(Entry { i: *id, t: decoded, lenient: lenient || repaired });
                 }
             }
             None => parsed.dropped.push(*id),
@@ -234,6 +239,37 @@ fn closing_quote(region: &[u8]) -> Option<usize> {
         // 用 then 而不是 then_some：后者的参数立即求值，q 为 0 时 q - 1 会下溢
         (q > 0 && region[q - 1] == b'"').then(|| q - 1)
     })
+}
+
+/// 最后一个元素少了 `}` 时的收尾引号。模型偶尔把最后一项写成 `{"i":7,"t":"……"` 就换行接 `]`：译文是完整的，只是漏了一个 `}`
+/// （只见于 `deepseek-chat`：没碰过的评测集 H 的第一轮回复 1,648 个里有 8 个，另一批数据里又有 8 个，`deepseek-v4-pro` 一个都没有；
+/// 见 CHANGELOG「修复 · 2026-11-01 — 截屏翻译：宽松解析收下『最后一项只少了 `}`』的回复」）。
+/// 严格解析整段失败、`closing_quote` 又找不到「引号 + `}`」，这一项就被当成「没写完」丢掉，应用要多补问一次
+/// （这 16 个请求的补问回复 16 / 16 写对了，所以真实的好处是少一次请求）；连补问也这样写时这一块才显示成「没译成」（mock 的 `UNCLOSED_LAST` 模拟的就是它）。
+/// 同时满足三条才收：① 区域去掉末尾空白后以 `]` 结尾；② `]` 前面（去掉空白）是一个没被转义的引号；
+/// ③ 这个引号之前整段都是干净的 JSON 字符串内容——没有没转义的引号。第 ③ 条把「模型闭合数组之后又写了说明、多余的字段、
+/// 认不出头的别的元素」挡在外面（它们里面总有没转义的引号，不能当译文收下），也让译文里的 `\"}` 不会被 `closing_quote` 当成收尾、取到半句，所以它先于 `closing_quote` 判断。
+/// 被 max_tokens 截断的回复到不了 `]`，它被切断的最后一项仍是「没译成」；`]` 后面还跟着别的话（不是模型闭合的数组）也不收。
+/// 只对最后一个元素用——别的元素漏了 `}`，后面跟的是 `,` 和下一个元素。
+fn unclosed_last_quote(region: &[u8]) -> Option<usize> {
+    let is_space = |byte: &u8| matches!(byte, b' ' | b'\n' | b'\t' | b'\r');
+    let end = region.iter().rposition(|byte| !is_space(byte))?;
+    if region[end] != b']' {
+        return None;
+    }
+    let quote = region[..end].iter().rposition(|byte| !is_space(byte))?;
+    // 收尾引号之前不许再有没转义的引号；走到收尾引号时仍处在转义状态，说明它自己是被转义的（前面有奇数个反斜杠），字符串其实没闭合
+    let mut escaped = false;
+    for &byte in &region[..quote] {
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            return None;
+        }
+    }
+    (region[quote] == b'"' && !escaped).then_some(quote)
 }
 
 /// 一段 JSON 字符串内容（不含两头的引号）→ 文字。严格解得开就用严格的；否则宽松：
@@ -580,8 +616,8 @@ async fn ask_round<A: Ask>(texts: &[&str], shown: Vec<usize>, want: &[usize], as
             return want.iter().map(|_| Err(why.clone())).collect();
         }
     };
-    // 回复被截断时，最后一个元素是在中途被切断的：宽松扫描偶尔会在半截译文里碰到 `"}`（译文里带着 JSON 字样时）而把它当成完整的。
-    // 宁可把那一条当没译成、补问一次，也不显示半句话
+    // 回复被截断时，最后一个元素是在中途被切断的：宽松扫描偶尔会在半截译文里碰到 `"}`（译文里带着 JSON 字样时）而把它当成完整的，
+    // 也可能碰巧停在「引号 + `]`」之后（少了 `}` 的最后一项会被收下）。宁可把那一条当没译成、补问一次，也不显示半句话
     if reply.truncated && parsed.last.is_some() && parsed.entries.last().map(|entry| entry.i) == parsed.last {
         parsed.entries.pop();
     }
@@ -797,6 +833,142 @@ mod tests {
     }
 
     #[test]
+    fn a_last_element_that_only_lacks_its_closing_brace_is_kept_once_the_array_is_closed() {
+        // 真实回复（deepseek-chat，截屏翻译评测）里的写法：最后一项译文是完整的，只漏了一个 `}`，换行就接 `]`
+        let parsed = parse_reply("[{\"i\":0,\"t\":\"甲\"},{\"i\":1,\"t\":\"乙\"},{\"i\":2,\"t\":\"丙\"\n]").unwrap();
+        assert_eq!(ids(&parsed), vec![(0, "甲".into()), (1, "乙".into()), (2, "丙".into())]);
+        assert!(parsed.dropped.is_empty());
+        assert_eq!(parsed.last, Some(2));
+        assert!(parsed.entries[2].lenient && !parsed.entries[0].lenient, "是靠宽松扫描捞回来的，要标出来");
+        // 引号与 `]` 之间的空白可有可无（`]` 之后的空白在 `strip_fence` 里就去掉了）；包在代码围栏里也一样
+        for raw in [
+            "[{\"i\":0,\"t\":\"甲\"},{\"i\":1,\"t\":\"乙\"]",
+            "[{\"i\":0,\"t\":\"甲\"},{\"i\":1,\"t\":\"乙\" \r\n\t ]  \n",
+            "```json\n[{\"i\":0,\"t\":\"甲\"},{\"i\":1,\"t\":\"乙\"\n]\n```",
+        ] {
+            let parsed = parse_reply(raw).unwrap();
+            assert_eq!(ids(&parsed), vec![(0, "甲".into()), (1, "乙".into())], "{raw}");
+            assert!(parsed.dropped.is_empty(), "{raw}");
+        }
+        // 只有这一个元素：以前整次都认不出
+        assert_eq!(ids(&parse_reply("[{\"i\":0,\"t\":\"甲\"\n]").unwrap()), vec![(0, "甲".into())]);
+    }
+
+    #[test]
+    fn an_unclosed_last_element_is_decoded_like_any_other_translation() {
+        // 译文里有 `]`、转义的引号和换行：照常还原
+        let parsed = parse_reply(
+            r#"[{"i":0,"t":"甲"},{"i":1,"t":"见 [1] 与 \"乙\"\n再见"
+]"#,
+        )
+        .unwrap();
+        assert_eq!(ids(&parsed), vec![(0, "甲".into()), (1, "见 [1] 与 \"乙\"\n再见".into())]);
+        // 译文以转义的反斜杠结尾：引号前是偶数个反斜杠，引号是真的收尾
+        let parsed = parse_reply("[{\"i\":0,\"t\":\"甲\"},{\"i\":1,\"t\":\"C:\\\\\"\n]").unwrap();
+        assert_eq!(ids(&parsed), vec![(0, "甲".into()), (1, "C:\\".into())]);
+        // 空译文照收，由对齐去报「译文是空的」
+        let parsed = parse_reply("[{\"i\":0,\"t\":\"甲\"},{\"i\":1,\"t\":\"\"\n]").unwrap();
+        assert_eq!(ids(&parsed), vec![(0, "甲".into()), (1, String::new())]);
+        let (slots, _) = align(&parsed.entries, &[0, 1]);
+        assert_eq!(slots, vec![Slot::Ok("甲".into()), Slot::Empty]);
+    }
+
+    #[test]
+    fn a_last_element_is_not_kept_unless_the_model_itself_closed_the_array_right_after_its_closing_quote() {
+        let head = r#"[{"i":0,"t":"甲"},"#;
+        for tail in [
+            // 引号之后就断了：没到 `]`
+            r#"{"i":1,"t":"乙""#,
+            // 译文写到一半断了
+            r#"{"i":1,"t":"乙"#,
+            // `]` 之后还跟着别的话：这不是模型闭合的数组
+            "{\"i\":1,\"t\":\"乙\"\n]\n以上是译文",
+            // ……那句话碰巧也以「引号 + ]」结尾
+            "{\"i\":1,\"t\":\"乙\"\n]\n另见 [\"x\"]",
+            // 半截译文碰巧以 `]` 结尾，`]` 前面不是引号
+            r#"{"i":1,"t":"见 [1]"#,
+            // `]` 前面是一个被转义的引号：字符串根本没闭合
+            r#"{"i":1,"t":"他说\"好\"]"#,
+            // 多余的字段：译文后面还有别的字符串
+            r#"{"i":1,"t":"乙","note":["a","b"]"#,
+            // 夹着一个认不出头的元素
+            "{\"i\":1,\"t\":\"乙\" ,{\"index\":2,\"text\":\"丙\"\n]",
+            // 译文里有没转义的引号：字符串结构本来就坏了
+            "{\"i\":1,\"t\":\"他说\"好\"\n]",
+            // 收下的元素也要过 JSON 碎片检查：译文里带着元素的键，多半是别的元素被吞进来了
+            "{\"i\":1,\"t\":\"键 \\\"i\\\": 1\"\n]",
+            // ……而且是对整句检查：译文里的 `\"}` 以前会让 closing_quote 取到半句 `x\`（没有碎片、被当成译文），整句 `x"} "t":1` 带着元素的键
+            "{\"i\":1,\"t\":\"x\\\"} \\\"t\\\":1\"\n]",
+        ] {
+            let parsed = parse_reply(&format!("{head}{tail}")).unwrap();
+            assert_eq!(ids(&parsed), vec![(0, "甲".into())], "{tail}");
+            assert_eq!(parsed.dropped, vec![1], "{tail}");
+        }
+    }
+
+    #[test]
+    fn a_json_looking_translation_in_an_unclosed_last_element_is_not_cut_short_at_the_brace_inside_it() {
+        // 译文里有 `\"}`（一段 JSON 示例）：最后一项又少了收尾的 `}`，不能把译文里的 `"}` 当成收尾、取到半句
+        let parsed = parse_reply(
+            r#"[{"i":0,"t":"甲"},{"i":1,"t":"用 {\"a\":\"b\"} 表示"
+]"#,
+        )
+        .unwrap();
+        assert_eq!(ids(&parsed), vec![(0, "甲".into()), (1, "用 {\"a\":\"b\"} 表示".into())]);
+        assert!(parsed.dropped.is_empty());
+    }
+
+    #[test]
+    fn a_complete_last_element_followed_by_a_note_is_not_mistaken_for_an_unclosed_one() {
+        // 最后一项是写完整的（有 `}`），后面跟了一句以「引号 + ]」结尾的话：仍取这一项自己的收尾，不把那句话收进译文
+        let parsed = parse_reply("[{\"i\":0,\"t\":\"甲\"},{\"i\":1,\"t\":\"乙\"}]\n注意 [\"x\"]").unwrap();
+        assert_eq!(ids(&parsed), vec![(0, "甲".into()), (1, "乙".into())]);
+        assert!(parsed.dropped.is_empty());
+        assert!(!parsed.entries[1].lenient, "它有自己的收尾，不是靠「少一个右花括号」这条规则收下的");
+    }
+
+    #[test]
+    fn the_last_element_gives_back_exactly_its_text_whether_or_not_it_lacks_its_closing_brace() {
+        // 译文里什么都可能有：引号、花括号、方括号、反斜杠、逗号、冒号、i / t、空格、换行、汉字。
+        // 最后一项写完整（第一项的编号后面多了一个引号，整段不是合法 JSON，所以走宽松扫描）和少了 `}` 两种写法，都要原样取回这段译文——
+        // 取到半句、多出别的东西、把译文里的 `"}` 当成收尾，都算错。译文本身带着元素碎片的（`has_element_debris`）是例外：宁可当没译成。
+        const ALPHABET: [char; 16] = ['"', '}', '{', ']', '[', '\\', ',', ':', 'i', 't', ' ', '\n', '甲', 'a', '1', '/'];
+        let mut rng = Lcg(20261101);
+        let (mut checked, head) = (0, r#"[{"i":0","t":"甲"},"#);
+        for round in 0..4000 {
+            let len = (rng.next() * 12.0) as usize;
+            let text: String = (0..len).map(|_| ALPHABET[(rng.next() * ALPHABET.len() as f64) as usize]).collect();
+            if has_element_debris(&text) {
+                continue;
+            }
+            let escaped = serde_json::to_string(&text).unwrap(); // 两头带引号
+            for (shape, tail) in [("写完整", format!("{{\"i\":1,\"t\":{escaped}}}]")), ("少了 }}", format!("{{\"i\":1,\"t\":{escaped}\n]"))] {
+                let parsed = parse_reply(&format!("{head}{tail}")).unwrap_or_else(|err| panic!("{err}：{shape} {text:?}"));
+                assert_eq!(ids(&parsed), vec![(0, "甲".into()), (1, text.clone())], "{shape}：{text:?}（第 {round} 个）");
+                assert!(parsed.dropped.is_empty(), "{shape}：{text:?}");
+            }
+            checked += 1;
+        }
+        assert!(checked > 3500, "随机出来的译文太多被跳过了：{checked}");
+    }
+
+    #[test]
+    fn only_the_last_element_may_lack_its_closing_brace() {
+        // 中间的元素漏了 `}`：后面跟的是 `,` 和下一个元素，没法确定它在哪里结束，照旧当没译成
+        let parsed = parse_reply(r#"[{"i":0,"t":"甲"},{"i":1,"t":"乙" ,{"i":2,"t":"丙"}]"#).unwrap();
+        assert_eq!(ids(&parsed), vec![(0, "甲".into()), (2, "丙".into())]);
+        assert_eq!(parsed.dropped, vec![1]);
+        // 最后一个元素漏了 `}`、中间还有一个也漏了：只收最后一个
+        let parsed = parse_reply("[{\"i\":0,\"t\":\"甲\"},{\"i\":1,\"t\":\"乙\" ,{\"i\":2,\"t\":\"丙\"\n]").unwrap();
+        assert_eq!(ids(&parsed), vec![(0, "甲".into()), (2, "丙".into())]);
+        assert_eq!(parsed.dropped, vec![1]);
+        // 区域恰好以「引号 + ]」收尾、后面却还有下一个元素：数组没有在这里结束，不是「模型闭合了数组」
+        let parsed = parse_reply("[{\"i\":0,\"t\":\"甲\"\n]{\"i\":1,\"t\":\"乙\"}]").unwrap();
+        assert_eq!(ids(&parsed), vec![(1, "乙".into())]);
+        assert_eq!(parsed.dropped, vec![0]);
+    }
+
+    #[test]
     fn quoted_ids_tabs_and_newlines_are_accepted_by_the_lenient_scan() {
         let parsed = parse_reply("[{\"i\":\"3\",\"t\":\"a\tb\"},{\"i\":4,\"t\":\"c\nd\"}").unwrap();
         assert_eq!(ids(&parsed), vec![(3, "a\tb".into()), (4, "c\nd".into())]);
@@ -875,6 +1047,19 @@ mod tests {
 
     fn texts(n: usize) -> Vec<String> {
         (0..n).map(|k| format!("source {k}")).collect()
+    }
+
+    /// 回复里每个元素都写完整，只是最后一个漏了 `}`、换行就接 `]`（模型偶尔这样写）。
+    fn unclosed_last(elements: &[String]) -> String {
+        let mut body = elements.join(",");
+        assert_eq!(body.pop(), Some('}'));
+        format!("[{body}\n]")
+    }
+
+    /// 假模型：按 user 里的编号逐条回 `T<i>`，元素写成 `{"i":N,"t":"T<N>"}` 的字符串。
+    fn elements(user: &str) -> Vec<String> {
+        let items: Vec<Value> = serde_json::from_str(user).unwrap();
+        items.iter().map(|item| format!("{{\"i\":{},\"t\":\"T{}\"}}", item["i"], item["i"])).collect()
     }
 
     /// 不等的版本：测试里的运行时没开计时器，「再问之前先等一等」单独在 `the_re_ask_waits_before_it_goes_out` 里测。
@@ -1755,6 +1940,61 @@ mod tests {
         assert_eq!(outcome.translations[3], Ok("T3".to_string()), "半截的那条要换成补问回来的整句，不能留着半句话");
         assert_eq!(outcome.translations[4], Ok("T4".to_string()));
         assert_eq!((outcome.requests, outcome.retries, outcome.failed()), (2, 1, 0));
+    }
+
+    #[test]
+    fn a_last_translation_that_only_lacks_its_closing_brace_is_accepted_not_asked_for_again() {
+        // 以前：这一项被当成「没写完」丢掉，多补问一次；每次回复（包括补问）都这样写时，最后一块还会显示成「没译成」
+        for total in [8, 70] {
+            let calls = AtomicUsize::new(0);
+            let ask = |user: String| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                ready(Ok(Reply { text: unclosed_last(&elements(&user)), truncated: false }))
+            };
+            let outcome = run(&texts(total), true, ask);
+            assert_eq!(outcome.translations, (0..total).map(|k| Ok(format!("T{k}"))).collect::<Vec<_>>(), "total={total}");
+            let chunks = plan_chunks(total).len();
+            assert_eq!((outcome.requests, outcome.retries, calls.load(Ordering::SeqCst)), (chunks, 0, chunks), "每块一次请求，没有补问：total={total}");
+        }
+    }
+
+    #[test]
+    fn an_unclosed_last_element_and_a_really_missing_one_in_the_same_reply_are_told_apart() {
+        // 第 1 次回复：漏了 3，最后一项（7）又漏了 `}`。补问只该带 3，不带已经收下的 7
+        let calls = Mutex::new(Vec::new());
+        let ask = |user: String| {
+            let call = {
+                let mut seen = calls.lock().unwrap();
+                seen.push(user.clone());
+                seen.len()
+            };
+            let mut all = elements(&user);
+            if call == 1 {
+                all.remove(3);
+                ready(Ok(Reply { text: unclosed_last(&all), truncated: false }))
+            } else {
+                ready(Ok(Reply { text: format!("[{}]", all.join(",")), truncated: false }))
+            }
+        };
+        let outcome = run(&texts(8), true, ask);
+        assert_eq!(outcome.translations, (0..8).map(|k| Ok(format!("T{k}"))).collect::<Vec<_>>());
+        assert_eq!((outcome.requests, outcome.retries), (2, 1));
+        assert_eq!(calls.lock().unwrap()[1], r#"[{"i":3,"t":"source 3"}]"#);
+    }
+
+    #[test]
+    fn a_truncated_reply_is_still_cut_at_its_last_element_even_when_that_element_closed_the_array() {
+        // 撞到 max_tokens 的回复，最后一项一律不信（哪怕它碰巧写成了「引号 + ] 」的样子）：补问一次，换成整句
+        let calls = AtomicUsize::new(0);
+        let ask = |user: String| {
+            let call = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let all = elements(&user);
+            let text = if call == 1 { unclosed_last(&all) } else { format!("[{}]", all.join(",")) };
+            ready(Ok(Reply { text, truncated: call == 1 }))
+        };
+        let outcome = run(&texts(5), true, ask);
+        assert_eq!(outcome.translations, (0..5).map(|k| Ok(format!("T{k}"))).collect::<Vec<_>>());
+        assert_eq!((outcome.requests, outcome.retries), (2, 1));
     }
 
     #[test]
