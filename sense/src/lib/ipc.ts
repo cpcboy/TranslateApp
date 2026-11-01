@@ -30,6 +30,28 @@ export type LookupResult = {
 
 export type LookupError = { code: string; message: string };
 
+/** 语言表里的一种语言。这张表只有 Rust 里有一份（`lang.rs`），前端拿来显示，不自己列。 */
+export type Language = { code: string; name: string; native: string };
+
+/**
+ * 一段话的两端语言。`source` 为 null = 认不出；`source_confident` 为 false = 没把握——
+ * 这时 `source` 只是「拉丁字母按英文处理」的默认值，界面写「自动识别」，不报语种。
+ */
+export type LanguagePair = { source: Language | null; source_confident: boolean; target: Language };
+
+/** `dictionary`：这段输入该不该走查词卡（只有中 ↔ 英；整句和长文由 `isLongText` 先挡掉） */
+export type TranslationPlan = LanguagePair & { dictionary: boolean };
+
+/** `target`：`auto` 或语言代码 */
+export type LanguageSettings = { target: string; languages: Language[] };
+
+/** 长文翻译的结果；语言字段是后加的，旧的返回里可能没有 */
+export type LongTextResult = {
+  text: string;
+  truncated: boolean;
+  incomplete: string | null;
+} & Partial<LanguagePair>;
+
 export type DeltaEvent = { request_id: string; text: string };
 
 /** active 为 false：配置里写了这个键，但没注册上（多半被别的 App 占了），它并不生效 */
@@ -133,11 +155,17 @@ export const api = {
   captureBlocks: () => invoke<CaptureView>("capture_blocks"),
   closeOverlay: () => invoke<void>("close_overlay"),
   translateText: (text: string, requestId: string) =>
-    invoke<{ text: string; truncated: boolean; incomplete: string | null }>("translate_text", {
+    invoke<LongTextResult>("translate_text", {
       text,
       requestId,
     }),
   cancelTranslate: () => invoke<void>("cancel_translate"),
+  /** 目标语言偏好 + 能选的语言 */
+  translateLanguages: () => invoke<LanguageSettings>("translate_languages"),
+  /** 存偏好（`auto` 或语言代码），返回实际存下的值 */
+  setTranslateTarget: (target: string) => invoke<string>("set_translate_target", { target }),
+  /** 这段输入会怎么译：认出的原文语言、目标语言，以及要不要走查词卡 */
+  planTranslation: (text: string) => invoke<TranslationPlan>("plan_translation", { text }),
   checkGrammar: (text: string) => invoke<GrammarIssue[]>("check_grammar", { text }),
   explainWord: (term: string, context: string) =>
     invoke<WordGloss>("explain_word", { term, context }),

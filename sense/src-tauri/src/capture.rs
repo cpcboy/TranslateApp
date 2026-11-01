@@ -44,6 +44,8 @@ pub fn request_screen_permission() -> bool {
     unsafe { CGRequestScreenCaptureAccess() }
 }
 
+use crate::commands::language::load_pref;
+use crate::lang::{self, Lang};
 use crate::providers::openai_compat;
 use crate::providers as provider_registry;
 use crate::secrets;
@@ -632,15 +634,15 @@ pub async fn run_with_image(
     // 翻译失败也把原文盖上去，至少让用户看到识别结果；
     // 但失败原因必须一起交给覆盖层，不能让原文冒充译文。
     let mut failure = None;
-    match translate_target(&blocks) {
+    match capture_target(&blocks, load_pref(app)) {
         Some(target) => {
-            if let Err(err) = translate_blocks(app, &mut blocks, target).await {
+            if let Err(err) = translate_blocks(app, &mut blocks, target.name).await {
                 eprintln!("[sense] 截图翻译失败：{err}");
                 failure = Some(err);
             }
         }
-        // 只有日文假名、韩文、俄文或纯数字符号：没翻也要说一声
-        None => failure = Some("选区里没有中文或英文，目前只支持中英互译".to_string()),
+        // 识别出来的全是数字、符号：没什么可译的，也要说一声
+        None => failure = Some("选区里没有可翻译的文字（只识别出数字或符号）".to_string()),
     }
 
     // 有失败、位置提示、或「译文全和原文一样」的提示时，覆盖层至少要放得下这条提示：
@@ -1022,14 +1024,18 @@ fn merge_lines(lines: &[OcrLine], scale: f64) -> Vec<Block> {
     blocks
 }
 
-/// 目标语言：源文以英文为主就译成中文，否则译成英文。
-fn translate_target(blocks: &[Block]) -> Option<&'static str> {
+/// 目标语言：整页识别出的文字合起来判原文语言，再按偏好取舍（规则见 `lang.rs`）。
+///
+/// 偏好是 `auto` 时，中文、英文页面的方向与以前完全一致：中文为主译成英文，否则译成中文
+/// （以前直接拒绝的日文、韩文、俄文页面，现在也默认译成中文）；
+/// 手选了别的语言就译成它（原文本身就是那种语言时退回默认）。
+/// 一个字母都没有（只有数字、符号）返回 None，没什么可译的。
+///
+/// 识别（OCR）本身目前只读中英文，其它语言的截图读不准——这是 OCR 的限制，不是翻译这边的。
+fn capture_target(blocks: &[Block], pref: &str) -> Option<&'static Lang> {
     let sample: String = blocks.iter().map(|block| block.text.as_str()).collect::<Vec<_>>().join(" ");
-    let (cjk, latin) = zh_wrap::script_counts(&sample);
-    if cjk == 0 && latin == 0 {
-        return None;
-    }
-    Some(if cjk * 2 >= latin { "英文" } else { "中文" })
+    let plan = lang::plan(&sample, pref);
+    plan.source.letters.then_some(plan.target)
 }
 
 /// 一次请求翻译全部块，顺序对齐；失败就保留原文。
@@ -1134,6 +1140,11 @@ fn parse_translation_array(raw: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 偏好是 auto 时的翻译方向（以前 `translate_target` 的老口径，下面这些断言原样保留）。
+    fn translate_target(blocks: &[Block]) -> Option<&'static str> {
+        capture_target(blocks, lang::AUTO).map(|lang| lang.name)
+    }
 
     fn line(text: &str, x: f64, y: f64, w: f64, h: f64) -> OcrLine {
         OcrLine {
@@ -2206,5 +2217,54 @@ mod tests {
             ..Default::default()
         }];
         assert_eq!(translate_target(&english), Some("中文"));
+    }
+
+    fn one_block(text: &str) -> Vec<Block> {
+        vec![Block {
+            text: text.into(),
+            x: 0.0,
+            y: 0.0,
+            w: 10.0,
+            h: 10.0,
+            line_h: 10.0,
+            translated: false,
+            ..Default::default()
+        }]
+    }
+
+    #[test]
+    fn other_scripts_are_translated_instead_of_rejected() {
+        // 以前：日文假名、俄文、韩文直接报「目前只支持中英互译」。现在默认译成中文
+        for text in ["今日は天気がいいですね", "Привет, как дела?", "안녕하세요", "Bonjour tout le monde"] {
+            assert_eq!(capture_target(&one_block(text), lang::AUTO).map(|lang| lang.code), Some("zh"), "{text}");
+        }
+        // 识别出来的全是数字、符号：没什么可译的
+        assert_eq!(capture_target(&one_block("12345 ——"), lang::AUTO).map(|lang| lang.code), None);
+        assert_eq!(capture_target(&one_block("12345 ——"), "ja").map(|lang| lang.code), None);
+    }
+
+    #[test]
+    fn a_chosen_language_applies_to_screen_translation_too() {
+        let english = one_block("The weather is nice and we can go out today.");
+        let chinese = one_block("今天天气很好，我们可以出去玩。");
+        assert_eq!(capture_target(&english, "ja").map(|lang| lang.name), Some("日语"));
+        assert_eq!(capture_target(&chinese, "fr").map(|lang| lang.name), Some("法语"));
+        assert_eq!(capture_target(&chinese, "zh-Hant").map(|lang| lang.name), Some("繁体中文"));
+        // 选的就是页面本身的语言：译成自己没有意义，退回默认方向
+        assert_eq!(capture_target(&english, "en").map(|lang| lang.name), Some("中文"));
+        assert_eq!(capture_target(&chinese, "zh").map(|lang| lang.name), Some("英文"));
+        // 认不得的偏好（配置被改坏）：当 auto
+        assert_eq!(capture_target(&chinese, "klingon").map(|lang| lang.name), Some("英文"));
+    }
+
+    #[test]
+    fn the_prompt_names_the_target_the_blocks_are_translated_into() {
+        // 提示词里写的是语言的中文名；默认方向仍是以前的「中文」「英文」，不多不少
+        let names: Vec<&str> = ["zh", "en", "ja", "zh-Hant"]
+            .iter()
+            .filter_map(|code| lang::lang_by_code(code))
+            .map(|lang| lang.name)
+            .collect();
+        assert_eq!(names, ["中文", "英文", "日语", "繁体中文"]);
     }
 }

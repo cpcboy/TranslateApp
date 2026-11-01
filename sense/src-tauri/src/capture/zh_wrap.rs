@@ -59,7 +59,7 @@ impl LineGeo<'_> {
     }
 }
 
-/// 汉字与拉丁字母各有多少个。翻译方向（`translate_target`）与这里的「中文为主」是同一个口径。
+/// 汉字与拉丁字母各有多少个。翻译方向（`lang::detect` 里汉字圈对拉丁字母的比较）与这里的「中文为主」是同一个口径。
 pub(super) fn script_counts(text: &str) -> (usize, usize) {
     let han = text.chars().filter(|ch| ('\u{4e00}'..='\u{9fff}').contains(ch)).count();
     let latin = text.chars().filter(|ch| ch.is_ascii_alphabetic()).count();

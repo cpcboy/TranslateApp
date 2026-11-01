@@ -6,6 +6,7 @@
 mod cache;
 mod capture;
 mod commands;
+mod lang;
 mod prompts;
 mod providers;
 mod secrets;
@@ -135,6 +136,9 @@ pub fn run() {
             commands::settings::dev_flags,
             commands::lookup::lookup,
             commands::lookup::invalidate_lookup,
+            commands::language::translate_languages,
+            commands::language::set_translate_target,
+            commands::language::plan_translation,
             commands::longtext::translate_text,
             commands::longtext::cancel_translate,
             commands::reading::check_grammar,

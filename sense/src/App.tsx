@@ -5,7 +5,7 @@ import { SettingsView } from "./features/settings/SettingsView";
 import { ResizeHandles } from "./features/window/ResizeHandles";
 import { WindowControls } from "./features/window/WindowControls";
 import { api, onHotkeyChanged } from "./lib/ipc";
-import { useLookup } from "./lib/store";
+import { routeInput, useLookup } from "./lib/store";
 import { UiScaleContext } from "./lib/uiScaleContext";
 import { useUiScale } from "./lib/useUiScale";
 
@@ -18,6 +18,7 @@ export default function App() {
   const [hint, setHint] = useState("");
   const [notice, setNotice] = useState("");
   const run = useLookup((state) => state.run);
+  const runLong = useLookup((state) => state.runLong);
   const longSource = useLookup((state) => state.longSource);
   const resetLookup = useLookup((state) => state.reset);
   const { scale, badge } = useUiScale();
@@ -48,20 +49,24 @@ export default function App() {
   }, []);
 
   // 仅 debug 构建：自动化验证时用环境变量触发一次查询。
+  // 走和输入框回车同一条路由（查词卡还是普通翻译，取决于输入和目标语言设置），验证的才是真实路径
   const devRunOnce = useRef(false);
   useEffect(() => {
     if (!isTauri || devRunOnce.current) return;
     void api
       .devFlags()
-      .then((flags) => {
-        if (!flags.dev_lookup || devRunOnce.current) return;
+      .then(async (flags) => {
+        const input = flags.dev_lookup;
+        if (!input || devRunOnce.current) return;
         devRunOnce.current = true; // StrictMode 会双跑 effect，别重复发请求
-        void run(flags.dev_lookup);
+        const route = await routeInput(input);
+        if (route === "long") void runLong(input);
+        else if (route === "word") void run(input);
       })
       .catch(() => {
         /* 拿不到就正常空跑 */
       });
-  }, [run]);
+  }, [run, runLong]);
 
   // 截屏失败（尤其没授权）必须让人看见，否则就是「按了没反应」
   useEffect(() => {

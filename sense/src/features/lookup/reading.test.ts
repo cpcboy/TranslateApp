@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { GrammarIssue } from "../../lib/ipc";
-import { findWhole, lastBlockIsOpen, markableSegments, markedCount, shouldCheckGrammar, sliceAround, splitMarked, GLOSS_WIDTH, glossPosition } from "./reading";
+import { findWhole, isEcho, lastBlockIsOpen, markableSegments, markedCount, shouldCheckGrammar, sliceAround, splitMarked, GLOSS_WIDTH, glossPosition } from "./reading";
 
 const issue = (fragment: string): GrammarIssue => ({ fragment, replacement: "", explanation: "" });
 const marked = (pieces: ReturnType<typeof splitMarked>) =>
@@ -60,6 +60,7 @@ describe("语法检查什么时候该发", () => {
     error: null,
     incomplete: null,
     checkedFor: "",
+    sourceLang: "en" as string | null,
   };
 
   it("译文完整写完才查", () => {
@@ -80,6 +81,37 @@ describe("语法检查什么时候该发", () => {
   it("中文原文和太短的原文不查", () => {
     expect(shouldCheckGrammar({ ...base, source: "这是一段很长的中文原文，".repeat(10) })).toBe(false);
     expect(shouldCheckGrammar({ ...base, source: "short text" })).toBe(false);
+  });
+
+  it("语法检查是英语的：只有 Rust 确认是英文的原文才发，别的语言、没把握的都不发", () => {
+    // 同一段文字，换成确认的语言代码：法语 / 德语 / 日语拿英语语法规则去查只会标出莫须有的错
+    for (const sourceLang of ["fr", "de", "ja", "es", "zh", "ru"]) {
+      expect(shouldCheckGrammar({ ...base, sourceLang }), sourceLang).toBe(false);
+    }
+    // 没把握（null）：不声称是英文，就不查
+    expect(shouldCheckGrammar({ ...base, sourceLang: null })).toBe(false);
+    expect(shouldCheckGrammar({ ...base, sourceLang: "en" })).toBe(true);
+  });
+});
+
+describe("isEcho：译文和原文一样", () => {
+  it("一样（只差空白）就是原样返回", () => {
+    expect(isEcho("charge", "charge")).toBe(true);
+    expect(isEcho("  charge \n", "charge")).toBe(true);
+    expect(isEcho("take  off", "take off")).toBe(true);
+    expect(isEcho("第一行\n第二行", "第一行 第二行")).toBe(true);
+  });
+
+  it("不一样就不是：大小写、标点、字都算", () => {
+    expect(isEcho("charge", "Charge")).toBe(false);
+    expect(isEcho("charge", "charge.")).toBe(false);
+    expect(isEcho("charge", "充电")).toBe(false);
+    expect(isEcho("a b", "ab")).toBe(false); // 空格不能被吃掉
+  });
+
+  it("没有内容不算一样（空原文不该冒出提示）", () => {
+    expect(isEcho("", "")).toBe(false);
+    expect(isEcho("   ", " ")).toBe(false);
   });
 });
 

@@ -1,7 +1,8 @@
 import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
-import { api, type GrammarIssue, type WordGloss } from "../../lib/ipc";
+import { api, type GrammarIssue, type LanguagePair, type WordGloss } from "../../lib/ipc";
+import { confirmedSourceCode, paneTitles } from "../../lib/languages";
 import { UiScaleContext } from "../../lib/uiScaleContext";
-import { glossPosition, lastBlockIsOpen, markedCount, shouldCheckGrammar, sliceAround, splitMarked } from "./reading";
+import { glossPosition, isEcho, lastBlockIsOpen, markedCount, shouldCheckGrammar, sliceAround, splitMarked } from "./reading";
 import { createScrollSync } from "./scrollSync";
 
 /** 复制到剪贴板：优先 Clipboard API，不行就退回 textarea + execCommand。 */
@@ -58,6 +59,7 @@ export function LongTextView({
   truncated,
   incomplete,
   error,
+  languages,
   onStop,
   onRetry,
   onBack,
@@ -69,6 +71,8 @@ export function LongTextView({
   /** 没有正常写完的原因（被停止、内容策略、没收到结束标记……）；完整时为 null */
   incomplete: string | null;
   error: string | null;
+  /** 原文语言与目标语言（Rust 翻译一开始就发来）；还没到为 null */
+  languages: LanguagePair | null;
   onStop: () => void;
   onRetry: () => void;
   onBack: () => void;
@@ -82,6 +86,9 @@ export function LongTextView({
 
   // 真正画出来的标记数，不是模型给的问题条数
   const marks = useMemo(() => markedCount(source, issues), [source, issues]);
+  const titles = paneTitles(languages);
+  // 语法检查是英语的：只对 Rust 确认是英文的原文发
+  const sourceLang = confirmedSourceCode(languages);
 
   const leftRef = useRef<HTMLDivElement>(null);
   const rightRef = useRef<HTMLDivElement>(null);
@@ -109,7 +116,7 @@ export function LongTextView({
   // 语法检查放在译文之后（B 方案：先出译文，波浪线后到）
   useEffect(() => {
     // 没写完（出错、点了停止、服务端提前收工）不查，规则见 shouldCheckGrammar
-    if (!shouldCheckGrammar({ busy, text, source, error, incomplete, checkedFor: checkedFor.current })) return;
+    if (!shouldCheckGrammar({ busy, text, source, error, incomplete, checkedFor: checkedFor.current, sourceLang })) return;
 
     checkedFor.current = source;
     const my = grammarSeq.current;
@@ -125,7 +132,7 @@ export function LongTextView({
       .finally(() => {
         if (my === grammarSeq.current) setChecking(false);
       });
-  }, [busy, text, source, error, incomplete]);
+  }, [busy, text, source, error, incomplete, sourceLang]);
 
   // 划词请求的序号：连续选词时，先发的请求后返回，不能盖掉后选的那个词的浮层
   const glossSeq = useRef(0);
@@ -234,14 +241,14 @@ export function LongTextView({
   return (
     <div className="flex h-full min-h-0 gap-3">
       <Pane
-        title="原文"
+        title={titles.source}
         hint={checking ? "检查中…" : issues.length > 0 && marks > 0 ? `${marks} 处标记` : `${source.length} 字符`}
         action={
           <div className="flex items-center gap-2">
             <button
               type="button"
               onClick={onBack}
-              className="rounded-md px-2 py-1 text-[12.5px] text-subtle hover:text-paper"
+              className="whitespace-nowrap rounded-md px-2 py-1 text-[12.5px] text-subtle hover:text-paper"
             >
               ← 返回查词
             </button>
@@ -260,7 +267,7 @@ export function LongTextView({
       </Pane>
 
       <Pane
-        title="译文"
+        title={titles.target}
         hint={busy ? "生成中…" : text ? `${error || incomplete ? "不完整 · " : ""}${text.length} 字符` : ""}
         action={
           <div className="flex items-center gap-2">
@@ -273,7 +280,7 @@ export function LongTextView({
               <button
                 type="button"
                 onClick={onStop}
-                className="rounded-md border border-[rgba(255,107,74,0.5)] px-2.5 py-1 text-[12.5px] text-acc hover:bg-[rgba(255,107,74,0.12)]"
+                className="whitespace-nowrap rounded-md border border-[rgba(255,107,74,0.5)] px-2.5 py-1 text-[12.5px] text-acc hover:bg-[rgba(255,107,74,0.12)]"
               >
                 停止
               </button>
@@ -333,6 +340,14 @@ export function LongTextView({
           </p>
         )}
 
+        {/* 写完了、没出错，译文却和原文一样：说一声，别让人以为是坏了 */}
+        {!busy && !error && !incomplete && text && isEcho(source, text) && (
+          <EchoNotice
+            target={languages?.target.name ?? null}
+            sourceKnown={sourceLang !== null && sourceLang !== languages?.target.code}
+          />
+        )}
+
         <div ref={endRef} />
       </Pane>
 
@@ -370,7 +385,22 @@ export function LongTextView({
   );
 }
 
-function Pane({
+/** 译文和原文一样时的说明（琥珀色，和别的"不是坏了、但你该知道"的提示同一个样式） */
+export function EchoNotice({ target, sourceKnown }: { target: string | null; sourceKnown: boolean }) {
+  return (
+    <p
+      role="status"
+      className="mt-3 rounded-lg border border-[rgba(240,180,94,0.35)] bg-[rgba(240,180,94,0.08)] px-3 py-2 text-[13px] leading-relaxed text-[#f0b45e]"
+    >
+      {sourceKnown
+        ? // 原文的语言已经确认、和目标语言不同（标题上写着「原文 · 英文」）：不能再说原文可能本来就是目标语言
+          "译文和原文一样：模型没有翻它。多半是代码、专有名词这类不用翻译的内容；也可以换一种目标语言再试。"
+        : `译文和原文一样：原文可能本来就是${target ?? "目标语言"}，或者是代码、专有名词这类不用翻译的内容。想查词典，请把输入框旁的目标语言改回「自动」。`}
+    </p>
+  );
+}
+
+export function Pane({
   title,
   hint,
   action,
@@ -387,8 +417,9 @@ function Pane({
 }) {
   return (
     <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-line bg-panel">
-      <header className="flex shrink-0 items-center justify-between border-b border-line px-4 py-2.5">
-        <div className="flex items-baseline gap-2">
+      {/* 窄窗口、放大字号时标题 + 提示 + 按钮一行放不下：整块换到下一行，按钮的字不换（以前「停止」会被挤成竖排） */}
+      <header className="flex shrink-0 flex-wrap items-center justify-between gap-x-3 gap-y-1.5 border-b border-line px-4 py-2.5">
+        <div className="flex items-baseline gap-2 whitespace-nowrap">
           <span className="text-[14px] font-medium text-paper">{title}</span>
           {hint && <span className="font-mono text-[12px] text-subtle">{hint}</span>}
         </div>
@@ -407,7 +438,7 @@ function CopyButton({ label, onClick, disabled }: { label: string; onClick: () =
       type="button"
       onClick={onClick}
       disabled={disabled}
-      className="rounded-md border border-line px-2.5 py-1 text-[12.5px] text-muted hover:border-line-strong hover:text-paper disabled:opacity-50"
+      className="whitespace-nowrap rounded-md border border-line px-2.5 py-1 text-[12.5px] text-muted hover:border-line-strong hover:text-paper disabled:opacity-50"
     >
       {label}
     </button>
@@ -418,7 +449,7 @@ function CopyButton({ label, onClick, disabled }: { label: string; onClick: () =
  * 按原文的结构渲染：空行 = 段落间隔，短行且无句末标点 = 小标题，`- `/`• ` = 列表。
  * 语法错误用虚线下划线 + 颜色双编码（不靠颜色单独表意），悬停看解释。
  */
-function Prose({
+export function Prose({
   text,
   tone,
   issues = [],
@@ -443,7 +474,7 @@ function Prose({
 
         if (lines.length > 0 && lines.every((line) => /^\s*[-*•]\s+/.test(line))) {
           return (
-            <ul key={index} className={`list-disc space-y-1 pl-5 text-[15px] leading-[1.75] ${color}`}>
+            <ul key={index} dir="auto" className={`list-disc space-y-1 ps-5 text-[15px] leading-[1.75] ${color}`}>
               {lines.map((line, item) => (
                 <li key={item}>{mark(line.replace(/^\s*[-*•]\s+/, ""), issues, used)}</li>
               ))}
@@ -460,14 +491,14 @@ function Prose({
 
         if (isHeading) {
           return (
-            <h3 key={index} className="pt-1 font-serif text-[19px] font-semibold leading-snug text-paper">
+            <h3 key={index} dir="auto" className="pt-1 font-serif text-[19px] font-semibold leading-snug text-paper">
               {mark(trimmed, issues, used)}
             </h3>
           );
         }
 
         return (
-          <p key={index} className={`whitespace-pre-wrap text-[15px] leading-[1.75] ${color}`}>
+          <p key={index} dir="auto" className={`whitespace-pre-wrap text-[15px] leading-[1.75] ${color}`}>
             {mark(block, issues, used)}
           </p>
         );

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isLongText } from "./route";
+import { isLongText, routeOf } from "./route";
 
 describe("isLongText：查词还是翻译", () => {
   it("一个词、词组、成语都留在词典", () => {
@@ -108,5 +108,34 @@ describe("isLongText：查词还是翻译", () => {
   it("空白不算内容", () => {
     expect(isLongText("   ")).toBe(false);
     expect(isLongText("  charge  ")).toBe(false);
+  });
+});
+
+describe("routeOf：查词卡还是普通翻译（在 isLongText 之上再看目标语言）", () => {
+  const dictionary = { dictionary: true };
+  const translate = { dictionary: false };
+
+  it("整句、长文一律普通翻译，不管 Rust 怎么说", () => {
+    for (const plan of [dictionary, translate, null]) {
+      expect(routeOf("This is a complete sentence that needs translating.", plan)).toBe("long");
+      expect(routeOf("今天天气很好，我们一起去公园散步吧，好不好？", plan)).toBe("long");
+      expect(routeOf("a\nb", plan)).toBe("long");
+    }
+  });
+
+  it("短输入：Rust 说走查词卡就查词（中 ↔ 英，默认方向）", () => {
+    expect(routeOf("charge", dictionary)).toBe("word");
+    expect(routeOf("落实", dictionary)).toBe("word");
+  });
+
+  it("短输入：Rust 说不走（别的语言、或手选了别的目标语言）就普通翻译——一个词也是", () => {
+    expect(routeOf("bonjour", translate)).toBe("long");
+    expect(routeOf("charge", translate)).toBe("long");
+    expect(routeOf("こんにちは", translate)).toBe("long");
+  });
+
+  it("拿不到 Rust 的结论（IPC 出错）：按以前的办法，短输入查词典", () => {
+    expect(routeOf("charge", null)).toBe("word");
+    expect(routeOf("落实", null)).toBe("word");
   });
 });

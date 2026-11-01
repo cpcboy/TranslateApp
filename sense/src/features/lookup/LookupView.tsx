@@ -1,15 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { isLongText } from "../../lib/route";
+import { useTarget } from "../../lib/languages";
 import { buildPreview } from "../../lib/schema";
-import { useLookup } from "../../lib/store";
+import { routeInput, useLookup } from "../../lib/store";
 import type { WordEntry } from "../../lib/schema";
 import { previewForDisplay, translatedFrom, untranslatedNotice } from "../../lib/translated";
 import { cn } from "../../lib/cn";
 import { ErrorState } from "./ErrorState";
+import { pickerEscHandler, pickTarget, submitInput } from "./inputFlow";
 import { LongTextView } from "./LongTextView";
 import { SenseCard } from "./SenseCard";
 import { Skeleton } from "./Skeleton";
+import { TargetButton, TargetPanel } from "./TargetPicker";
 
 const EXAMPLES = ["charge", "落实", "run", "交代"];
 
@@ -28,6 +30,7 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
     longBusy,
     longTruncated,
     longIncomplete,
+    longLang,
     run,
     runLong,
     cancelLong,
@@ -35,6 +38,23 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
   } = useLookup();
   const [text, setText] = useState("");
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const { pref, languages, error: targetError, load: loadTargets, choose, clearError } = useTarget();
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const closePicker = () => setPickerOpen(false);
+  const focusInput = () => inputRef.current?.focus();
+
+  // 能选哪些语言、现在选了哪个：Rust 持有（截屏翻译也用它），进来时取一次
+  useEffect(() => {
+    void loadTargets();
+  }, [loadTargets]);
+
+  // 选择器展开时 Esc 先把它收起来（逻辑在 inputFlow.ts，有单测）
+  useEffect(() => {
+    if (!pickerOpen) return;
+    const onKey = pickerEscHandler({ closePicker: () => setPickerOpen(false), focusInput: () => inputRef.current?.focus() });
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [pickerOpen]);
 
   // 窗口一显示就聚焦输入框：用户按完快捷键应该能直接打字。
   useEffect(() => {
@@ -69,17 +89,18 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
     [partial, entry, query],
   );
 
-  const submit = () => {
-    const value = text.trim();
-    if (!value) return;
-    // 一句话以上就当长文翻译：查词那套 JSON 契约放不下句子和文章（规则见 route.ts）
-    if (isLongText(value)) {
-      void runLong(value);
-      setText("");
-      return;
-    }
-    void run(value);
+  // 查词卡还是普通翻译：一句话以上走翻译（查词那套 JSON 契约放不下句子和文章），
+  // 别的语言、或者手选了别的目标语言，一个词也走翻译（规则见 route.ts 与 lang.rs；流程在 inputFlow.ts，有单测）
+  const inputActions = {
+    routeInput,
+    run: (value: string) => void run(value),
+    runLong: (value: string) => void runLong(value),
+    clearInput: () => setText(""),
+    closePicker,
   };
+  const submit = (raw: string = text) => submitInput(raw, inputActions);
+  // 重试不碰输入框：失败之后用户可能已经在里面打了新的内容，不能替他清掉
+  const retry = (value: string) => submitInput(value, { ...inputActions, clearInput: () => {} });
 
   const busy = status === "loading" || status === "streaming";
 
@@ -92,7 +113,7 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
             ref={inputRef}
             value={text}
             rows={1}
-            aria-label="查一个词，或粘贴一段长文"
+            aria-label="查一个词，或粘贴任意语言的文字"
             onChange={(event) => setText(event.currentTarget.value)}
             onKeyDown={(event) => {
               // Enter 翻译，Shift+Enter 换行；输入法组字时不拦。
@@ -104,7 +125,7 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
                 event.nativeEvent.keyCode !== 229
               ) {
                 event.preventDefault();
-                submit();
+                void submit();
               }
             }}
             className="max-h-[200px] w-full resize-none overflow-y-auto bg-transparent text-[18px] leading-[1.6] text-paper focus:outline-none"
@@ -112,13 +133,33 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
           {/* 自绘占位符：WKWebView 里 input 的 placeholder 渲染不出中文 */}
           {text.length === 0 && (
             <span aria-hidden="true" className="pointer-events-none absolute inset-y-0 left-0 flex items-center text-[18px] text-subtle">
-              查一个词（中文会先译成英文）
+              查一个词，或粘贴任意语言的文字
             </span>
           )}
         </div>
         {busy && <span className="font-mono text-[13.5px] text-muted">查询中</span>}
+        {languages.length > 0 && (
+          <TargetButton
+            pref={pref}
+            languages={languages}
+            open={pickerOpen}
+            onClick={() => {
+              if (!pickerOpen) clearError(); // 上一回存失败的提示说的是上一回的事
+              setPickerOpen(!pickerOpen);
+            }}
+          />
+        )}
         <kbd className="rounded border border-line px-2 py-1 font-mono text-[13.5px] text-muted">↵</kbd>
       </div>
+
+      {pickerOpen && languages.length > 0 && (
+        <TargetPanel
+          pref={pref}
+          languages={languages}
+          error={targetError}
+          onChoose={(code) => void pickTarget(code, choose, { closePicker, focusInput })}
+        />
+      )}
 
       <div className="min-h-0 flex-1 overflow-y-auto pr-0.5">
         {longSource ? (
@@ -129,6 +170,7 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
             truncated={longTruncated}
             incomplete={longIncomplete}
             error={error ? error.message : null}
+            languages={longLang}
             onStop={() => void cancelLong()}
             onRetry={() => void runLong(longSource)}
             onBack={() => reset()}
@@ -136,7 +178,7 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
         ) : error ? (
           <ErrorState
             error={error}
-            onRetry={() => void run(query)}
+            onRetry={() => void retry(query)} // 重试也走路由：失败之后换了目标语言再点，要重新分流
             onOpenSettings={onOpenSettings}
           />
         ) : entry || preview ? (
@@ -152,7 +194,7 @@ export function LookupView({ onOpenSettings }: { onOpenSettings: () => void }) {
           // 以前只在 loading 时画骨架，streaming 却没有预览时会闪一下首页
           <Skeleton />
         ) : (
-          <Empty onPick={(word) => { setText(word); void run(word); }} />
+          <Empty onPick={(word) => { setText(word); void submit(word); }} />
         )}
       </div>
 
@@ -224,6 +266,11 @@ function Empty({ onPick }: { onPick: (word: string) => void }) {
         输入中文，会先译成英文，再解析那个英文词。
         <br />
         查过的词会存本地，第二次不再走网络。
+      </p>
+      <p className="mt-3 text-[16px] leading-relaxed text-muted">
+        粘贴句子、长文或其它语言的文字，会自动识别原文语言再翻译：
+        <br />
+        默认译成中文，原文是中文则译成英文；输入框右边可以改成别的语言。
       </p>
       <div className="mt-5 flex flex-wrap justify-center gap-2">
         {EXAMPLES.map((word) => (

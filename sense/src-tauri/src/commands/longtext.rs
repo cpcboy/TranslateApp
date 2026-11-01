@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
+use crate::commands::language::{load_pref, Languages};
+use crate::lang::{self, Lang};
 use crate::providers as provider_registry;
 use crate::providers::openai_compat;
 use crate::secrets;
@@ -44,6 +46,9 @@ pub struct LongTextResult {
     pub truncated: bool,
     /// 其它没有正常写完的原因：被停止、被内容策略中止、没收到结束标记……正常结束为 None。
     pub incomplete: Option<String>,
+    /// 原文语言与目标语言（开始时已经用事件告诉过前端一次，这里再带一份，结果自成一体）。
+    #[serde(flatten)]
+    pub languages: Languages,
 }
 
 /// 结束方式 → 「译文不完整」的原因。正常结束（stop，或只收到 [DONE]）返回 None；
@@ -67,10 +72,28 @@ struct LongTextDelta {
     text: String,
 }
 
-fn looks_chinese(text: &str) -> bool {
-    let cjk = text.chars().filter(|ch| ('\u{4e00}'..='\u{9fff}').contains(ch)).count();
-    let latin = text.chars().filter(|ch| ch.is_ascii_alphabetic()).count();
-    cjk * 2 >= latin && cjk > 0
+/// 翻译开始时告诉前端：原文是什么语言、会译成什么语言（两栏的标题据此标出）。
+#[derive(Clone, Serialize)]
+struct LongTextLang {
+    request_id: String,
+    #[serde(flatten)]
+    languages: Languages,
+}
+
+/// 长文翻译的系统提示词，目标语言按偏好与原文语言取（规则见 `lang.rs`）。
+///
+/// 头一句是 `tools/mock-provider.mjs` 认「长文翻译」请求的标记（MARKERS.longText），必须原样保留。
+/// 目标是中文、英文时与改动前逐字节相同（单测钉着）；模型自己认原文语言，这里不另外告诉它。
+fn system_prompt(target: &Lang) -> String {
+    format!(
+        "你是翻译引擎。把 user 给的整篇文本翻译成{}。\n\
+         要求：\n\
+         1. 先通读全文再动笔，术语、人名、指代前后保持一致；\n\
+         2. 保留原有分段与换行；\n\
+         3. 代码、命令、路径、URL、版本号、数字原样保留；\n\
+         4. 只输出译文，不要解释、不要加引号或 Markdown 代码块。",
+        target.name
+    )
 }
 
 /// 整篇翻译。增量通过 `sense://longtext-delta` 推给右栏。
@@ -89,6 +112,18 @@ pub async fn translate_text(
     let id = begin();
     let stopped = move || is_cancelled(id);
 
+    // 目标语言 = 偏好 + 原文语言。在读钥匙串、发请求之前就告诉前端：
+    // 不管后面成功还是失败，两栏的标题都标得出"日语 → 中文"
+    let plan = lang::plan(&source, load_pref(&app));
+    let languages = Languages::of(&plan);
+    let _ = app.emit(
+        "sense://longtext-lang",
+        LongTextLang {
+            request_id: request_id.clone(),
+            languages: languages.clone(),
+        },
+    );
+
     let provider = provider_registry::active(&app)?;
     let key = if provider.requires_key {
         secrets::get_key(&provider.id)?
@@ -96,15 +131,7 @@ pub async fn translate_text(
         None
     };
 
-    let target = if looks_chinese(&source) { "英文" } else { "中文" };
-    let system = format!(
-        "你是翻译引擎。把 user 给的整篇文本翻译成{target}。\n\
-         要求：\n\
-         1. 先通读全文再动笔，术语、人名、指代前后保持一致；\n\
-         2. 保留原有分段与换行；\n\
-         3. 代码、命令、路径、URL、版本号、数字原样保留；\n\
-         4. 只输出译文，不要解释、不要加引号或 Markdown 代码块。"
-    );
+    let system = system_prompt(plan.target);
 
     let reasoning = provider_registry::reasoning_fields(&provider.id);
     let body = openai_compat::build_body(
@@ -143,6 +170,7 @@ pub async fn translate_text(
         truncated: finish_reason == Some("length"),
         incomplete: incomplete_reason(finish_reason, outcome.done, outcome.cancelled),
         text: outcome.text,
+        languages,
     })
 }
 
@@ -174,11 +202,69 @@ mod tests {
         assert!(!is_cancelled(second), "之后开始的新翻译不受影响");
     }
 
+    fn target_of(source: &str, pref: &str) -> &'static str {
+        lang::plan(source, pref).target.code
+    }
+
     #[test]
-    fn target_language_follows_source() {
-        assert!(looks_chinese("这是一段中文"));
-        assert!(!looks_chinese("this is english"));
-        // 中英混排偏英文时仍译成中文
-        assert!(!looks_chinese("Rust 的所有权模型 the ownership model in Rust"));
+    fn default_direction_is_unchanged() {
+        // 改动前就是这样判的：中文 → 英文，其它 → 中文；中英混排偏英文时仍译成中文
+        assert_eq!(target_of("这是一段中文", lang::AUTO), "en");
+        assert_eq!(target_of("this is english", lang::AUTO), "zh");
+        assert_eq!(target_of("Rust 的所有权模型 the ownership model in Rust", lang::AUTO), "zh");
+    }
+
+    #[test]
+    fn target_follows_the_preference_and_falls_back_when_source_is_already_that_language() {
+        assert_eq!(target_of("今日は天気がいいですね", lang::AUTO), "zh", "日语默认译成中文（以前会因为带汉字译成英文）");
+        assert_eq!(target_of("这是一段中文", "ja"), "ja");
+        assert_eq!(target_of("This is an English sentence about the weather.", "fr"), "fr");
+        assert_eq!(target_of("这是一段中文", "zh"), "en", "选的就是原文语言：退回默认");
+        assert_eq!(target_of("This is an English sentence about the weather.", "en"), "zh");
+    }
+
+    /// 改动前 `translate_text` 里的提示词（目标写成 {T}）。默认方向的提示词一个字节都不能变：
+    /// 它在真实模型上核对过，mock 也靠头一句认请求。
+    const PROMPT_BEFORE: &str = "你是翻译引擎。把 user 给的整篇文本翻译成{T}。\n要求：\n1. 先通读全文再动笔，术语、人名、指代前后保持一致；\n2. 保留原有分段与换行；\n3. 代码、命令、路径、URL、版本号、数字原样保留；\n4. 只输出译文，不要解释、不要加引号或 Markdown 代码块。";
+
+    #[test]
+    fn prompt_is_byte_identical_for_the_default_directions() {
+        for code in ["zh", "en"] {
+            let target = lang::lang_by_code(code).expect("表里有");
+            assert_eq!(system_prompt(target), PROMPT_BEFORE.replace("{T}", target.name), "{code}");
+        }
+    }
+
+    #[test]
+    fn prompt_names_the_chosen_language() {
+        for target in lang::LANGS {
+            let prompt = system_prompt(target);
+            assert!(prompt.starts_with(&format!("你是翻译引擎。把 user 给的整篇文本翻译成{}。", target.name)), "{prompt}");
+            // 其余几条要求不随语言变
+            assert!(prompt.ends_with("4. 只输出译文，不要解释、不要加引号或 Markdown 代码块。"), "{}", target.code);
+        }
+        assert!(system_prompt(lang::lang_by_code("ja").unwrap()).contains("翻译成日语。"));
+        assert!(system_prompt(lang::lang_by_code("zh-Hant").unwrap()).contains("翻译成繁体中文。"));
+    }
+
+    #[test]
+    fn result_carries_both_languages_at_the_top_level() {
+        let plan = lang::plan("こんにちは", "en");
+        let value = serde_json::to_value(LongTextResult {
+            text: "Hello".into(),
+            truncated: false,
+            incomplete: None,
+            languages: Languages::of(&plan),
+        })
+        .expect("序列化");
+        assert_eq!(value["text"], "Hello");
+        assert_eq!(value["source"]["code"], "ja");
+        assert_eq!(value["source_confident"], true);
+        assert_eq!(value["target"]["code"], "en");
+
+        let event = serde_json::to_value(LongTextLang { request_id: "r1".into(), languages: Languages::of(&plan) })
+            .expect("序列化");
+        assert_eq!(event["request_id"], "r1");
+        assert_eq!(event["target"]["code"], "en");
     }
 }

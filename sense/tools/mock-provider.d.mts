@@ -6,6 +6,12 @@ export const MARKERS: {
   explain: string;
 };
 
+/** 认出请求类型和翻译目标语言（长文、截屏提示词里的「翻译成{语言名}」）；只用于日志 */
+export function describeRequest(body: { messages?: Array<{ content?: string }> } | null | undefined): {
+  task: "capture" | "longText" | "grammar" | "explain" | "word";
+  target: string | null;
+};
+
 /** 中文输入那一节提示词的标题；system 里有它，mock 才会回译成英文的词条 */
 export const ZH_SECTION: string;
 

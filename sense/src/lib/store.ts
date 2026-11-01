@@ -1,5 +1,7 @@
 import { create } from "zustand";
-import { api, onDelta, type LookupError } from "./ipc";
+import { api, onDelta, type LanguagePair, type LookupError } from "./ipc";
+import { parsePair } from "./languages";
+import { isLongText, routeOf, type Route } from "./route";
 import { detectLang, parseWordEntry, type WordEntry } from "./schema";
 import { parseFinal, tryParsePartial, type PartialEntry } from "./stream";
 import { asEnglishEntry, translationProblem } from "./translated";
@@ -35,6 +37,8 @@ type LookupState = {
   longTruncated: boolean;
   /** 译文没有正常写完的原因（被停止、内容策略、没收到结束标记……）；完整时为 null */
   longIncomplete: string | null;
+  /** 这一篇的原文语言与目标语言（翻译一开始 Rust 就发来）；还没到为 null */
+  longLang: LanguagePair | null;
   run: (word: string) => Promise<void>;
   runLong: (text: string) => Promise<void>;
   cancelLong: () => Promise<void>;
@@ -56,6 +60,7 @@ const empty = {
   longBusy: false,
   longTruncated: false,
   longIncomplete: null,
+  longLang: null as LanguagePair | null,
 };
 
 /**
@@ -116,6 +121,20 @@ export const useLookup = create<LookupState>((set, get) => ({
         if (pending === null) pending = setTimeout(flush, 60);
       },
     );
+    // 原文语言与目标语言：翻译一开始 Rust 就发来，两栏的标题据此标出（失败的翻译也有）。
+    // 标题只是锦上添花：订阅不上就算了，不能拖垮翻译本身（也不能让上面那个订阅泄漏）
+    const unlistenLang = await listen<{ request_id?: string }>("sense://longtext-lang", (event) => {
+      if (my !== epoch || event.payload?.request_id !== requestId) return;
+      const pair = parsePair(event.payload);
+      if (pair) set({ longLang: pair });
+    }).catch(() => () => {});
+
+    // 订阅这两个事件的 await 期间被取代了（离开阅读视图、又提交了别的）：别再发请求。发出去的译文没人要，还白计费
+    if (my !== epoch) {
+      unlisten();
+      unlistenLang();
+      return;
+    }
 
     try {
       // 整篇一次送：切块会丢上下文，译文会和原文意思有偏
@@ -127,6 +146,7 @@ export const useLookup = create<LookupState>((set, get) => ({
         longText: result.text,
         longTruncated: result.truncated,
         longIncomplete: result.incomplete,
+        longLang: parsePair(result) ?? get().longLang,
         longBusy: false,
       });
     } catch (err) {
@@ -138,9 +158,20 @@ export const useLookup = create<LookupState>((set, get) => ({
         longBusy: false,
         error: { code: "longtext", message: String(err).replace(/^Error:\s*/, "") },
       });
+      // 语言事件在发请求之前就发出了，按理早到；万一没到（事件和命令回复走两条通道），标题退回只写「原文」「译文」太可惜：
+      // 问一次 Rust 补上（本地计算，不发请求）
+      if (get().longLang === null) {
+        try {
+          const pair = parsePair(await api.planTranslation(text));
+          if (my === epoch && pair && get().longLang === null) set({ longLang: pair });
+        } catch {
+          /* 补不上就算了 */
+        }
+      }
     } finally {
       if (pending !== null) clearTimeout(pending);
       unlisten();
+      unlistenLang();
     }
   },
 
@@ -201,6 +232,12 @@ export const useLookup = create<LookupState>((set, get) => ({
       dirty = true;
       if (pending === null) pending = setTimeout(flush, 66);
     });
+
+    // 订阅的 await 期间被取代了（离开、又查了别的词）：别再发请求，也别留着监听
+    if (my !== epoch) {
+      unlisten();
+      return;
+    }
 
     try {
       const first = await api.lookup({ word, requestId, temperature: 0.3 });
@@ -273,6 +310,21 @@ export const useLookup = create<LookupState>((set, get) => ({
     }
   },
 }));
+
+let routeSeq = 0;
+
+/**
+ * 一次提交该走哪条路（规则见 route.ts 的 `routeOf`）。短输入要先问 Rust 目标语言，这一问是异步的：
+ * 连按两次回车时，慢的那次不能抢在新的一次后面开跑，所以被更新的一次取代了就返回 null——调用方什么也别做。
+ */
+export async function routeInput(raw: string): Promise<Route | null> {
+  const value = raw.trim();
+  if (!value) return null;
+  const my = ++routeSeq;
+  const plan = isLongText(value) ? null : await api.planTranslation(value).catch(() => null);
+  if (my !== routeSeq) return null;
+  return routeOf(value, plan);
+}
 
 type Validated =
   /** untranslated：中文输入没能译成英文，这张卡是降级展示的中文词条（界面据此在卡片上方明说） */

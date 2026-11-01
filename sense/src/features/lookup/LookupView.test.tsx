@@ -6,7 +6,7 @@ import { makeEntry } from "../../lib/testing";
 // store 换成「想让它是什么就是什么」的假 hook：LookupView / ResultCard 本体是真代码。
 // 用 react-dom/server 渲染成 HTML 字符串来看画了什么——node 环境不需要 DOM；effect 不会执行，也用不到窗口 API。
 const store = vi.hoisted(() => ({ current: {} as Record<string, unknown> }));
-vi.mock("../../lib/store", () => ({ useLookup: () => store.current }));
+vi.mock("../../lib/store", () => ({ useLookup: () => store.current, routeInput: vi.fn() }));
 
 import { LookupView, ResultCard } from "./LookupView";
 import { SenseCard } from "./SenseCard";
@@ -26,6 +26,7 @@ const idle = () => ({
   longBusy: false,
   longTruncated: false,
   longIncomplete: null,
+  longLang: null,
   run: vi.fn(),
   runLong: vi.fn(),
   cancelLong: vi.fn(),

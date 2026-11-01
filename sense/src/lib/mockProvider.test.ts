@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createMock, MARKERS, ZH_SECTION, type MockServer } from "../../tools/mock-provider.mjs";
+import { createMock, describeRequest, MARKERS, ZH_SECTION, type MockServer } from "../../tools/mock-provider.mjs";
 // 用 Vite 的 ?raw 读 Rust 源码：不引入 Node 类型依赖
 import captureRs from "../../src-tauri/src/capture.rs?raw";
 import longtextRs from "../../src-tauri/src/commands/longtext.rs?raw";
@@ -156,5 +156,38 @@ describe("mock-provider 的 UNTRANSLATED 模式：模拟不听话的模型", () 
     } finally {
       await new Promise<void>((resolve) => untranslated.close(() => resolve()));
     }
+  });
+});
+
+describe("mock-provider 的日志认得出翻译目标语言（端到端验证靠它看发给模型的提示词）", () => {
+  const body = (system: string) => ({ messages: [{ content: system }, { content: "x" }] });
+
+  it("长文翻译：从「翻译成{语言名}。」里取出语言名", () => {
+    for (const name of ["中文", "英文", "日语", "繁体中文", "印度尼西亚语"]) {
+      expect(describeRequest(body(`${MARKERS.longText}${name}。\n要求：\n1. 先通读全文再动笔`))).toEqual({
+        task: "longText",
+        target: name,
+      });
+    }
+  });
+
+  it("截屏翻译：从「逐条翻译成{语言名}；」里取出语言名", () => {
+    expect(describeRequest(body(`${MARKERS.capture}。\n1. 先通读全部条目，再逐条翻译成法语；指代、术语前后保持一致。`))).toEqual({
+      task: "capture",
+      target: "法语",
+    });
+  });
+
+  it("跟 Rust 里真实的提示词对得上：两处提示词的措辞改了，这里的正则要跟着改", () => {
+    // 不是随手写的样例：直接对 Rust 源码里的措辞
+    expect(longtextRs).toContain("整篇文本翻译成{}。");
+    expect(captureRs).toContain("再逐条翻译成{target}；");
+  });
+
+  it("别的请求没有目标语言", () => {
+    expect(describeRequest(body(MARKERS.grammar))).toEqual({ task: "grammar", target: null });
+    expect(describeRequest(body(MARKERS.explain))).toEqual({ task: "explain", target: null });
+    expect(describeRequest(body("# 角色\n词典"))).toEqual({ task: "word", target: null });
+    expect(describeRequest(null)).toEqual({ task: "word", target: null });
   });
 });

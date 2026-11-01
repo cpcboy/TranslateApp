@@ -30,6 +30,19 @@ export const MARKERS = {
 };
 
 /**
+ * 认出请求类型和翻译目标语言，只用于日志：无 Key 的端到端验证里，靠它看见「发给模型的提示词里目标语言是什么」。
+ * 长文和截屏提示词把目标写成「翻译成{语言名}」，语言名就是 lang.rs 语言表里的中文名。
+ */
+export function describeRequest(body) {
+  const system = body?.messages?.[0]?.content ?? "";
+  if (system.includes(MARKERS.capture)) return { task: "capture", target: /逐条翻译成(.+?)；/.exec(system)?.[1] ?? null };
+  if (system.includes(MARKERS.longText)) return { task: "longText", target: /翻译成(.+?)。/.exec(system)?.[1] ?? null };
+  if (system.includes(MARKERS.grammar)) return { task: "grammar", target: null };
+  if (system.includes(MARKERS.explain)) return { task: "explain", target: null };
+  return { task: "word", target: null };
+}
+
+/**
  * 中文输入那一节提示词的标题（system-word-zh.txt 的第一行）。
  * 模型是被提示词教会「先译成英文」的：mock 只有在 system 里看到这一节，才像听话的模型那样回英文词条；
  * 看不到就按老办法回中文词条。这样 Rust 一侧要是忘了给中文输入发这一节，无 Key 的端到端会变红，而不是悄悄「成功」。
@@ -181,6 +194,8 @@ export function createMock({ delay = 35, bad = false, untranslated = false, log:
         log(
           `  > model=${body.model} max_tokens=${body.max_tokens ?? "-"} temperature=${body.temperature ?? "-"} thinking=${JSON.stringify(thinking)}`,
         );
+        const { task, target } = describeRequest(body);
+        log(`  > task=${task} target=${target ?? "-"}`);
         source = answerFor(body, bad, untranslated);
       } else {
         log("  > body 解析失败");

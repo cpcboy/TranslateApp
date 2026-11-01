@@ -61,6 +61,9 @@ export function splitMarked(text: string, issues: GrammarIssue[], used: Set<numb
  *
  * 没写完（出错、被停止、服务端提前收工）就不查：那是在白白花一次请求，
  * 而且用户马上会点「重新翻译」；译文完整了自然会再走到这里。
+ *
+ * 语法检查的提示词是英语的：`sourceLang` 是 Rust **确认**的原文语言代码，只有 `en` 才查。
+ * 法语、德语、日语……拿英语语法规则去检查，只会标出一堆莫须有的错；没把握（null）也不查。
  */
 export function shouldCheckGrammar(state: {
   busy: boolean;
@@ -69,13 +72,25 @@ export function shouldCheckGrammar(state: {
   error: string | null;
   incomplete: string | null;
   checkedFor: string;
+  sourceLang: string | null;
 }): boolean {
-  const { busy, text, source, error, incomplete, checkedFor } = state;
+  const { busy, text, source, error, incomplete, checkedFor, sourceLang } = state;
   if (busy || !text || !source || error || incomplete) return false;
   if (checkedFor === source) return false;
+  if (sourceLang !== "en") return false;
   const latin = (source.match(/[a-zA-Z]/g) ?? []).length;
   const cjk = (source.match(/[一-鿿]/g) ?? []).length;
-  return latin >= 40 && cjk * 2 < latin; // 中文原文不查语法
+  return latin >= 40 && cjk * 2 < latin; // 中文为主的原文不查语法
+}
+
+/**
+ * 译文和原文一样（只差空白）：模型原样返回了，或者原文本来就是目标语言、是代码 / 专有名词这类不用翻译的东西。
+ * 阅读视图据此在译文下面说一声，免得用户以为"没翻"是坏了（尤其是选了英文、却输入了一个没认出的英文词时）。
+ */
+export function isEcho(source: string, text: string): boolean {
+  const flat = (value: string) => value.split(/\s+/).filter(Boolean).join(" ");
+  const a = flat(source);
+  return a.length > 0 && a === flat(text);
 }
 
 /**

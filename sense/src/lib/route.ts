@@ -77,6 +77,21 @@ function endsLikeSentence(text: string): boolean {
   return !isAbbreviation(last.slice(0, -1)) && !isAbbreviation(last);
 }
 
+/** 一次提交走哪条路：`word` = 查词卡，`long` = 普通翻译（原文 / 译文两栏对照）。 */
+export type Route = "word" | "long";
+
+/**
+ * 在 `isLongText` 之上再看目标语言：查词卡只做中 ↔ 英（契约里 `lang` 只有 en / zh），
+ * 别的语言、或者手选了别的目标语言，一个词也走普通翻译。
+ *
+ * `plan` 来自 Rust 的 `plan_translation`（它认原文语言、读目标语言偏好）；
+ * 拿不到（IPC 出错）就按以前的办法：短输入查词典。
+ */
+export function routeOf(input: string, plan: { dictionary: boolean } | null): Route {
+  if (isLongText(input)) return "long";
+  return plan === null || plan.dictionary ? "word" : "long";
+}
+
 export function isLongText(input: string): boolean {
   const text = input.trim();
   if (!text) return false;
