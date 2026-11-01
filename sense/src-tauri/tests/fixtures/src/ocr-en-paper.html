@@ -1,0 +1,30 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><style>
+html,body{margin:0;background:#fff;color:#111;font-family:"Times New Roman",Times,serif;overflow:hidden}
+.w{position:absolute;left:40px;top:24px;width:880px}
+h1{font-size:24px;margin:0 0 14px;text-align:center;font-weight:700}
+.cols{column-count:2;column-gap:36px;text-align:justify;-webkit-hyphens:auto;hyphens:auto;font-size:15px;line-height:1.18}
+h2{font-size:16px;margin:0 0 4px;font-weight:700}
+p{margin:0;text-indent:1.4em}
+p.first{text-indent:0}
+a{color:#1a2fd0;text-decoration:none}
+ul{margin:6px 0 6px;padding-left:1.6em;text-align:left}
+li{margin:0 0 2px}
+.cap{font-size:13px;margin:8px 0 8px;text-indent:0}
+</style></head><body>
+<div class="w">
+<h1>Reading Paragraphs From Screenshots</h1>
+<div class="cols">
+<h2>1 Introduction</h2>
+<p class="first">Translating text that appears on a screen is harder than translating a document, because the text has already been laid out. Every line break was chosen by a typesetting engine and not by the author, so a sentence is often cut in the middle of a phrase.</p>
+<p>A translator that treats each visual line as a separate unit will therefore produce a translation that reads badly, and it may even move words from one line to the next without anyone noticing (<a>Smith et al., 2018</a>). We recover whole paragraphs from the geometry of the recognized lines instead.</p>
+<ul>
+<li>Headings are never merged with the text below them.</li>
+<li>Every list item starts a new unit of its own.</li>
+</ul>
+<p class="cap">Figure 1: Lines that belong to one paragraph are joined into a single block before translation.</p>
+<h2>2 Method</h2>
+<p class="first">Two lines belong together when the upper line is full, its sentence is not finished, and the lower line is the natural continuation of it. A line that stops early, ends with a period or starts a new item is left alone, because merging it would be worse than not merging it at all.</p>
+<p>Hyphenated words such as inter-national are joined without a space, so the translator sees the word the author wrote.</p>
+</div>
+</div>
+</body></html>
