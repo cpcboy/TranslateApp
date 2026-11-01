@@ -18,6 +18,7 @@
 - **当前阶段**：**M1 已完成**（D1–D5）：查 `charge` 出完整义项卡、二次查询命中缓存 0 请求。下一步 W2（D6 划词 / D7 截图 / D8 OCR / D9–D10 校对）
 - **交接材料**：`SENSE-v1.0/`（只读参考，勿修改其中 `spec/` 与 `docs/`）
 - **工程目录**：`sense/`（D1 建立）
+- **分发与更新**：应用内自动更新（`sense/src-tauri/src/updater.rs`，从 GitHub Release 取 `latest.json`，下载验签后提示重启）；`sense/tools/release.sh` 构建 Apple 芯片 + Intel 两个更新包，默认不上传，`--publish` 才发布。**创建 Release 与 push 同级，每次需要单独授权**；更新私钥只在负责人本机，不进仓库、不进聊天
 
 ## 六条硬约束（违反任何一条即视为做错）
 
@@ -35,4 +36,5 @@
 - 一次只做一天的任务，做完先自验（跑命令、看 DOM、截图），再汇报。
 - 汇报固定格式：**做了什么 / 怎么验证的 / 还剩什么 / 卡在哪**。
 - 界面文案用中文。
-- 不提交真实 Key，不 push 到远端（除非当次明确授权）。
+- 不提交真实 Key 与更新私钥，不 push 到远端、不创建 GitHub Release（除非当次明确授权）。
+- AI 代理不得读取、打印、复制更新私钥 `~/.tauri/sense-updater.key`（没设密码，谁读到谁就能给所有已装机器签更新）；签名只经 `sense/tools/release.sh`。
