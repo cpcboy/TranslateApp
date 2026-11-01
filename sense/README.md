@@ -172,7 +172,7 @@ macOS 上的 AI 翻译器。查一个词，给一张完整的义项卡——音�
 
 **一次性准备**：
 
-1. 更新签名密钥（**这台电脑上已经生成**：2026-11-01，`~/.tauri/sense-updater.key`，权限 600，**没设密码**）。「无密码」是 AI 在负责人说「太麻烦了，不用密钥吧」之后替他选的，**还没有得到明确确认**——第一个 Release 发出去之前随时可以换成带密码的（重新生成、把新公钥填进 `tauri.conf.json`、重跑测试）。私钥只存本机，**不要入库、不要贴进聊天**（`.gitignore` 兜着 `*.key`，`release.sh` 拒绝放在仓库目录里的私钥）：丢了，已装的机器就再也收不到更新（只能手动重装）；泄露了，别人只要还能控制更新端点就能给所有已装机器推更新；没有密码，所以谁能读到这个文件谁就能签——**请自己备份 `sense-updater.key` 和 `sense-updater.key.pub` 两个文件**（密码管理器 / 加密备份盘；`.pub` 丢了可以把 `tauri.conf.json` 里的 pubkey 原样写成它，`release.sh` 没有它会直接失败）。发布时 `release.sh` 会问私钥密码，没设密码就直接回车（或 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD= ./tools/release.sh`）。
+1. 更新签名密钥（**这台电脑上已经生成**：2026-11-01，`~/.tauri/sense-updater.key`，权限 600，**没设密码**）。「无密码」是 AI 在负责人说「太麻烦了，不用密钥吧」之后替他选的，负责人随后（2026-11-01）明确回复「接受无密码」；第一个 Release 发出去之前仍可以换成带密码的（重新生成、把新公钥填进 `tauri.conf.json`、重跑测试）。私钥只存本机，**不要入库、不要贴进聊天**（`.gitignore` 兜着 `*.key`，`release.sh` 拒绝放在仓库目录里的私钥）：丢了，已装的机器就再也收不到更新（只能手动重装）；泄露了，别人只要还能控制更新端点就能给所有已装机器推更新；没有密码，所以谁能读到这个文件谁就能签——**请自己备份 `sense-updater.key` 和 `sense-updater.key.pub` 两个文件**（密码管理器 / 加密备份盘；`.pub` 丢了可以把 `tauri.conf.json` 里的 pubkey 原样写成它，`release.sh` 没有它会直接失败）。发布时 `release.sh` 会问私钥密码，没设密码就直接回车（或 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD= ./tools/release.sh`）。
    换一台电脑发布：把这两个文件拷过去、私钥权限改成 600 就行。**不要重新生成**——新密钥就是新公钥，换钥的代价见下面「更换更新密钥、私钥丢了或泄露了」。真要重新生成：
    ```bash
    cd sense && npx --no-install tauri signer generate -w ~/.tauri/sense-updater.key   # 会问密码，可以直接回车；加 --ci -p "" 免交互
