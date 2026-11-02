@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createMock, describeRequest, MARKERS, ZH_SECTION, type MockServer } from "../../tools/mock-provider.mjs";
+import { createMock, describeRequest, MARKERS, parseDrop, ZH_SECTION, type MockServer } from "../../tools/mock-provider.mjs";
 // 用 Vite 的 ?raw 读 Rust 源码：不引入 Node 类型依赖
 import captureRs from "../../src-tauri/src/capture.rs?raw";
 import longtextRs from "../../src-tauri/src/commands/longtext.rs?raw";
@@ -45,9 +45,9 @@ beforeAll(async () => {
 
 afterAll(() => new Promise<void>((resolve) => server.close(() => resolve())));
 
-/** 按真实请求的形状发一次，把 SSE 增量拼成完整文本 */
-async function ask(system: string, user: string): Promise<string> {
-  const response = await fetch(`${base}/chat/completions`, {
+/** 按真实请求的形状发一次，把 SSE 增量拼成完整文本（`root` 默认是共用的那个 mock，换一个就问另一个） */
+async function ask(system: string, user: string, root = base): Promise<string> {
+  const response = await fetch(`${root}/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -69,10 +69,72 @@ async function ask(system: string, user: string): Promise<string> {
 }
 
 describe("mock-provider 对每种请求都回对形状的数据", () => {
-  it("截屏翻译：user 是字符串数组，回等长数组", async () => {
-    const out = JSON.parse(await ask(`${MARKERS.capture}。input 是 JSON 数组`, JSON.stringify(["Hello", "World", "Again"])));
-    expect(out).toHaveLength(3);
-    expect(out[0]).toContain("译文1");
+  it("截屏翻译：user 是带编号的数组，按同样的编号回译文（编号不连续也照抄）", async () => {
+    const items = [{ i: 0, t: "Hello" }, { i: 1, t: "World" }, { i: 5, t: "Again" }];
+    const out = JSON.parse(await ask(`${MARKERS.capture}。input 是 JSON 数组`, JSON.stringify(items)));
+    expect(out.map((item: { i: number }) => item.i)).toEqual([0, 1, 5]);
+    expect(out[0].t).toContain("译文1");
+    expect(out[2].t).toContain("译文6");
+  });
+
+  it("DROP 环境变量：3,8 → [3, 8]；没设、空、混进不是整数的东西都不报错（README 里 `DROP=3,8 node tools/mock-provider.mjs` 靠它）", () => {
+    expect(parseDrop("3,8")).toEqual([3, 8]);
+    expect(parseDrop(" 3 , 8 ,")).toEqual([3, 8]);
+    expect(parseDrop(undefined)).toEqual([]);
+    expect(parseDrop("")).toEqual([]);
+    expect(parseDrop("x,2,1.5,-1")).toEqual([2, -1]);
+  });
+
+  it("截屏翻译：DROP 的编号不在回复里（测部分没译成的降级），其余照常", async () => {
+    const dropping = createMock({ delay: 1, log: null, drop: [1] });
+    await new Promise<void>((resolve) => dropping.listen(0, "127.0.0.1", resolve));
+    const address = dropping.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "mock",
+          stream: true,
+          messages: [
+            { role: "system", content: `${MARKERS.capture}。input 是 JSON 数组` },
+            { role: "user", content: JSON.stringify([{ i: 0, t: "a" }, { i: 1, t: "b" }, { i: 2, t: "c" }]) },
+          ],
+        }),
+      });
+      let text = "";
+      for (const line of (await response.text()).split("\n")) {
+        if (!line.startsWith("data: ") || line.includes("[DONE]")) continue;
+        text += JSON.parse(line.slice(6)).choices?.[0]?.delta?.content ?? "";
+      }
+      expect(JSON.parse(text).map((item: { i: number }) => item.i)).toEqual([0, 2]);
+    } finally {
+      await new Promise<void>((resolve) => dropping.close(() => resolve()));
+    }
+  });
+
+  it("截屏翻译：UNCLOSED_LAST 的回复里最后一项只少一个 }、换行接 ]（整段不是合法 JSON），别的元素和译文照常", async () => {
+    const glitchy = createMock({ delay: 1, log: null, unclosedLast: true });
+    await new Promise<void>((resolve) => glitchy.listen(0, "127.0.0.1", resolve));
+    const address = glitchy.address();
+    const root = `http://127.0.0.1:${typeof address === "object" && address ? address.port : 0}/v1`;
+    try {
+      const system = `${MARKERS.capture}。input 是 JSON 数组`;
+      const text = await ask(system, JSON.stringify([{ i: 0, t: "a" }, { i: 1, t: "b" }, { i: 2, t: "c" }]), root);
+      expect(() => JSON.parse(text)).toThrow();
+      expect(text.endsWith('"\n]')).toBe(true);
+      expect(text.match(/\}/g)).toHaveLength(2);
+      // 补上那个 } 就是和不开这个开关时一模一样的回复
+      const repaired = JSON.parse(text.replace(/\n\]$/, "}]"));
+      expect(repaired).toEqual(JSON.parse(await ask(system, JSON.stringify([{ i: 0, t: "a" }, { i: 1, t: "b" }, { i: 2, t: "c" }]))));
+      expect(repaired.map((item: { i: number }) => item.i)).toEqual([0, 1, 2]);
+      // 没有元素就没有「最后一项」：照常回 []；别的请求类型不受影响
+      expect(await ask(system, "[]", root)).toBe("[]");
+      expect(JSON.parse(await ask(MARKERS.grammar, "Everything is fine here.", root))).toEqual([]);
+    } finally {
+      await new Promise<void>((resolve) => glitchy.close(() => resolve()));
+    }
   });
 
   it("长文翻译：回纯文本并保留分段，不是 []", async () => {

@@ -13,6 +13,8 @@
  *   node tools/mock-provider.mjs            # 监听 11434，对应 Ollama 预设
  *   BAD=1 node tools/mock-provider.mjs      # 故意返回残缺包，测降级
  *   UNTRANSLATED=1 node tools/mock-provider.mjs  # 中文输入仍回中文词条（模拟不听话的模型），测中译英的降级
+ *   DROP=3,8 node tools/mock-provider.mjs   # 截屏翻译的回复里故意漏掉编号 3 和 8（重发也漏），测「一部分没译成」的降级
+ *   UNCLOSED_LAST=1 node tools/mock-provider.mjs  # 截屏翻译的每个回复（补问也是）里最后一项都少一个 }（译文完整、换行接 ]），测宽松解析收下它、不补问
  *   DELAY=120 PORT=11434 node tools/mock-provider.mjs
  *
  * 每个请求都会追加到 LOG 文件，用来证明「第二次查询 0 请求」。
@@ -122,15 +124,24 @@ const chineseEntry = (word, bad) => ({
   pronunciation: { ipa: null, pinyin: "zhōng wén" },
 });
 
-/** 按请求类型算出整段要回的文本 */
-function answerFor(body, bad, untranslated = false) {
+/**
+ * 按请求类型算出整段要回的文本。`drop`：截屏翻译的回复里故意漏掉这些编号，测「部分没译成」的降级。
+ * `unclosedLast`：截屏翻译的回复里最后一项少一个 `}`、换行接 `]`——真实模型偶尔这样写，译文本身是完整的。
+ * 这里**每个**回复（补问也一样）都这样写，比真实模型狠得多：它是用来看最坏情形的。
+ */
+function answerFor(body, bad, untranslated = false, drop = [], unclosedLast = false) {
   const system = body.messages?.[0]?.content ?? "";
   const user = body.messages?.[1]?.content ?? "";
 
   if (system.includes(MARKERS.capture)) {
-    // 截屏翻译：user 是字符串数组，回等长的译文数组
+    // 截屏翻译：user 是 [{"i":编号,"t":原文}…]，按编号回 [{"i":编号,"t":译文}…]（块两头的上下文也照样回，应用会丢掉）
     const items = parseJson(user, []);
-    return JSON.stringify(items.map((text, index) => `译文${index + 1} ${String(text).slice(0, 6)}`));
+    const reply = JSON.stringify(
+      items
+        .filter((item) => !drop.includes(item.i))
+        .map((item) => ({ i: item.i, t: `译文${item.i + 1} ${String(item.t).slice(0, 6)}` })),
+    );
+    return unclosedLast && reply.endsWith("}]") ? `${reply.slice(0, -2)}\n]` : reply;
   }
   if (system.includes(MARKERS.longText)) {
     // 长文翻译：user 就是整篇原文，保留分段，回纯文本
@@ -160,8 +171,25 @@ function answerFor(body, bad, untranslated = false) {
   return JSON.stringify(makeEntry(word, bad));
 }
 
+/** `DROP=3,8` → [3, 8]；空、没设、混进不是整数的东西都当没有（不是整数的丢掉）。 */
+export function parseDrop(value) {
+  return String(value ?? "")
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map(Number)
+    .filter(Number.isInteger);
+}
+
 /** 造一个 mock 服务（还没开始监听）。 */
-export function createMock({ delay = 35, bad = false, untranslated = false, log: logFile = "/tmp/sense-mock-requests.log" } = {}) {
+export function createMock({
+  delay = 35,
+  bad = false,
+  untranslated = false,
+  drop = [],
+  unclosedLast = false,
+  log: logFile = "/tmp/sense-mock-requests.log",
+} = {}) {
   const log = (line) => {
     if (!logFile) return;
     try {
@@ -196,10 +224,10 @@ export function createMock({ delay = 35, bad = false, untranslated = false, log:
         );
         const { task, target } = describeRequest(body);
         log(`  > task=${task} target=${target ?? "-"}`);
-        source = answerFor(body, bad, untranslated);
+        source = answerFor(body, bad, untranslated, drop, unclosedLast);
       } else {
         log("  > body 解析失败");
-        source = answerFor({}, bad, untranslated);
+        source = answerFor({}, bad, untranslated, drop, unclosedLast);
       }
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
@@ -245,7 +273,11 @@ if (isMain) {
   const delay = Number(process.env.DELAY ?? 35);
   const bad = process.env.BAD === "1";
   const untranslated = process.env.UNTRANSLATED === "1";
-  createMock({ delay, bad, untranslated, log: process.env.LOG ?? "/tmp/sense-mock-requests.log" }).listen(port, "127.0.0.1", () => {
-    console.log(`[mock] listening on http://127.0.0.1:${port}/v1  (bad=${bad}, untranslated=${untranslated}, delay=${delay}ms)`);
+  const drop = parseDrop(process.env.DROP);
+  const unclosedLast = process.env.UNCLOSED_LAST === "1";
+  createMock({ delay, bad, untranslated, drop, unclosedLast, log: process.env.LOG ?? "/tmp/sense-mock-requests.log" }).listen(port, "127.0.0.1", () => {
+    console.log(
+      `[mock] listening on http://127.0.0.1:${port}/v1  (bad=${bad}, untranslated=${untranslated}, drop=[${drop}], unclosedLast=${unclosedLast}, delay=${delay}ms)`,
+    );
   });
 }

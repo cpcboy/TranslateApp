@@ -32,6 +32,13 @@ const block = (overrides: Partial<OverlayBlock> = {}): OverlayBlock => ({
 
 const count = (html: string, needle: string) => html.split(needle).length - 1;
 
+/** 每个译文元素按顺序：有没有 `data-untranslated`，里面写的是什么字（一行一行拼起来）。 */
+const textElements = (html: string) =>
+  [...html.matchAll(/<div[^>]*data-role="text"([^>]*)>((?:<div[^>]*>[^<]*<\/div>)+)<\/div>/g)].map((element) => ({
+    flagged: element[1].includes('data-untranslated="true"'),
+    text: [...element[2].matchAll(/<div[^>]*>([^<]*)<\/div>/g)].map((line) => line[1]).join("\n"),
+  }));
+
 describe("OverlayLayers：覆盖层的画层", () => {
   it("每块一个遮盖矩形（用原文的底色填满、不带圆角）+ 一个译文元素（原文的字号和颜色）", () => {
     const html = renderToStaticMarkup(<OverlayLayers blocks={[block()]} plans={[plan()]} />);
@@ -104,6 +111,48 @@ describe("OverlayLayers：覆盖层的画层", () => {
     expect(failed).toContain("opacity:0.82");
     const ok = renderToStaticMarkup(<OverlayLayers blocks={[block({ translated: true })]} plans={[plan()]} />);
     expect(ok).toContain("opacity:1");
+  });
+
+  it("一部分译成、一部分没译成：没译成的加虚线下划线（data-untranslated），译成的不加", () => {
+    const blocks = [block({ translated: true }), block({ translated: false, text: "Docs" }), block({ translated: true })];
+    const html = renderToStaticMarkup(<OverlayLayers blocks={blocks} plans={[plan(), plan({ lines: ["Docs"] }), plan()]} />);
+    // 带标记的正是第二块（没译成、画的是原文 Docs），别的两块没有：标到前一块 / 后一块都会红
+    expect(textElements(html)).toEqual([
+      { flagged: false, text: "新建任务" },
+      { flagged: true, text: "Docs" },
+      { flagged: false, text: "新建任务" },
+    ]);
+    expect(count(html, "underline dotted")).toBe(1);
+    expect(count(html, 'data-untranslated="true"')).toBe(1);
+    expect(count(html, "opacity:0.82")).toBe(1);
+  });
+
+  it("没译成的块排在哪都加虚线（开头、中间、结尾，不止一块），译成的都不加", () => {
+    const blocks = [block({ translated: false, text: "A" }), block({ translated: true }), block({ translated: false, text: "B" }), block({ translated: true }), block({ translated: false, text: "C" })];
+    const plans = [plan({ lines: ["A"] }), plan(), plan({ lines: ["B"] }), plan(), plan({ lines: ["C"] })];
+    const html = renderToStaticMarkup(<OverlayLayers blocks={blocks} plans={plans} />);
+    expect(textElements(html).map((element) => element.flagged)).toEqual([true, false, true, false, true]);
+  });
+
+  it("译成的块里有「译文和原文一样」的：也算译成了，没译成的照样加虚线", () => {
+    const blocks = [block({ translated: true, unchanged: true, text: "V5.9.3" }), block({ translated: false, text: "Docs" })];
+    const html = renderToStaticMarkup(<OverlayLayers blocks={blocks} plans={[plan({ lines: ["V5.9.3"] }), plan({ lines: ["Docs"] })]} />);
+    expect(count(html, 'data-untranslated="true"')).toBe(1);
+    expect(html).not.toContain("V5.9.3");
+  });
+
+  it("全都没译成（失败提示已经说明了）：不加虚线，整屏的虚线只是噪声", () => {
+    const blocks = [block({ translated: false }), block({ translated: false })];
+    const html = renderToStaticMarkup(<OverlayLayers blocks={blocks} plans={[plan(), plan()]} />);
+    expect(html).not.toContain("underline");
+    expect(html).not.toContain("data-untranslated");
+    expect(count(html, "opacity:0.82")).toBe(2);
+  });
+
+  it("全都译成了：什么标记都没有", () => {
+    const html = renderToStaticMarkup(<OverlayLayers blocks={[block(), block()]} plans={[plan(), plan()]} />);
+    expect(html).not.toContain("underline");
+    expect(html).not.toContain("data-untranslated");
   });
 
   it("没有块 / 没有排版结果：什么都不画，不出错", () => {

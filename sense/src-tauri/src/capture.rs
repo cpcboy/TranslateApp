@@ -52,6 +52,10 @@ use crate::secrets;
 
 // 中文折行段落的判定（纯函数，不碰 OCR / 窗口）：一句话被折成多行时合回一块再翻译
 mod zh_wrap;
+// 英文硬折行段落的判定（同上）：PDF 论文、等宽字体的 README、网页里的多行段落按行折断时合回一块再翻译
+mod en_wrap;
+// 与模型之间的协议（纯函数 + 一个把「问模型」当参数的 `translate_all`）：分块、带编号的消息、按编号对齐、重试、对齐粗检
+mod protocol;
 
 /// 结果窗口的 label。
 pub const OVERLAY_WINDOW: &str = "overlay";
@@ -652,17 +656,17 @@ pub async fn run_with_image(
 
     // 翻译失败也把原文盖上去，至少让用户看到识别结果；
     // 但失败原因必须一起交给覆盖层，不能让原文冒充译文。
-    let mut failure = None;
-    match choose_target(&mut blocks, load_pref(app)) {
-        Some(target) => {
-            if let Err(err) = translate_blocks(app, &mut blocks, target.name).await {
+    let (failure, notice) = match choose_target(&mut blocks, load_pref(app)) {
+        Some((target, direction)) => {
+            let translated = translate_blocks(app, &mut blocks, target.name, direction).await;
+            if let Err(err) = &translated {
                 eprintln!("[sense] 截图翻译失败：{err}");
-                failure = Some(err);
             }
+            settle(translated, notice)
         }
         // 识别出来的全是数字、符号：没什么可译的，也要说一声
-        None => failure = Some("选区里没有可翻译的文字（只识别出数字或符号）".to_string()),
-    }
+        None => (Some("选区里没有可翻译的文字（只识别出数字或符号）".to_string()), notice),
+    };
 
     // 有失败、位置提示、或「译文全和原文一样」的提示时，覆盖层至少要放得下这条提示：
     // 只框了一行字（比如一个版本号、一条命令）时选区太矮，提示会被截掉
@@ -950,14 +954,19 @@ fn is_rtl_text(text: &str) -> bool {
 /// 中文折行（`zh_wrap`）判「上一行说完了」时也先看它。
 const SENTENCE_END: &str = ".!?。！？:：;；$>|/\\）)】]」』";
 
-/// 同一段的多行合回一块。两条路，前一条沿用以前的判据，后一条是中文折行：
+/// 同一段的多行合回一块。三条路，前面两条沿用以前的判据，第三条是英文硬折行：
 /// - 英文那套：行高接近、竖直间隙小、同列，并且上一行以逗号 / 连字符结尾或这一行以小写字母开头（明显被折断的一句话）；
 ///   只和**上一块**比（顺序里挨着的）
 /// - 中文折行：按版面找「同列里紧挨在上面的那一行」，上一行写满、话没说完、这一对像正文才合（见 `zh_wrap`）；
 ///   并进的可能是更早的一块（夹在中间的是别栏的内容）
+/// - 英文硬折行：同样按版面找「同列里紧挨在上面的那一行」（见 `en_wrap`），一整段连着合；Vision 把一行拆成两段的，右半截跟着左半截走。
+///   前两条没认领的行才轮到它；不含 CJK 字符（汉字、假名、谚文、全角形式）的行只会被第一条和第三条认领，含 CJK 字符的行只会被前两条认领。
+///   阿拉伯文、泰文、西里尔字母的行也不含 CJK 字符，所以可能被第三条认领；英文硬折行判据本身要求行里至少有 3 个 ASCII 字母（见 `en_wrap`），纯阿拉伯文 / 泰文的行通常不满足，夹着拉丁词的才有可能。
+///   第一条只看「上一块」的几何：上一块被第三条并成了更高的一块以后，它认不出这一行了（HEAD 合并过的行对里有 1.7% 因此不再同块，见 CHANGELOG）
 fn merge_lines(lines: &[OcrLine], scale: f64) -> Vec<Block> {
     let mut sorted: Vec<&OcrLine> = lines.iter().filter(|line| !line.text.trim().is_empty()).collect();
-    sorted.sort_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal));
+    // `total_cmp`：y 是 NaN 时 `partial_cmp(..).unwrap_or(Equal)` 不是全序，标准库的排序会 panic；有限数上两者排出来一样
+    sorted.sort_by(|a, b| a.y.total_cmp(&b.y));
 
     // 中文折行：每一行应当并进哪一行（下标对的是 `sorted`）
     let zh_links = {
@@ -968,10 +977,54 @@ fn merge_lines(lines: &[OcrLine], scale: f64) -> Vec<Block> {
         zh_wrap::wrap_links(&geometry)
     };
 
+    // 英文硬折行：每一行应当并进哪一行、哪些行只是同一视觉行的右半截（下标同样对的是 `sorted`）
+    let en = {
+        let geometry: Vec<en_wrap::EnGeo> = sorted
+            .iter()
+            .map(|line| {
+                let words = line.words.iter().filter(|word| word.w.is_finite() && word.w > 0.0);
+                en_wrap::EnGeo {
+                    x: line.x / scale,
+                    y: line.y / scale,
+                    w: line.w / scale,
+                    h: line.h / scale,
+                    text: line.text.trim(),
+                    fg: rgb_triple(line.fg.as_ref()),
+                    first_word: line.words.first().filter(|word| word.w.is_finite() && word.w > 0.0).map(|word| word.w / scale),
+                    word_chars: words.clone().map(|word| word.t.chars().count()).sum(),
+                    word_width: words.map(|word| word.w / scale).sum(),
+                }
+            })
+            .collect();
+        en_wrap::wrap_links(&geometry)
+    };
+
+    // 处理顺序：按 y 从小到大；同一视觉行的右半截紧跟在左半截后面（它的 y 可能比左半截还小，不能先处理）
+    let order = {
+        let mut rest: Vec<Vec<usize>> = vec![Vec::new(); sorted.len()];
+        for (k, head) in en.fragment_of.iter().enumerate() {
+            if let Some(head) = head {
+                rest[*head].push(k);
+            }
+        }
+        let mut order = Vec::with_capacity(sorted.len());
+        for k in 0..sorted.len() {
+            if en.fragment_of[k].is_some() {
+                continue;
+            }
+            order.push(k);
+            let mut tail = std::mem::take(&mut rest[k]);
+            tail.sort_by(|a, b| sorted[*a].x.total_cmp(&sorted[*b].x));
+            order.extend(tail);
+        }
+        order
+    };
+
     let mut blocks: Vec<Block> = Vec::new();
-    // `sorted` 里每一行落进了哪一块：中文折行并进的是「同列上一行」所在的块，不一定是最后一块
-    let mut block_of: Vec<usize> = Vec::with_capacity(sorted.len());
-    for (index, line) in sorted.into_iter().enumerate() {
+    // `sorted` 里每一行落进了哪一块：折行并进的是「同列上一行」所在的块，不一定是最后一块
+    let mut block_of: Vec<usize> = vec![usize::MAX; sorted.len()];
+    for index in order {
+        let line = sorted[index];
         let (x, y, w, h) = (line.x / scale, line.y / scale, line.w / scale, line.h / scale);
         let text = line.text.trim().to_string();
         let ink = scaled_rect(line.ink, scale);
@@ -986,8 +1039,9 @@ fn merge_lines(lines: &[OcrLine], scale: f64) -> Vec<Block> {
                 .collect::<Vec<_>>()
         };
 
-        // 英文那套：和上一块比
-        let joins_last = blocks.last().is_some_and(|last| {
+        // 英文那套：和上一块比（同一视觉行的右半截不走这一条：它跟着左半截）
+        let joins_last = en.fragment_of[index].is_none()
+            && blocks.last().is_some_and(|last| {
             let same_column = x >= last.x - last.w * 0.35 && x <= last.x + last.w * 0.35;
             let gap = y - (last.y + last.h);
             let close_enough = gap >= -2.0 && gap < last.h * 0.55;
@@ -1009,8 +1063,17 @@ fn merge_lines(lines: &[OcrLine], scale: f64) -> Vec<Block> {
 
             same_column && close_enough && similar_height && wraps
         });
-        // 中文折行：并进「同列上一行」所在的块（`block_of` 里一定有：上一行排在前面）
-        let target = if joins_last { Some(blocks.len() - 1) } else { zh_links[index].map(|upper| block_of[upper]) };
+        // 并进的块：右半截跟着左半截；其次英文老路（上一块）；其次中文折行、英文硬折行（「同列上一行」所在的块）。
+        // 「同列上一行」通常排在前面、已经有块了；但一条视觉行被拆成高度逐段变大的几段、紧接着又有一行比它们都高时，
+        // 「上一行」的行头可能排在这一行后面——还没处理就当没连上（这一行自己起一块），不能越界（评审 A 构造出过）
+        let assigned = |line: usize| Some(block_of[line]).filter(|block| *block != usize::MAX);
+        let target = if let Some(head) = en.fragment_of[index] {
+            assigned(head)
+        } else if joins_last {
+            Some(blocks.len() - 1)
+        } else {
+            zh_links[index].or(en.wraps[index]).and_then(assigned)
+        };
 
         if let Some(position) = target {
             let last = &mut blocks[position];
@@ -1037,11 +1100,11 @@ fn merge_lines(lines: &[OcrLine], scale: f64) -> Vec<Block> {
             last.cover = union_all(last.cover, cover);
             last.room = min_known(last.room, room);
             last.room_left = min_known(last.room_left, room_left);
-            block_of.push(position);
+            block_of[index] = position;
             continue;
         }
 
-        block_of.push(blocks.len());
+        block_of[index] = blocks.len();
         blocks.push(Block {
             rtl: is_rtl_text(&text),
             target_rtl: false,
@@ -1076,21 +1139,121 @@ fn merge_lines(lines: &[OcrLine], scale: f64) -> Vec<Block> {
 ///
 /// 能不能把图里的字读出来是 OCR 的事（`tools/ocr.swift`），不是翻译这边的：拉丁字母、西里尔字母的页面（法、德、西、葡、意、荷、波、土、印尼、越南、俄、乌克兰）
 /// 前两遍就读得出来，日文假名、韩文、阿拉伯文、泰文靠补的第三遍（自动识别语言）；希伯来文、印地文、希腊文 Vision 不支持，读出来是乱码。
+#[cfg(test)]
 fn capture_target(blocks: &[Block], pref: &str) -> Option<&'static Lang> {
+    capture_plan(blocks, pref).map(|(target, _)| target)
+}
+
+/// 定目标语言和对齐粗检的方向（`capture_plan`），并把目标语言的书写方向记到每一块上（`set_target_direction`）：覆盖层靠它给译文定方向。
+/// 正式流程（`run_with_image`）和测试都走这一个入口，两步不会被拆开。
+fn choose_target(blocks: &mut [Block], pref: &str) -> Option<(&'static Lang, protocol::Direction)> {
+    let (target, direction) = capture_plan(blocks, pref)?;
+    set_target_direction(blocks, target);
+    Some((target, direction))
+}
+
+/// 目标语言，加上对齐粗检能不能用：粗检的长度比只量过「中文页 → 英文」和「英文页 → 中文」，
+/// 别的源 → 目标组合（法语 → 英文、日文 → 中文……）每个字符的权重不同，量不准，会把对齐的译文当错位，所以不检。
+/// 英文页只要识别为英文就算（拉丁字母没把握时默认就是英文，和以前一样）。
+fn capture_plan(blocks: &[Block], pref: &str) -> Option<(&'static Lang, protocol::Direction)> {
     let sample: String = blocks.iter().map(|block| block.text.as_str()).collect::<Vec<_>>().join(" ");
     let plan = lang::plan(&sample, pref);
-    plan.source.letters.then_some(plan.target)
+    if !plan.source.letters {
+        return None;
+    }
+    let source = plan.source.lang.map(|lang| lang.code);
+    let direction = match (source, plan.target.name) {
+        (Some("zh"), "英文") => protocol::Direction::ToEnglish,
+        (Some("en"), "中文") => protocol::Direction::ToChinese,
+        _ => protocol::Direction::Other,
+    };
+    Some((plan.target, direction))
 }
 
-/// 定目标语言（`capture_target`），并把它的书写方向记到每一块上（`set_target_direction`）：覆盖层靠它给译文定方向。
-fn choose_target(blocks: &mut [Block], pref: &str) -> Option<&'static Lang> {
-    let target = capture_target(blocks, pref)?;
-    set_target_direction(blocks, target);
-    Some(target)
+/// 截屏翻译的系统提示词。
+///
+/// 这段措辞 2026-10-31 用真实模型核对过（`deepseek-flash`，样本外页面，按页口径；预设里的 `deepseek-chat` 是它的别名，2026-11-01 又补测了 `deepseek-v4-pro`），数据在 CHANGELOG
+/// 「截屏翻译：整页『译文条数对不上』改成带编号的协议」：每条带编号、模型照抄编号译回，应用按编号对齐，取代了「等长字符串数组、条数是唯一校验」的老协议。
+/// 第 5 条（半句话、单个符号 / 单词也用自己的编号单独译）是在 PDF 两栏页上量出来的：没有它，模型会顺着句意把译文重新分配到
+/// 各个断行上（编号对、位置错一格）；加上之后第一轮的部分失败与对齐粗检触发都明显少了，别的页面上没有变差。
+/// 第 4 条「每条尽量简短」对整段验证过，没有让模型删正文（CHANGELOG「验证 · 2026-10-31 — 截屏翻译提示词」）。
+/// 逐字钉在 `tests/fixtures/capture-prompt.to-{en,zh}.txt`（评测用的就是这份原文）；改措辞之前先看 CHANGELOG：
+/// 完整优先、写明条数、「必须恰好 N 条」这几类改法在老协议下试过，都有代价，没采用；这里也别加「不要删减信息」之类的完整性措辞。
+/// 开头那句是 tools/mock-provider.mjs 认「截屏翻译」请求的标记（MARKERS.capture），必须原样保留。
+fn capture_system_prompt(target: &str) -> String {
+    format!(
+        "你是一位翻译，正在翻译屏幕上一段连续的文字。input 是按阅读顺序排好的 JSON 数组，\
+         每个元素形如 {{\"i\":编号,\"t\":原文}}，相邻两条通常属于同一段内容。\n\n要求：\n\
+         1. 先通读全部条目，理解整体在讲什么，再逐条翻译成{target}；指代、术语、语气前后保持一致。\n\
+         2. 输出 JSON 数组，每个元素形如 {{\"i\":编号,\"t\":译文}}，编号照抄输入，一个编号一个元素。\
+         只输出数组本身，不要解释、不要代码块。\n\
+         3. 命令行、代码、变量名、路径、URL、版本号、错误码、日志级别原样保留，不要翻译。\n\
+         4. 每条尽量简短，以适配原来的版面宽度。\n\
+         5. 有的条目只是被折行或分栏拆开的半句话，或者只是一个符号、一个词：照样用它自己的编号单独翻译，\
+         哪怕读起来不通顺，不要并进相邻的条目。"
+    )
 }
 
-/// 一次请求翻译全部块，顺序对齐；失败就保留原文。
-async fn translate_blocks(app: &AppHandle, blocks: &mut [Block], target: &str) -> Result<(), String> {
+/// 向模型问一次（流式；截屏翻译没有「停止」按钮，所以不带取消）：返回完整的回复文本，和回复有没有被 max_tokens 截断。
+async fn ask_model(
+    client: &reqwest::Client,
+    provider: &provider_registry::Provider,
+    key: Option<&str>,
+    system: &str,
+    reasoning: Option<&serde_json::Value>,
+    user: String,
+) -> Result<protocol::Reply, String> {
+    let body = openai_compat::build_body(&provider.model, system, &user, 0.2, reasoning, openai_compat::MAX_TOKENS);
+    let outcome = openai_compat::stream_chat_adaptive(client, provider, key, &body, reasoning, &mut |_: &str| {}, None)
+        .await
+        .map_err(|err| err.message())?;
+    Ok(reply_from(outcome.text, outcome.finish_reason.as_deref()))
+}
+
+/// 模型的一次回复：文本，和有没有被 max_tokens 截断（`finish_reason` 是 `length`）。
+fn reply_from(text: String, finish_reason: Option<&str>) -> protocol::Reply {
+    protocol::Reply { truncated: finish_reason == Some("length"), text }
+}
+
+/// 问模型的方式。
+struct Delivery {
+    /// 各块同时发（云端 provider）。本地模型（不要 Key 的）一次只处理一个请求：同时发只会排队超时，一块一块来
+    parallel: bool,
+    /// 译成什么方向：对齐粗检按它取长度比；方向传反了，会把对齐的译文当成错位；中英以外的目标不检
+    to_english: protocol::Direction,
+}
+
+fn delivery(direction: protocol::Direction, requires_key: bool) -> Delivery {
+    Delivery { parallel: requires_key, to_english: direction }
+}
+
+/// 翻译这一步的结果怎么落到覆盖层的两个槽：整次失败的原因，和要附的提示。
+/// 一部分没译成时，那句话排在位置提示（`notice`，如果有）前面，一起说。
+fn settle(translated: Result<Option<String>, String>, notice: Option<String>) -> (Option<String>, Option<String>) {
+    match translated {
+        Ok(None) => (None, notice),
+        Ok(Some(partial)) => (
+            None,
+            Some(match notice {
+                Some(existing) => format!("{partial}{existing}"),
+                None => partial,
+            }),
+        ),
+        Err(err) => (Some(err), notice),
+    }
+}
+
+/// 一块都没译成（至少有一块、而且全失败了）才是整次失败；没有块时没东西可译，不算失败。
+fn all_failed(outcome: &protocol::Outcome) -> bool {
+    let total = outcome.translations.len();
+    total > 0 && outcome.failed() == total
+}
+
+/// 翻译整屏的块。分块并行发、按编号对齐，没译成的块保留原文：
+/// - `Ok(None)`：全部译成；
+/// - `Ok(Some(话))`：有的块没译成（原文原样留着，`translated` 仍为 false），这句话要交给覆盖层，不能让原文冒充译文；
+/// - `Err`：一块都没译成。
+async fn translate_blocks(app: &AppHandle, blocks: &mut [Block], target: &str, direction: protocol::Direction) -> Result<Option<String>, String> {
     let provider = provider_registry::active(app)?;
     let key = if provider.requires_key {
         match secrets::get_key(&provider.id)? {
@@ -1102,66 +1265,46 @@ async fn translate_blocks(app: &AppHandle, blocks: &mut [Block], target: &str) -
         None
     };
 
-    let payload: Vec<&str> = blocks.iter().map(|block| block.text.as_str()).collect();
-    let user = serde_json::to_string(&payload).map_err(|err| err.to_string())?;
-    // 这段提示词的措辞 2026-10-31 用真实模型核对过：deepseek-flash 上 47 个多行整段（517 个译文样本）、
-    // 在 deepseek-chat 上重复（178 个样本），第 4 条「每条尽量简短」都没有让模型删正文，所以原样保留。
-    // 也试过别的写法：完整优先的改写没有收益；写明条数 + 「一条对一条」的规则 + 小例子能压低整页「译文条数对不上」，
-    // 但好处在默认型号上不显著，还带来静默错位、个别限定语被压缩、坏 JSON 等代价，没采用。
-    // 数据、取舍和后续建议见 CHANGELOG「验证 · 2026-10-31 — 截屏翻译提示词」，改措辞之前先看那里。
-    // 开头那句是 tools/mock-provider.mjs 认「截屏翻译」请求的标记（MARKERS.capture），必须原样保留。
-    let system = format!(
-        "你是一位翻译，正在翻译屏幕上一段连续的文字。input 是按阅读顺序排好的 JSON 字符串数组，\
-         相邻两条通常属于同一段内容。\n\n要求：\n\
-         1. 先通读全部条目，理解整体在讲什么，再逐条翻译成{target}；指代、术语、语气前后保持一致。\n\
-         2. 输出同样长度、同样顺序的 JSON 字符串数组，只输出数组本身，不要解释、不要代码块。\n\
-         3. 命令行、代码、变量名、路径、URL、版本号、错误码、日志级别原样保留，不要翻译。\n\
-         4. 每条尽量简短，以适配原来的版面宽度。"
-    );
-
-    // 上下文由「整屏一次送 + 先通读再翻」的提示词保证，不靠思维链。
+    let system = capture_system_prompt(target);
+    // 上下文由「整屏一起送 + 先通读再翻」的提示词保证，不靠思维链。
     // 实测开思考要多等 2–5 秒，换来的是翻译任务里几乎看不出的提升。
     let reasoning = provider_registry::reasoning_fields(&provider.id);
-    let body = openai_compat::build_body(
-        &provider.model,
-        &system,
-        &user,
-        0.2,
-        reasoning.as_ref(),
-        openai_compat::MAX_TOKENS,
-    );
+    let client = crate::client_for(&provider.base_url);
+    let (provider_ref, key_ref, reasoning_ref) = (&provider, key.as_deref(), reasoning.as_ref());
+    let ask = |user: String| ask_model(client, provider_ref, key_ref, &system, reasoning_ref, user);
 
-    let mut raw = String::new();
-    let outcome = openai_compat::stream_chat_adaptive(
-        crate::client_for(&provider.base_url),
-        &provider,
-        key.as_deref(),
-        &body,
-        reasoning.as_ref(),
-        &mut |delta: &str| raw.push_str(delta),
-        None,
-    )
-    .await
-    .map_err(|err| err.message())?;
+    let Delivery { parallel, to_english } = delivery(direction, provider.requires_key);
+    let outcome = {
+        let texts: Vec<&str> = blocks.iter().map(|block| block.text.as_str()).collect();
+        protocol::translate_all(&texts, parallel, to_english, ask).await
+    };
 
-    let translations = parse_translation_array(&outcome.text)?;
-    if translations.len() != blocks.len() {
-        return Err(format!(
-            "译文条数对不上：{} vs {}",
-            translations.len(),
-            blocks.len()
-        ));
+    let (total, failed) = (outcome.translations.len(), outcome.failed());
+    trace(app, format!("translate blocks={total} requests={} retries={} failed={failed}", outcome.requests, outcome.retries));
+    let notice = failure_notice(&outcome);
+    if all_failed(&outcome) {
+        return Err(outcome.main_reason().map(protocol::Why::describe).unwrap_or_default());
     }
-
-    apply_translations(blocks, translations);
-    Ok(())
+    apply_translations(blocks, outcome.translations);
+    Ok(notice)
 }
 
-/// 把译文按顺序套回各块。空译文保留原文（`translated` 仍为 false）；
+/// 有的块没译成时，给覆盖层的一句话：几块、为什么、这几块是什么样（保留原文，用虚线标出）。
+fn failure_notice(outcome: &protocol::Outcome) -> Option<String> {
+    let failed = outcome.failed();
+    if failed == 0 {
+        return None;
+    }
+    let reason = outcome.main_reason().map(protocol::Why::describe).unwrap_or_default();
+    Some(format!("有 {failed} 块没能译出：{}。那几块仍是原文，用虚线下划线标出。", reason.trim_end_matches(['。', '.'])))
+}
+
+/// 把译文套回各块。没译成的块（`Err`）和空译文保留原文（`translated` 仍为 false）；
 /// 译文和原文一样（模型按提示词把命令、版本号、专有名词原样保留了）的标 `unchanged`：
 /// 覆盖层不去动这样的块，原来的像素一点不改，比用另一种字体照着再画一遍更像原文。
-fn apply_translations(blocks: &mut [Block], translations: Vec<String>) {
-    for (block, text) in blocks.iter_mut().zip(translations) {
+fn apply_translations(blocks: &mut [Block], translations: Vec<Result<String, protocol::Why>>) {
+    for (block, item) in blocks.iter_mut().zip(translations) {
+        let Ok(text) = item else { continue };
         let text = text.trim().to_string();
         if !text.is_empty() {
             block.unchanged = same_text(&block.text, &text);
@@ -1174,18 +1317,6 @@ fn apply_translations(blocks: &mut [Block], translations: Vec<String>) {
 /// 两段文字只差空白（OCR 的空格与模型的空格不一定一致）也算一样。
 fn same_text(a: &str, b: &str) -> bool {
     a.split_whitespace().eq(b.split_whitespace())
-}
-
-/// 模型偶尔会包一层 ```json，这里统一剥掉再解析。
-fn parse_translation_array(raw: &str) -> Result<Vec<String>, String> {
-    let mut text = raw.trim();
-    if let Some(rest) = text.strip_prefix("```") {
-        let rest = rest.trim_start_matches("json").trim_start();
-        text = rest.trim_end_matches("```").trim();
-    }
-    let start = text.find('[').ok_or("译文里没有 JSON 数组")?;
-    let end = text.rfind(']').ok_or("译文 JSON 不完整")?;
-    serde_json::from_str::<Vec<String>>(&text[start..=end]).map_err(|err| format!("译文解析失败：{err}"))
 }
 
 #[cfg(test)]
@@ -1351,13 +1482,13 @@ mod tests {
         assert!(blocks.iter().all(|block| !block.target_rtl), "刚合出来的块默认从左往右");
         for (pref, expected_code, rtl) in [("ar", "ar", true), ("he", "he", true), ("en", "en", false), (lang::AUTO, "en", false), ("ja", "ja", false)] {
             let mut blocks = fresh();
-            let target = choose_target(&mut blocks, pref).expect("中文页有目标语言");
+            let target = choose_target(&mut blocks, pref).map(|(lang, _)| lang).expect("中文页有目标语言");
             assert_eq!(target.code, expected_code, "偏好 {pref}");
             assert!(blocks.len() == 2 && blocks.iter().all(|block| block.target_rtl == rtl), "偏好 {pref}：target_rtl 应为 {rtl}");
         }
         // 原文是阿拉伯文、目标是中文：块的 rtl（原文方向）为 true，target_rtl 为 false
         let mut arabic = merge_lines(&[line("الإعدادات", 10.0, 10.0, 80.0, 16.0)], 1.0);
-        assert_eq!(choose_target(&mut arabic, lang::AUTO).map(|lang| lang.code), Some("zh"));
+        assert_eq!(choose_target(&mut arabic, lang::AUTO).map(|(lang, _)| lang.code), Some("zh"));
         assert!(arabic[0].rtl && !arabic[0].target_rtl, "原文从右往左、译文是中文");
         // 一个字母都没有：没有目标语言，不动块
         let mut digits = merge_lines(&[line("12:30", 10.0, 10.0, 40.0, 16.0)], 1.0);
@@ -1579,24 +1710,26 @@ mod tests {
     }
 
     #[test]
-    fn english_merging_is_exactly_what_it_was() {
-        // 英文那条老路一个字不动：连逗号结尾的多行段落只会两两合并（合并后用整块的高度比下一行，第三行就对不上），这里把它钉住
+    fn english_old_rule_still_merges_what_it_merged_and_the_hard_wrap_rule_goes_on_from_there() {
+        // 英文那条老路没动（它的每个子条件在下面一个用例里逐条钉着），但它不再是英文合并的全部：
+        // 以前连逗号结尾的多行段落只会两两合并（合并后用整块的高度比下一行，第三行就对不上），现在一整段合成一块——
+        // 老路先合上前两行，英文硬折行（`en_wrap`）把后面的行接到「同列上一行」所在的块上
         let paragraph = vec![
             line("The quick brown,", 10.0, 10.0, 200.0, 20.0),
             line("fox jumps over the,", 10.0, 32.0, 190.0, 20.0),
             line("lazy dog and then,", 10.0, 54.0, 180.0, 20.0),
             line("runs away quickly", 10.0, 76.0, 170.0, 20.0),
         ];
-        assert_eq!(shape(&merge_lines(&paragraph, 1.0)), [(2, "The quick brown, fox jumps over the,"), (2, "lazy dog and then, runs away quickly")]);
+        assert_eq!(shape(&merge_lines(&paragraph, 1.0)), [(4, "The quick brown, fox jumps over the, lazy dog and then, runs away quickly")]);
         // 下一行小写开头
         let lowercase = vec![line("Open the settings", 10.0, 10.0, 160.0, 20.0), line("to configure the app.", 10.0, 32.0, 190.0, 20.0)];
         assert_eq!(shape(&merge_lines(&lowercase, 1.0)), [(2, "Open the settings to configure the app.")]);
         // 独立的英文行
         let menu = vec![line("Settings", 10.0, 10.0, 60.0, 20.0), line("Keyboard shortcuts", 10.0, 32.0, 130.0, 20.0), line("About", 10.0, 54.0, 40.0, 20.0)];
         assert_eq!(merge_lines(&menu, 1.0).len(), 3);
-        // 连字符结尾：与以前一样隔一个空格
+        // 连字符结尾：合并仍由老路认领，只是英文单词被连字符断开的，拼接时不再隔空格（`inter-national`；以前是 `inter- national`）
         let hyphen = vec![line("an inter-", 10.0, 10.0, 70.0, 20.0), line("national event", 10.0, 32.0, 110.0, 20.0)];
-        assert_eq!(shape(&merge_lines(&hyphen, 1.0)), [(2, "an inter- national event")]);
+        assert_eq!(shape(&merge_lines(&hyphen, 1.0)), [(2, "an inter-national event")]);
         // 中文行后面跟小写拉丁开头的行：英文那条老路合，边界有拉丁字符，隔一个空格（与以前一样）
         let mixed = vec![line("使用前请先打开", 10.0, 10.0, 150.0, 20.0), line("macOS 的系统设置", 10.0, 32.0, 130.0, 20.0)];
         assert_eq!(shape(&merge_lines(&mixed, 1.0)), [(2, "使用前请先打开 macOS 的系统设置")]);
@@ -1621,35 +1754,36 @@ mod tests {
     #[test]
     fn each_condition_of_the_english_rule_is_pinned_one_by_one() {
         // 英文那条老路的子条件（同列、间隙、行高、`ends_open`、`starts_lower`）搬进了闭包：每一条单独钉住。
+        // 第一行只用两个词（`Quick brown,`）：英文硬折行（`en_wrap`）要求上一行至少四个词，不会插手，这里测的是老路自己。
         // 基准：上一行以逗号结尾、下一行大写开头（只靠 `ends_open` 合并），几何合格。期望值按老判据逐行移植算出
         let merged = |first: &str, second: OcrLine| merge_lines(&[line(first, 10.0, 10.0, 200.0, 20.0), second], 1.0).len() == 1;
-        assert!(merged("The quick brown,", line("Fox jumps over", 10.0, 32.0, 190.0, 20.0)), "基准：逗号结尾 + 同列 + 紧挨着 + 行高一样 → 合");
+        assert!(merged("Quick brown,", line("Fox jumps over", 10.0, 32.0, 190.0, 20.0)), "基准：逗号结尾 + 同列 + 紧挨着 + 行高一样 → 合");
         // 同列：下一行的左缘要落在上一块左缘 ± 0.35 倍块宽之内
-        assert!(merged("The quick brown,", line("Fox jumps over", 60.0, 32.0, 190.0, 20.0)));
-        assert!(!merged("The quick brown,", line("Fox jumps over", 95.0, 32.0, 190.0, 20.0)), "左缘偏出去 85（> 70）");
-        assert!(merged("The quick brown,", line("Fox jumps over", -40.0, 32.0, 190.0, 20.0)), "往左偏 50（< 70）也算同列");
-        assert!(!merged("The quick brown,", line("Fox jumps over", -70.0, 32.0, 190.0, 20.0)), "往左偏 80（> 70）");
+        assert!(merged("Quick brown,", line("Fox jumps over", 60.0, 32.0, 190.0, 20.0)));
+        assert!(!merged("Quick brown,", line("Fox jumps over", 95.0, 32.0, 190.0, 20.0)), "左缘偏出去 85（> 70）");
+        assert!(merged("Quick brown,", line("Fox jumps over", -40.0, 32.0, 190.0, 20.0)), "往左偏 50（< 70）也算同列");
+        assert!(!merged("Quick brown,", line("Fox jumps over", -70.0, 32.0, 190.0, 20.0)), "往左偏 80（> 70）");
         // 竖直间隙：≥ −2 且 < 0.55 倍块高（块高 20 → 11）
-        assert!(merged("The quick brown,", line("Fox jumps over", 10.0, 40.0, 190.0, 20.0)), "间隙 10 < 11");
-        assert!(!merged("The quick brown,", line("Fox jumps over", 10.0, 42.0, 190.0, 20.0)), "间隙 12 ≥ 11");
-        assert!(merged("The quick brown,", line("Fox jumps over", 10.0, 28.0, 190.0, 20.0)), "重叠 2 还算");
-        assert!(!merged("The quick brown,", line("Fox jumps over", 10.0, 27.0, 190.0, 20.0)), "重叠 3 不算");
+        assert!(merged("Quick brown,", line("Fox jumps over", 10.0, 40.0, 190.0, 20.0)), "间隙 10 < 11");
+        assert!(!merged("Quick brown,", line("Fox jumps over", 10.0, 42.0, 190.0, 20.0)), "间隙 12 ≥ 11");
+        assert!(merged("Quick brown,", line("Fox jumps over", 10.0, 28.0, 190.0, 20.0)), "重叠 2 还算");
+        assert!(!merged("Quick brown,", line("Fox jumps over", 10.0, 27.0, 190.0, 20.0)), "重叠 3 不算");
         // 行高：差 < 较大者的 40%
-        assert!(merged("The quick brown,", line("Fox jumps over", 10.0, 32.0, 190.0, 13.0)), "20 vs 13：差 7 < 8");
-        assert!(!merged("The quick brown,", line("Fox jumps over", 10.0, 32.0, 190.0, 12.0)), "20 vs 12：差 8 不 < 8");
+        assert!(merged("Quick brown,", line("Fox jumps over", 10.0, 32.0, 190.0, 13.0)), "20 vs 13：差 7 < 8");
+        assert!(!merged("Quick brown,", line("Fox jumps over", 10.0, 32.0, 190.0, 12.0)), "20 vs 12：差 8 不 < 8");
         // 上一行怎么结尾：逗号、全角逗号、连字符、破折号都算「没说完」，别的（句号、分号、冒号、右括号）不算
-        for open in ["The quick brown,", "The quick brown，", "The quick inter-", "The quick brown—"] {
+        for open in ["Quick brown,", "Quick brown，", "Quick inter-", "Quick brown—"] {
             assert!(merged(open, line("Fox jumps over", 10.0, 32.0, 190.0, 20.0)), "「{open}」没说完，下一行大写开头也合");
         }
-        for closed in ["The quick brown.", "The quick brown;", "The quick brown:", "The quick (brown)", "The quick brown"] {
+        for closed in ["Quick brown.", "Quick brown;", "Quick brown:", "Quick (brown)", "Quick brown"] {
             assert!(!merged(closed, line("Fox jumps over", 10.0, 32.0, 190.0, 20.0)), "「{closed}」：既没有逗号 / 连字符，下一行又不是小写开头，不合");
         }
         // 下一行小写开头（上一行没有逗号）才合；上一行已说完则不合（上面那个循环已经钉过字符表）
-        assert!(merged("The quick brown", line("fox jumps over", 10.0, 32.0, 190.0, 20.0)));
-        assert!(!merged("The quick brown", line("Fox jumps over", 10.0, 32.0, 190.0, 20.0)));
-        assert!(!merged("The quick brown.", line("fox jumps over", 10.0, 32.0, 190.0, 20.0)), "说完了：小写开头也不合");
-        let blank = merge_lines(&[line("The quick brown,", 10.0, 10.0, 200.0, 20.0), line("   ", 10.0, 32.0, 190.0, 20.0)], 1.0);
-        assert_eq!(shape(&blank), [(1, "The quick brown,")], "空白行直接被丢掉，没有下一行可并");
+        assert!(merged("Quick brown", line("fox jumps over", 10.0, 32.0, 190.0, 20.0)));
+        assert!(!merged("Quick brown", line("Fox jumps over", 10.0, 32.0, 190.0, 20.0)));
+        assert!(!merged("Quick brown.", line("fox jumps over", 10.0, 32.0, 190.0, 20.0)), "说完了：小写开头也不合");
+        let blank = merge_lines(&[line("Quick brown,", 10.0, 10.0, 200.0, 20.0), line("   ", 10.0, 32.0, 190.0, 20.0)], 1.0);
+        assert_eq!(shape(&blank), [(1, "Quick brown,")], "空白行直接被丢掉，没有下一行可并");
     }
 
     #[test]
@@ -2518,7 +2652,7 @@ mod tests {
     #[test]
     fn translations_are_applied_in_order_and_identical_ones_are_flagged_unchanged() {
         let mut blocks = vec![plain_block("New task"), plain_block("V5.9.3"), plain_block("git commit -m fix")];
-        apply_translations(&mut blocks, vec!["新建任务".into(), "  V5.9.3 ".into(), "git  commit -m fix".into()]);
+        apply_translations(&mut blocks, vec![Ok("新建任务".into()), Ok("  V5.9.3 ".into()), Ok("git  commit -m fix".into())]);
         assert_eq!(blocks[0].text, "新建任务");
         assert!(blocks[0].translated && !blocks[0].unchanged);
         assert_eq!(blocks[1].text, "V5.9.3", "两头的空白去掉");
@@ -2529,10 +2663,134 @@ mod tests {
     #[test]
     fn an_empty_translation_keeps_the_original_and_is_not_marked_translated() {
         let mut blocks = vec![plain_block("Library")];
-        apply_translations(&mut blocks, vec!["   ".into()]);
+        apply_translations(&mut blocks, vec![Ok("   ".into())]);
         assert_eq!(blocks[0].text, "Library");
         assert!(!blocks[0].translated, "没有译文就是没译，覆盖层要按「原文」画并带提示");
         assert!(!blocks[0].unchanged, "没译成不能当成「译文和原文一样」");
+    }
+
+    #[test]
+    fn a_block_that_failed_keeps_its_original_while_its_neighbours_are_translated() {
+        let mut blocks = vec![plain_block("Home"), plain_block("Docs"), plain_block("Blog")];
+        apply_translations(&mut blocks, vec![Ok("首页".into()), Err(protocol::Why::Missing), Ok("博客".into())]);
+        assert_eq!(blocks.iter().map(|block| block.text.as_str()).collect::<Vec<_>>(), ["首页", "Docs", "博客"]);
+        assert_eq!(blocks.iter().map(|block| block.translated).collect::<Vec<_>>(), [true, false, true]);
+        assert!(!blocks[1].unchanged, "没译成不能当成「译文和原文一样」：覆盖层会照原样盖住它");
+    }
+
+    fn outcome_of(translations: Vec<Result<String, protocol::Why>>) -> protocol::Outcome {
+        protocol::Outcome { translations, requests: 1, retries: 0 }
+    }
+
+    #[test]
+    fn a_partial_failure_tells_the_user_how_many_blocks_and_why() {
+        assert_eq!(failure_notice(&outcome_of(vec![Ok("a".into()), Ok("b".into())])), None);
+        let notice = failure_notice(&outcome_of(vec![Ok("a".into()), Err(protocol::Why::Missing), Err(protocol::Why::Missing)])).unwrap();
+        assert!(notice.starts_with("有 2 块没能译出："), "{notice}");
+        assert!(notice.contains("模型没有给出这几条的译文"), "{notice}");
+        assert!(notice.contains("仍是原文"), "{notice}");
+        // 原因是一句话时不重复句号
+        let notice = failure_notice(&outcome_of(vec![Ok("a".into()), Err(protocol::Why::Request("请求太频繁了。".into()))])).unwrap();
+        assert!(notice.contains("请求太频繁了。那几块") && !notice.contains("。。"), "{notice}");
+    }
+
+    #[test]
+    fn the_translation_step_hands_the_overlay_its_failure_and_its_notice_in_the_right_slots() {
+        // 全译成：什么都不加，位置提示（如果有）原样留着
+        assert_eq!(settle(Ok(None), None), (None, None));
+        assert_eq!(settle(Ok(None), Some("位置提示".into())), (None, Some("位置提示".into())));
+        // 一部分没译成：那句话要交给覆盖层，排在位置提示前面
+        assert_eq!(settle(Ok(Some("有 2 块没能译出。".into())), None), (None, Some("有 2 块没能译出。".into())));
+        assert_eq!(
+            settle(Ok(Some("有 2 块没能译出。".into())), Some("位置提示".into())),
+            (None, Some("有 2 块没能译出。位置提示".into()))
+        );
+        // 整次失败：原因进失败槽，位置提示照旧
+        assert_eq!(settle(Err("连不上".into()), Some("位置提示".into())), (Some("连不上".into()), Some("位置提示".into())));
+    }
+
+    #[test]
+    fn local_providers_go_one_chunk_at_a_time_and_the_direction_follows_the_source_and_target() {
+        use protocol::Direction::*;
+        let (cloud_en, cloud_zh) = (delivery(ToEnglish, true), delivery(ToChinese, true));
+        assert!(cloud_en.parallel && cloud_en.to_english == ToEnglish);
+        assert!(cloud_zh.parallel && cloud_zh.to_english == ToChinese);
+        let (local_en, local_zh) = (delivery(ToEnglish, false), delivery(ToChinese, false));
+        assert!(!local_en.parallel && local_en.to_english == ToEnglish);
+        assert!(!local_zh.parallel && local_zh.to_english == ToChinese);
+    }
+
+    #[test]
+    fn the_alignment_check_is_only_on_for_the_two_directions_whose_length_ratio_was_measured() {
+        use protocol::Direction::*;
+        let direction = |text: &str, pref: &str| capture_plan(&one_block(text), pref).map(|(_, direction)| direction);
+        let chinese = "这是一段中文，用来确认译成英文时的方向没有变。";
+        let english = "This is a plain English sentence that has to be translated into Chinese by default.";
+        // 默认方向：和以前一样开
+        assert_eq!(direction(chinese, lang::AUTO), Some(ToEnglish));
+        assert_eq!(direction(english, lang::AUTO), Some(ToChinese));
+        // 中英以外的目标、或中英以外的原文：长度比没量过，不检
+        assert_eq!(direction(chinese, "ja"), Some(Other));
+        assert_eq!(direction(chinese, "zh-Hant"), Some(Other));
+        assert_eq!(direction(english, "fr"), Some(Other));
+        assert_eq!(direction("Où est la gare, s'il vous plaît? Je voudrais acheter un billet pour demain.", "en"), Some(Other));
+        assert_eq!(direction("ありがとうございます、お願いします", lang::AUTO), Some(Other));
+        assert_eq!(direction("Привет, как дела? Спасибо большое", lang::AUTO), Some(Other));
+        assert_eq!(direction("12345 ——", lang::AUTO), None);
+    }
+
+    #[test]
+    fn a_reply_cut_off_by_the_token_limit_is_marked_truncated() {
+        assert!(reply_from("[".into(), Some("length")).truncated);
+        assert!(!reply_from("[]".into(), Some("stop")).truncated);
+        assert!(!reply_from("[]".into(), None).truncated);
+        assert_eq!(reply_from("文本".into(), None).text, "文本");
+    }
+
+    #[test]
+    fn only_a_screen_where_every_block_failed_is_a_total_failure() {
+        use protocol::Why;
+        assert!(!all_failed(&outcome_of(vec![])), "没有块就没东西可译");
+        assert!(!all_failed(&outcome_of(vec![Ok("a".into()), Err(Why::Missing)])));
+        assert!(all_failed(&outcome_of(vec![Err(Why::Missing), Err(Why::Empty)])));
+    }
+
+    #[test]
+    fn the_prompt_is_the_wording_that_was_evaluated_byte_for_byte() {
+        // 评测用的就是这两份原文；改措辞要连同 CHANGELOG 里的数据一起重新评测，再有意识地更新金标准文件
+        assert_eq!(capture_system_prompt("英文"), include_str!("../tests/fixtures/capture-prompt.to-en.txt"));
+        assert_eq!(capture_system_prompt("中文"), include_str!("../tests/fixtures/capture-prompt.to-zh.txt"));
+    }
+
+    /// tools/mock-provider.mjs 里 `MARKERS.capture` 的值：从那个文件里读，别在这里再写一遍字面量
+    /// （写了，mockProvider.test.ts 里「标记出现在 capture.rs 里」的检查就会被这个单测自己满足而失效）。
+    fn mock_capture_marker() -> String {
+        let mock = include_str!("../../tools/mock-provider.mjs");
+        let after = &mock[mock.find("capture: \"").expect("mock-provider.mjs 里有 MARKERS.capture") + "capture: \"".len()..];
+        after[..after.find('"').unwrap()].to_string()
+    }
+
+    #[test]
+    fn the_prompt_starts_with_the_marker_the_mock_provider_recognises() {
+        let marker = mock_capture_marker();
+        assert!(marker.chars().count() > 10, "标记读空了：{marker:?}");
+        for target in ["英文", "中文"] {
+            assert!(capture_system_prompt(target).starts_with(&marker), "{target}");
+        }
+    }
+
+    #[test]
+    fn the_prompt_asks_for_ids_and_does_not_pressure_the_model_to_hit_a_count_or_to_keep_everything() {
+        let prompt = capture_system_prompt("中文");
+        assert!(prompt.contains("\"i\":编号") && prompt.contains("编号照抄输入"));
+        // 老协议下试过的「必须恰好 N 条」「不要删减信息」会诱导模型凑条数 / 并回邻条，见 CHANGELOG；别加回来。
+        // 反过来「可以省略 / 概括」会让模型删正文（上一轮核对过现有措辞不删）：同样不要加
+        for banned in ["恰好", "不要删减", "译全", "共 ", "N 条", "删减", "省略", "概括"] {
+            assert!(!prompt.contains(banned), "提示词里不该有「{banned}」");
+        }
+        assert!(prompt.contains("翻译成中文") && capture_system_prompt("英文").contains("翻译成英文"));
+        // 第 5 条：半句话也用自己的编号单独译（PDF 两栏页上量出来的，见 CHANGELOG）；它说的是每个编号各译各的，不是凑条数
+        assert!(prompt.contains("5. 有的条目只是被折行或分栏拆开的半句话") && prompt.contains("不要并进相邻的条目"));
     }
 
     #[test]
@@ -2541,12 +2799,6 @@ mod tests {
         assert!(!same_text("Scheduled", "scheduled"), "大小写不同算不同");
         assert!(!same_text("© Scheduled", "已计划"));
         assert!(!same_text("a b", "ab"), "空格不能被吃掉");
-    }
-
-    #[test]
-    fn translation_array_survives_code_fence() {
-        let raw = "```json\n[\"甲\",\"乙\"]\n```";
-        assert_eq!(parse_translation_array(raw).unwrap(), vec!["甲", "乙"]);
     }
 
     #[test]
@@ -2611,5 +2863,471 @@ mod tests {
             .map(|lang| lang.name)
             .collect();
         assert_eq!(names, ["中文", "英文", "日语", "繁体中文"]);
+    }
+
+    // ───────────────────────── 英文硬折行（`en_wrap`）：`merge_lines` 这一层 ─────────────────────────
+
+    /// 一栏两端对齐的论文正文（几何照真 Vision 在 BERT 论文第一页上量到的形状取整）：x = 134、右缘 420、行高 16、行距 18，
+    /// 一段九行（末行短），隔一行空隙后是下一段。
+    fn paper_column() -> Vec<OcrLine> {
+        let rows: [(&str, f64); 9] = [
+            ("We introduce a new language representa-", 286.0),
+            ("tion model called BERT, which stands for", 286.0),
+            ("Bidirectional Encoder Representations from", 286.0),
+            ("Transformers. Unlike recent language repre-", 286.0),
+            ("sentation models (Peters et al., 2018a; Rad-", 284.0),
+            ("ford et al., 2018), BERT is designed to pre-", 284.0),
+            ("train deep bidirectional representations from", 286.0),
+            ("unlabeled text by jointly conditioning on both", 286.0),
+            ("left and right context in all layers.", 226.0),
+        ];
+        let mut lines: Vec<OcrLine> = rows.iter().enumerate().map(|(k, (text, w))| line(text, 134.0, 376.0 + 18.0 * k as f64, *w, 16.0)).collect();
+        // 下一段：空一行
+        lines.push(line("BERT is conceptually simple and empirically", 136.0, 376.0 + 18.0 * 9.0 + 8.0, 282.0, 16.0));
+        lines.push(line("powerful. It obtains new state-of-the-art re-", 134.0, 376.0 + 18.0 * 10.0 + 8.0, 286.0, 16.0));
+        lines.push(line("sults on eleven natural language processing", 134.0, 376.0 + 18.0 * 11.0 + 8.0, 284.0, 16.0));
+        lines.push(line("tasks, including pushing the GLUE score.", 134.0, 376.0 + 18.0 * 12.0 + 8.0, 250.0, 16.0));
+        lines
+    }
+
+    #[test]
+    fn a_hard_wrapped_english_paragraph_becomes_one_block_and_the_next_paragraph_another() {
+        let blocks = merge_lines(&paper_column(), 1.0);
+        let summary: Vec<(u32, String)> = blocks.iter().map(|b| (b.lines, b.text.chars().take(24).collect())).collect();
+        assert_eq!(summary.len(), 2, "两段：{summary:?}");
+        assert_eq!(blocks[0].lines, 9);
+        assert_eq!(blocks[1].lines, 4);
+        // 连字符断开的词紧挨着接起来；其余隔一个空格；合并后是各行的并集，单行行高仍是一行
+        assert!(blocks[0].text.starts_with("We introduce a new language representa-tion model called BERT, which stands for Bidirectional"), "{}", blocks[0].text);
+        assert!(blocks[0].text.contains("repre-sentation models (Peters et al., 2018a; Rad-ford et al., 2018)"), "{}", blocks[0].text);
+        assert!(blocks[0].text.ends_with("conditioning on both left and right context in all layers."), "{}", blocks[0].text);
+        assert!(blocks[1].text.starts_with("BERT is conceptually simple and empirically powerful."), "{}", blocks[1].text);
+        assert!((blocks[0].y - 376.0).abs() < 1e-9 && (blocks[0].h - (8.0 * 18.0 + 16.0)).abs() < 1e-9 && (blocks[0].line_h - 16.0).abs() < 1e-9, "{:?}", (blocks[0].y, blocks[0].h, blocks[0].line_h));
+        assert_eq!(translate_target(&blocks), Some("中文"));
+    }
+
+    #[test]
+    fn the_same_paragraph_in_double_pixels_and_in_any_input_order_gives_the_same_blocks() {
+        let one_x = paper_column();
+        let two_x: Vec<OcrLine> = one_x.iter().map(|l| OcrLine { x: l.x * 2.0, y: l.y * 2.0, w: l.w * 2.0, h: l.h * 2.0, ..l.clone() }).collect();
+        assert_eq!(shape(&merge_lines(&one_x, 1.0)), shape(&merge_lines(&two_x, 2.0)));
+        let mut shuffled = one_x.clone();
+        shuffled.reverse();
+        shuffled.swap(2, 7);
+        assert_eq!(shape(&merge_lines(&shuffled, 1.0)), shape(&merge_lines(&one_x, 1.0)));
+    }
+
+    #[test]
+    fn two_columns_and_a_vertical_stamp_do_not_get_in_each_others_way() {
+        // 两栏的行按 y 交替，加上页边一条竖排的 arXiv 戳（框高 270）：每一栏各自成段，戳自己一块
+        let left = ["Translating text that appears on a screen is harder than", "translating a document, because the text has already been", "laid out by a typesetting engine, not by the author."];
+        let right = ["We recover whole paragraphs from the geometry of the", "recognized lines instead of the sentence that was cut in", "half by the typesetting engine of the screen."];
+        let mut lines = vec![line("arXiv:1810.04805v2 [cs.CL] 24 May 2019", 26.0, 100.0, 28.0, 270.0)];
+        for k in 0..3 {
+            let w = if k < 2 { 420.0 } else { 330.0 };
+            lines.push(line(left[k], 100.0, 100.0 + 18.0 * k as f64, w, 16.0));
+            lines.push(line(right[k], 560.0, 101.0 + 18.0 * k as f64, w, 16.0));
+        }
+        let blocks = merge_lines(&lines, 1.0);
+        assert_eq!(blocks.len(), 3, "{:?}", shape(&blocks));
+        assert_eq!(blocks.iter().filter(|b| b.lines == 3).count(), 2);
+        assert!(blocks.iter().any(|b| b.text.starts_with("Translating text") && b.text.ends_with("by the author.")));
+        assert!(blocks.iter().any(|b| b.text.starts_with("We recover whole") && b.text.ends_with("of the screen.")));
+        assert!(blocks.iter().any(|b| b.lines == 1 && b.text.starts_with("arXiv")));
+    }
+
+    #[test]
+    fn a_line_vision_split_in_two_is_glued_back_in_reading_order_even_when_the_right_half_sorts_first() {
+        // 第二行被拆成左右两段；右半截的 y 比左半截还小一点，按 y 排会排在前面——不能先处理，更不能把顺序弄反
+        let lines = vec![
+            line("Translating text that appears on a screen is harder than", 100.0, 100.0, 420.0, 16.0),
+            line("has already been", 400.0, 117.5, 118.0, 16.0),
+            line("translating a document, because the text", 100.0, 118.0, 296.0, 16.0),
+            line("engine and not by the author, so a sentence is often.", 100.0, 136.0, 385.0, 16.0),
+        ];
+        let blocks = merge_lines(&lines, 1.0);
+        assert_eq!(shape(&blocks), [(4, "Translating text that appears on a screen is harder than translating a document, because the text has already been engine and not by the author, so a sentence is often.")]);
+        // 孤零零的相邻两项（没有任何折行的上下文）不拼：导航栏
+        let nav = vec![line("Home", 100.0, 40.0, 50.0, 16.0), line("Products", 156.0, 40.0, 70.0, 16.0)];
+        assert_eq!(merge_lines(&nav, 1.0).len(), 2);
+    }
+
+    #[test]
+    fn headings_list_items_code_tables_and_menus_are_not_pulled_into_the_paragraph_around_them() {
+        let lines = vec![
+            line("1 Introduction", 100.0, 20.0, 130.0, 18.0),
+            line("Translating text that appears on a screen is harder than", 100.0, 46.0, 420.0, 16.0),
+            line("translating a document, because the text has been", 100.0, 64.0, 404.0, 16.0),
+            line("laid out by a typesetting engine and not the author.", 100.0, 82.0, 380.0, 16.0),
+            line("• Headings are never merged with the text below them.", 100.0, 116.0, 400.0, 16.0),
+            line("• Every list item starts a new unit of its own, as shown.", 100.0, 134.0, 420.0, 16.0),
+            line("$ ./tools/install-app.sh --release", 100.0, 168.0, 250.0, 16.0),
+            line("$ open /Applications/SENSE.app", 100.0, 186.0, 220.0, 16.0),
+            line("Timeout", 100.0, 220.0, 60.0, 16.0),
+            line("Retries", 100.0, 238.0, 56.0, 16.0),
+            line("Settings", 100.0, 270.0, 60.0, 16.0),
+            line("Keyboard shortcuts", 100.0, 288.0, 130.0, 16.0),
+            line("About", 100.0, 306.0, 40.0, 16.0),
+        ];
+        let blocks = merge_lines(&lines, 1.0);
+        let summary = shape(&blocks);
+        assert_eq!(blocks.len(), 11, "{summary:?}");
+        assert_eq!(blocks.iter().filter(|b| b.lines == 3).count(), 1, "只有那一段正文是三行：{summary:?}");
+        assert!(blocks.iter().any(|b| b.lines == 3 && b.text.starts_with("Translating text") && b.text.ends_with("not the author.")));
+        assert!(blocks.iter().any(|b| b.lines == 1 && b.text == "1 Introduction"));
+    }
+
+    #[test]
+    fn lines_with_cjk_punctuation_or_a_chinese_majority_stay_with_the_chinese_rules() {
+        // 前两行由英文老路合上（下一行小写开头）；第三行只有靠英文硬折行才接得上——它含全角逗号，英文这条路就不认领
+        let third = |text: &str| {
+            vec![
+                line("Translating text that appears on a screen is harder than", 100.0, 100.0, 420.0, 16.0),
+                line("translating a document, because the text has already", 100.0, 118.0, 405.0, 16.0),
+                line(text, 100.0, 136.0, 380.0, 16.0),
+            ]
+        };
+        assert_eq!(merge_lines(&third("been laid out by a typesetting engine, not the author."), 1.0).len(), 1, "对照：纯 ASCII 的第三行接上");
+        assert_eq!(merge_lines(&third("been laid out by a typesetting engine， not the author."), 1.0).len(), 2, "含全角逗号：不接");
+        assert_eq!(merge_lines(&third("been laid out by a typesetting engine（not the author）"), 1.0).len(), 2, "含全角括号：不接");
+        // 英文段落和中文段落同在一页：各走各的，汉字之间不加空格
+        let page = vec![
+            line("Translating text that appears on a screen is harder than", 10.0, 10.0, 420.0, 16.0),
+            line("translating a document, because the text has already", 10.0, 28.0, 405.0, 16.0),
+            line("been laid out by a typesetting engine and not the author.", 10.0, 46.0, 380.0, 16.0),
+            line("为了保护你的隐私，所有的文字识别都在本机完成，图", 500.0, 10.0, 358.0, 20.0),
+            line("片不会离开你的电脑。只有识别出来的文字会发送给你", 500.0, 34.0, 356.0, 22.0),
+            line("选择的翻译服务，而密钥只保存在系统钥匙串里。", 500.0, 60.0, 324.0, 20.0),
+        ];
+        let blocks = merge_lines(&page, 1.0);
+        assert_eq!(blocks.iter().map(|b| b.lines).collect::<Vec<_>>(), [3, 3], "{:?}", shape(&blocks));
+        assert!(blocks[1].text.starts_with("为了保护你的隐私，所有的文字识别都在本机完成，图片不会离开你的电脑。"), "汉字之间不加空格：{}", blocks[1].text);
+    }
+
+    #[test]
+    fn a_merged_english_block_unions_the_geometry_and_keeps_the_first_lines_style() {
+        let ink = |x: f64, y: f64, w: f64| OcrInk { x, y, w, h: 14.0 };
+        let mut lines = vec![
+            styled("Translating text that appears on a screen is harder than", 100.0, 100.0, 420.0, 16.0, ink(101.0, 101.0, 418.0), 80.0),
+            styled("translating a document, because the text has been", 100.0, 118.0, 405.0, 16.0, ink(101.0, 119.0, 403.0), 30.0),
+            styled("laid out by a typesetting engine and not the author.", 100.0, 136.0, 380.0, 16.0, ink(101.0, 137.0, 378.0), 55.0),
+        ];
+        for l in lines.iter_mut() {
+            l.words = l.text.split_whitespace().map(|word| OcrWord { t: word.to_string(), w: word.chars().count() as f64 * 7.0 }).collect();
+        }
+        let blocks = merge_lines(&lines, 1.0);
+        assert_eq!(blocks.len(), 1);
+        let block = &blocks[0];
+        assert_eq!(block.lines, 3);
+        assert_eq!((block.x, block.y, block.w, block.h, block.line_h), (100.0, 100.0, 420.0, 52.0, 16.0));
+        assert_eq!(block.ink, Some(Rect { x: 101.0, y: 101.0, w: 418.0, h: 50.0 }));
+        assert_eq!(block.room, Some(30.0), "右边的空白取各行里最窄的");
+        assert_eq!(block.bg.as_deref(), Some("#1e1e1e"));
+        assert_eq!(block.fg.as_deref(), Some("#c8c9ca"));
+        assert_eq!(block.words.len(), lines.iter().map(|l| l.words.len()).sum::<usize>(), "逐词框接上");
+    }
+
+    fn assert_block_with<'a>(blocks: &'a [Block], needle: &str) -> &'a Block {
+        blocks.iter().find(|block| block.text.contains(needle)).unwrap_or_else(|| panic!("没有哪一块里有「{needle}」：{:?}", shape(blocks)))
+    }
+
+    #[test]
+    fn real_ocr_lines_of_a_two_column_english_paper_become_one_block_per_paragraph() {
+        // 真 Vision 读两栏、两端对齐、带连字符断词和引用链接的英文页：每段合成一块，标题、列表项、图注各自成块，
+        // 左右两栏的行不串。断言只认短锚点与块的结构，不比整行文字（Vision 偶尔读歪一两个字不该让它变红）
+        if real_sidecar().is_none() {
+            return;
+        }
+        let lines = recognized_lines("ocr-en-paper.png");
+        let text = joined(&lines);
+        assert!(lines.len() >= 18, "这一页至少读出 18 行，只有 {} 行：\n{text}", lines.len());
+        let blocks = merge_lines(&lines, 1.0);
+        let summary = || shape(&blocks);
+        // 每段的开头和末尾的锚点落在同一块里
+        for (first, last, at_least) in [("Translating text", "phrase", 4), ("A translator", "instead", 5), ("Two lines belong", "at all", 4), ("Hyphenated", "wrote", 2), ("Figure 1", "translation", 2)] {
+            let block = assert_block_with(&blocks, first);
+            assert!(block.text.contains(last) && block.lines >= at_least, "「{first}」到「{last}」应当合成一块、至少 {at_least} 行：{:?}", summary());
+        }
+        // 前提与护栏：标题、列表项各自一块；没有哪一块把两栏的内容拼在一起
+        for single in ["Reading Paragraphs", "1 Introduction", "2 Method", "Every list item", "Headings are never"] {
+            assert_eq!(assert_block_with(&blocks, single).lines, 1, "「{single}」自己一块：{:?}", summary());
+        }
+        assert!(blocks.iter().all(|b| !(b.text.contains("Translating text") && b.text.contains("Two lines belong"))), "左右两栏不串：{:?}", summary());
+        // 连字符断开的词紧挨着（`recog-` + `nized`、`sen-` + `tence`）
+        let first = assert_block_with(&blocks, "Translating text");
+        assert!(first.text.contains("sen-tence"), "连字符断词紧挨着：{}", first.text);
+        assert_eq!(translate_target(&blocks), Some("中文"));
+    }
+
+    #[test]
+    fn real_ocr_lines_of_a_hard_wrapped_monospace_readme_merge_paragraphs_but_not_code_or_table_cells() {
+        // 等宽字体、按字符数硬折的 README：段落合并，缩进的列表项连着它的续行，代码行与表格单元格各自一块
+        if real_sidecar().is_none() {
+            return;
+        }
+        let lines = recognized_lines("ocr-en-readme.png");
+        let text = joined(&lines);
+        assert!(lines.len() >= 17, "这一页至少读出 17 行，只有 {} 行：\n{text}", lines.len());
+        let blocks = merge_lines(&lines, 1.0);
+        let summary = || shape(&blocks);
+        for (first, last, at_least) in [("Screenshot translation", "pasted", 3), ("Download the latest", "your Mac", 2), ("The key never", "copy of it", 2)] {
+            let block = assert_block_with(&blocks, first);
+            assert!(block.text.contains(last) && block.lines >= at_least, "「{first}」到「{last}」应当合成一块、至少 {at_least} 行：{:?}", summary());
+        }
+        for single in ["Installation", "Grant the screen", "install-app", "open /Applications", "retries"] {
+            assert_eq!(assert_block_with(&blocks, single).lines, 1, "「{single}」自己一块：{:?}", summary());
+        }
+        // 表格里同一列的两个单元格（3 个词和 4 个词，几何上像折行）不并到一起。不要求它们各自单独成块：表头 `Notes` 与 `Name` / `Value`
+        // 的 y 只差 1 px，排序一变，老路（不是新判据）就会把 `Notes` 并上 `seconds, per request`——读数抖动 1 px 时有一成的概率
+        let position = |anchor: &str| blocks.iter().position(|block| block.text.contains(anchor)).unwrap_or_else(|| panic!("没有包含「{anchor}」的块：{:?}", summary()));
+        assert_ne!(position("seconds, per"), position("before giving"), "两个单元格不能合成一块：{:?}", summary());
+        assert_eq!(translate_target(&blocks), Some("中文"));
+    }
+
+    /// 一个小的线性同余随机数发生器（测试里要可复现，不引依赖）。
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+
+        fn unit(&mut self) -> f64 {
+            (self.next() % 10_000) as f64 / 10_000.0
+        }
+    }
+
+    #[test]
+    fn random_pages_never_panic_and_every_non_empty_line_lands_in_exactly_one_block() {
+        // 三千页随机版面：英文 / 中文 / 混排 / 列表符号 / 空白 / 非有限数 / 零宽零高 / 巨大坐标。要求：不 panic、行数守恒、每块至少一行、
+        // 合并后的块框里没有 NaN（输入的框都是有限数时）、结果与输入顺序无关（同一页打乱后块数一样）
+        let words = [
+            "the", "of", "and", "to", "a", "in", "is", "that", "Translating", "text", "screen", "layout", "inter-", "national", "e.g.", "et", "al.", "(Smith", "2018)", "1.", "•", "-", "7.2", "//", "#", "x_y", "a=b;", "->", "你好", "，", "翻译。", "，。", "SENSE", "https://x.org/a", "$", "~", "[12]", "(", ")", "“quoted”",
+        ];
+        let mut rng = Lcg(20261101);
+        for page in 0..3000 {
+            let count = rng.below(40) as usize;
+            let finite = page % 7 != 0;
+            let lines: Vec<OcrLine> = (0..count)
+                .map(|_| {
+                    let n = rng.below(12) + 1;
+                    let text = if rng.below(25) == 0 { "   ".to_string() } else { (0..n).map(|_| words[rng.below(words.len() as u64) as usize]).collect::<Vec<_>>().join(" ") };
+                    let column = rng.below(3) as f64 * 520.0;
+                    let mut l = line(&text, column + rng.below(40) as f64, rng.below(900) as f64 + rng.unit(), 40.0 + rng.below(420) as f64, 6.0 + rng.below(30) as f64);
+                    if !finite {
+                        match rng.below(9) {
+                            0 => l.x = f64::NAN,
+                            8 => l.y = f64::NAN,
+                            1 => l.y = f64::INFINITY,
+                            2 => l.w = f64::NEG_INFINITY,
+                            3 => l.h = f64::NAN,
+                            4 => l.w = 0.0,
+                            5 => l.h = 0.0,
+                            6 => l.x = 1e300,
+                            _ => l.y = -1e300,
+                        }
+                    }
+                    if rng.below(3) == 0 {
+                        l.fg = Some(vec![rng.below(256) as f64, rng.below(256) as f64, rng.below(256) as f64]);
+                    }
+                    if rng.below(3) == 0 {
+                        l.words = text.split_whitespace().map(|word| OcrWord { t: word.to_string(), w: word.chars().count() as f64 * (3.0 + rng.below(8) as f64) }).collect();
+                    }
+                    l
+                })
+                .collect();
+            let scale = if page % 5 == 0 { 2.0 } else { 1.0 };
+            let blocks = merge_lines(&lines, scale);
+            let non_empty = lines.iter().filter(|l| !l.text.trim().is_empty()).count();
+            assert_eq!(blocks.iter().map(|b| b.lines as usize).sum::<usize>(), non_empty, "第 {page} 页：行数守恒");
+            assert!(blocks.iter().all(|b| b.lines >= 1 && !b.text.trim().is_empty()), "第 {page} 页：每块至少一行、有字");
+            if finite {
+                assert!(blocks.iter().all(|b| [b.x, b.y, b.w, b.h, b.line_h].iter().all(|v| v.is_finite())), "第 {page} 页：框是有限数");
+                let mut shuffled = lines.clone();
+                shuffled.reverse();
+                let again = merge_lines(&shuffled, scale);
+                // y 相同的行顺序可以不同（排序是稳定的）：只要页上没有 y 完全相同的行，结果就该一样
+                let mut ys: Vec<u64> = lines.iter().map(|l| l.y.to_bits()).collect();
+                ys.sort();
+                ys.dedup();
+                if ys.len() == lines.len() {
+                    assert_eq!(shape(&blocks), shape(&again), "第 {page} 页：与输入顺序无关");
+                }
+            }
+        }
+    }
+
+    // ───────────────────────── 评审补的用例（接线层：崩溃、碎片顺序、字色、倍数、已知取舍） ─────────────────────────
+
+    #[test]
+    fn a_visual_row_split_into_growing_fragments_does_not_panic_when_a_taller_line_follows() {
+        // 评审 A 构造的输入：同一视觉行被拆成四段，高度 8 / 12 / 18 / 27（相邻一对的比值 ≤ 1.5，所以都算同一行的碎片），底边对齐；
+        // 下一行高 48、顶比最左碎片还高。最左碎片（行头）按 y 排在下一行后面，处理下一行时它的块还没有——以前这里越界 panic（release 下整个应用退出）
+        let bottom = 200.0;
+        let page = vec![
+            line("Translating text", 100.0, bottom - 8.0, 70.0, 8.0),
+            line("that appears on a", 172.0, bottom - 12.0, 80.0, 12.0),
+            line("screen is harder than", 254.0, bottom - 18.0, 100.0, 18.0),
+            line("translating", 356.0, bottom - 27.0, 110.0, 27.0),
+            line("a document because the text has already been laid out by a typesetting", 100.0, 190.0, 366.0, 48.0),
+        ];
+        let blocks = merge_lines(&page, 1.0);
+        assert_eq!(blocks.iter().map(|block| block.lines as usize).sum::<usize>(), 5, "行数守恒：{:?}", shape(&blocks));
+    }
+
+    #[test]
+    fn random_fragment_chains_never_panic_and_every_line_lands_in_exactly_one_block() {
+        // 每一行由 1–3 段碎片组成（碎片的高度、竖直错位、间隙都随机，跨过各条阈值的两侧），行与行的高度、间距也随机；四分之一的页再加一条
+        // 「高度逐段变大」的碎片串，后面跟一行更高的。专门撞「处理顺序」「碎片并入」「同列上一行」这几处——上一个随机用例里各行的框互相独立，几乎不出碎片
+        let snippets = [
+            "translating a document, because the text has already been",
+            "laid out by a typesetting engine and not by the author, so a",
+            "sentence is often cut in the middle of a phrase and",
+            "which is why the",
+            "of the model that we",
+            "Alice and Bob wrote the",
+            "the second moment estimate is therefore a poor approximation to the",
+        ];
+        let mut rng = Lcg(20261102);
+        for page in 0..4000 {
+            let mut lines: Vec<OcrLine> = Vec::new();
+            let right_edge = 400.0 + rng.below(200) as f64;
+            let mut y = 100.0;
+            for _ in 0..2 + rng.below(8) {
+                let h = 8.0 + rng.below(36) as f64;
+                let segments = 1 + rng.below(3);
+                let mut x = 100.0 + (rng.below(5) as f64 - 2.0) * h * 0.3;
+                let justified = rng.below(2) == 0;
+                for segment in 0..segments {
+                    let text = snippets[rng.below(snippets.len() as u64) as usize];
+                    let segment_h = h * (0.6 + rng.unit());
+                    let segment_y = y + (rng.unit() - 0.5) * h * 0.9;
+                    let w = if segment + 1 == segments && justified { (right_edge - x).max(30.0) } else { 40.0 + rng.below(160) as f64 };
+                    lines.push(line(text, x, segment_y, w, segment_h));
+                    x += w + (rng.unit() * 1.1 - 0.35) * h;
+                }
+                y += h * (0.9 + rng.unit() * 0.7);
+            }
+            if page % 4 == 0 {
+                // 评审 A 构造的那种：四段碎片，高度按 1.35–1.5 倍逐段变大、底边对齐，后面一行更高、右缘与碎片串的右缘对齐、顶压在最左碎片上面
+                let bottom = y + 40.0;
+                let growth = 1.35 + rng.unit() * 0.15;
+                let mut h = 6.0 + rng.below(7) as f64;
+                let mut x = 100.0;
+                for (segment, (text, width)) in [("Translating text", 70.0), ("that appears on a", 80.0), ("screen is harder than", 100.0), ("translating", 110.0)].iter().enumerate() {
+                    let w = width * (0.9 + rng.unit() * 0.2);
+                    lines.push(line(text, x, bottom - h, w, h));
+                    x += w + 2.0 + rng.unit() * 4.0;
+                    if segment < 3 {
+                        h *= growth;
+                    }
+                }
+                let tall = h * (1.5 + rng.unit() * 0.5);
+                lines.push(line("a document because the text has already been laid out by a typesetting", 100.0, bottom - 8.0 - rng.below(6) as f64, x - 100.0, tall));
+            }
+            let blocks = merge_lines(&lines, if page % 3 == 0 { 2.0 } else { 1.0 });
+            assert_eq!(blocks.iter().map(|block| block.lines as usize).sum::<usize>(), lines.len(), "第 {page} 页：行数守恒");
+        }
+    }
+
+    #[test]
+    fn independent_bracket_prefixed_log_lines_stay_separate_blocks() {
+        // 四条独立的 Maven 日志（几何取自真 Vision 对渲染页的识别）。HEAD 是 4 块；`[` 开头曾被当成「小写开头」的证据，合成了 2 块
+        let lines = vec![
+            line("[INFO] Downloading from central the artifact for the plugin", 24.0, 134.0, 462.0, 16.0),
+            line("[INFO] Compiling 14 source files to the target directory", 26.0, 152.0, 438.0, 14.0),
+            line("[INFO] Building demo-app 1.0-SNAPSHOT", 24.0, 170.0, 292.0, 16.0),
+            line("[INFO] Tests run 12 Failures 0 Errors 0 Skipped 0 in the module", 24.0, 188.0, 494.0, 14.0),
+        ];
+        assert_eq!(merge_lines(&lines, 1.0).len(), 4, "{:?}", shape(&merge_lines(&lines, 1.0)));
+    }
+
+    #[test]
+    fn a_line_vision_split_in_three_is_glued_left_to_right_whatever_the_input_order() {
+        // 一条视觉行被拆成左 / 中 / 右三段，输入里右段排在中段前面：文字要按 左 中 右 拼，再接下一行
+        let mut lines = vec![
+            line("Translating text", 100.0, 100.0, 112.0, 16.0),
+            line("that appears on a", 216.0, 100.0, 119.0, 16.0),
+            line("screen is harder than", 339.0, 100.0, 147.0, 16.0),
+            line("translating a document, because the text has already been", 100.0, 118.0, 399.0, 16.0),
+        ];
+        lines.swap(1, 2);
+        let blocks = merge_lines(&lines, 1.0);
+        assert_eq!(shape(&blocks), vec![(4, "Translating text that appears on a screen is harder than translating a document, because the text has already been")]);
+    }
+
+    #[test]
+    fn the_text_color_the_helper_measured_reaches_the_english_wrap_check() {
+        // 下一行大写开头，老路不会管它；上一行断在连接词上：只有英文硬折行这一条在判，字色差得远（页脚小字、灰色摘要）就不并
+        let merged = |first: f64, second: f64| {
+            let mut upper = line("Translating text that appears on a screen is harder than", 100.0, 100.0, 420.0, 16.0);
+            let mut lower = line("Documents laid out by an engine, because the text has been", 100.0, 118.0, 380.0, 16.0);
+            upper.fg = Some(vec![first; 3]);
+            lower.fg = Some(vec![second; 3]);
+            merge_lines(&[upper, lower], 1.0).len()
+        };
+        assert_eq!(merged(20.0, 20.0), 1, "同色：并");
+        assert_eq!(merged(20.0, 70.0), 1, "亮度差 50：并");
+        assert_eq!(merged(20.0, 150.0), 2, "灰字：不并");
+    }
+
+    #[test]
+    fn english_wrap_geometry_and_word_boxes_are_divided_by_the_scale() {
+        // 词框 `OcrWord.w` 和行框一样是物理像素，2 倍图要除以倍数。第三行的第一个词（`laid`）在 1 倍图上宽 28，放得下上一行剩下的 40：不并；
+        // 词框没除以倍数（56）就成了「放不下」，把第三行并进来
+        let words = |text: &str, scale: f64| -> Vec<OcrWord> { text.split_whitespace().map(|word| OcrWord { t: word.to_string(), w: word.chars().count() as f64 * 7.0 * scale }).collect() };
+        let page = |scale: f64| -> Vec<OcrLine> {
+            [
+                ("Translating text that appears on a screen is harder than", 100.0, 100.0, 420.0),
+                ("translating a document, because the text has already been", 100.0, 118.0, 380.0),
+                ("laid out by a typesetting engine and not by the author.", 100.0, 136.0, 300.0),
+            ]
+            .iter()
+            .map(|(text, x, y, w)| {
+                let mut l = line(text, x * scale, y * scale, w * scale, 16.0 * scale);
+                l.words = words(text, scale);
+                l
+            })
+            .collect()
+        };
+        let one = merge_lines(&page(1.0), 1.0);
+        let two = merge_lines(&page(2.0), 2.0);
+        assert_eq!(shape(&one), shape(&two));
+        assert_eq!(one.iter().map(|block| block.lines).collect::<Vec<_>>(), vec![2, 1], "{:?}", shape(&one));
+    }
+
+    #[test]
+    fn known_limit_a_pair_the_old_rule_merged_is_split_when_the_line_above_joined_a_paragraph() {
+        // 已知的取舍（CHANGELOG「相对 HEAD 丢掉的合并」）。HEAD 是 [1 2][3 4]；现在 1–3 先并成一段，块变高，老路认不出第 4 行，
+        // 而第 4 行字母不到一半、新判据又不认领它。补回来要让新判据对「老路本来会合」的行对兜底——会带回老路的错合，没做。改了这里要同时改文档
+        let lines = vec![
+            line("Translating text that appears on a screen is harder than", 100.0, 100.0, 420.0, 16.0),
+            line("translating a document, because the text has already been", 100.0, 118.0, 420.0, 16.0),
+            line("laid out by a typesetting engine and not by the author, so", 100.0, 136.0, 420.0, 16.0),
+            line("a size is in (224, 256, 384, 480, 640}).", 100.0, 154.0, 250.0, 16.0),
+        ];
+        let blocks = merge_lines(&lines, 1.0);
+        assert_eq!(blocks.iter().map(|block| block.lines).collect::<Vec<_>>(), vec![3, 1], "{:?}", shape(&blocks));
+    }
+
+    #[test]
+    fn known_limit_a_heading_the_old_rule_joins_to_a_lowercase_first_line_pulls_the_whole_paragraph_in() {
+        // 已知的取舍（评审 A 的 P1-3）。HEAD 的老路只能两两合并，「标题 + 小写开头的首行」这个错合的伤害限在 2 行；
+        // 现在后面每一行都是「同列上一行」，整段跟着进了标题那一块（几何取自真 Vision）。改了这里要同时改文档
+        let lines = vec![
+            line("Introduction to the conll-2003 shared task: Language-independent", 24.0, 234.0, 484.0, 16.0),
+            line("iPhone we plan to extend the Transformer to problems involving input and output", 24.0, 256.0, 556.0, 20.0),
+            line("modalities other than text and to investigate local, restricted attention", 22.0, 278.0, 480.0, 23.0),
+            line("mechanisms to efficiently handle large inputs and outputs such as images, audio", 22.0, 300.0, 554.0, 22.0),
+            line("and video. We adopt Faster R-CNN [32] as the detection method. For NER, we", 24.0, 320.0, 538.0, 22.0),
+            line("report both fine-tuning and feature-based approaches, as we expect the", 22.0, 346.0, 500.0, 18.0),
+        ];
+        let blocks = merge_lines(&lines, 1.0);
+        assert_eq!(blocks.iter().map(|block| block.lines).collect::<Vec<_>>(), vec![6], "{:?}", shape(&blocks));
     }
 }

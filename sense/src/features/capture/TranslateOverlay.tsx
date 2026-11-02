@@ -216,14 +216,23 @@ export function isNothingToReplace(blocks: OverlayBlock[] | null): boolean {
 /**
  * 画层：先把所有原文盖住，再画译文——相邻两块的遮盖矩形不能压在对方的译文上。
  * 译文和原文一样的块不画，原来的像素一点不动（比用另一种字体照着再画一遍更像原文，粗体标题也不会被换成常规字重）。
+ *
+ * 一部分译成、一部分没译成（模型漏了几条）时，没译成的块画的是原文：压暗之外再加一道虚线下划线，
+ * 用户一眼看得出是哪几块，不会把夹在译文里的原文当成译文。全都没译成时（失败提示已经说明）不加，整屏的虚线只是噪声。
  */
 export function OverlayLayers({ blocks, plans }: { blocks: OverlayBlock[]; plans: BlockPlan[] }) {
+  const someTranslated = blocks.some((block) => block?.translated === true);
   return (
     <>
       {plans.map((plan, index) => (blocks[index]?.unchanged ? null : <CoverView key={`cover-${index}`} plan={plan} />))}
       {plans.map((plan, index) =>
         blocks[index]?.unchanged ? null : (
-          <TextView key={`text-${index}`} plan={plan} translated={blocks[index]?.translated ?? false} />
+          <TextView
+            key={`text-${index}`}
+            plan={plan}
+            translated={blocks[index]?.translated ?? false}
+            flagUntranslated={someTranslated}
+          />
         ),
       )}
     </>
@@ -247,13 +256,15 @@ function CoverView({ plan }: { plan: BlockPlan }) {
  * 译文：一行一个元素，行已经折好了（见 `wrapText`），浏览器不再自己折，排出来才和预估的一致。
  * 没译成（失败时画的是识别出的原文）的稍微压暗一点，和顶部的失败提示一起，不让原文冒充译文。
  */
-function TextView({ plan, translated }: { plan: BlockPlan; translated: boolean }) {
+function TextView({ plan, translated, flagUntranslated }: { plan: BlockPlan; translated: boolean; flagUntranslated: boolean }) {
+  const flagged = !translated && flagUntranslated;
   return (
     <div
       data-role="text"
       data-size={plan.fontSize}
       data-truncated={plan.truncated ? "true" : undefined}
       data-anchor={plan.anchor}
+      data-untranslated={flagged ? "true" : undefined}
       className="absolute"
       style={{
         left: plan.x,
@@ -266,6 +277,7 @@ function TextView({ plan, translated }: { plan: BlockPlan; translated: boolean }
         color: plan.fg,
         whiteSpace: "pre",
         opacity: translated ? 1 : 0.82,
+        ...(flagged ? { textDecoration: "underline dotted", textUnderlineOffset: 2 } : {}),
       }}
     >
       {/* dir 由目标语言定（见 textDirection）：阿拉伯语、希伯来语的译文从右往左，括号、句点、夹着的英文才不会跑到错的一边；其余照旧从左往右 */}
