@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { parseUpdateStatus, type UpdateStatus } from "./updateStatus";
 import type { Frame } from "./windowFrame";
 
 export type ProviderView = {
@@ -121,6 +122,13 @@ export type LookupArgs = {
   bypassCache?: boolean;
 };
 
+/** Rust 返回的更新状态必须认得出来；认不出来说明前后端版本对不上，别悄悄当成功 */
+function needUpdateStatus(raw: unknown): UpdateStatus {
+  const status = parseUpdateStatus(raw);
+  if (!status) throw new Error("更新状态的格式不认识（前后端版本对不上？）");
+  return status;
+}
+
 export const api = {
   listProviders: () => invoke<ProviderView[]>("list_providers"),
   saveProvider: (id: string, baseUrl: string, model: string) =>
@@ -177,7 +185,33 @@ export const api = {
     invoke<WordGloss>("explain_word", { term, context }),
   invalidateLookup: (word: string, lang: string, context?: string) =>
     invoke<void>("invalidate_lookup", { word, lang, context }),
+  /** 自动更新：状态 / 立刻检查（发现新版本会一直下载到验签完成才返回）/ 装上并重启 / 开关 */
+  updateStatus: () => invoke<unknown>("update_status").then(needUpdateStatus),
+  checkUpdate: () => invoke<unknown>("update_check_now").then(needUpdateStatus),
+  restartForUpdate: () => invoke<void>("update_restart"),
+  setAutoUpdate: (enabled: boolean) =>
+    invoke<unknown>("set_auto_update", { enabled }).then(needUpdateStatus),
 };
+
+/**
+ * 更新状态每变一次 Rust 发一个事件（下载进度也走它），载荷是完整的状态。
+ * 格式不对的不交给 handler，但不能悄悄吞掉：打一行错误，并通知调用方（`onInvalid`），
+ * 由它重新取一次状态、取不到就告诉用户——否则前后端版本一旦对不上，整块更新界面会无声无息地消失。
+ */
+export function onUpdateStatus(
+  handler: (status: UpdateStatus) => void,
+  onInvalid?: () => void,
+): Promise<UnlistenFn> {
+  return listen<unknown>("sense://update-status", (event) => {
+    const status = parseUpdateStatus(event.payload);
+    if (status) {
+      handler(status);
+      return;
+    }
+    console.error("[sense] 更新状态事件的格式不认识，已忽略", event.payload);
+    onInvalid?.();
+  });
+}
 
 /** 改键成功（或旧键装不回去）后，Rust 发这个事件；标题栏的键帽据此重新取 */
 export function onHotkeyChanged(handler: () => void): Promise<UnlistenFn> {

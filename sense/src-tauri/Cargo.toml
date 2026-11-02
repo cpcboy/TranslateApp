@@ -22,6 +22,12 @@ tauri = { version = "2", features = ["macos-private-api"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-global-shortcut = "2.4.1"
+# 自动更新：只在 Rust 里用（检查 / 下载 / 验签 / 替换 .app），不给前端开 updater:* 权限，见 src/updater.rs
+# default-features = false：默认特性里的 system-proxy 会打开 reqwest 的 macOS 系统代理支持，而 reqwest 是整个进程共用的，
+# 模型请求也会跟着去读系统代理；应用一直只认环境变量里的代理（lib.rs 的 client_for），所以只留 rustls-tls 和 zip。
+# 关掉默认特性之后，插件以后新增的默认特性不会自动带上：升级它的时候对照它的 [features] 重新核对
+# （守卫：src/updater.rs 的 updater_plugin_does_not_turn_on_the_system_proxy）
+tauri-plugin-updater = { version = "2.14.1", default-features = false, features = ["rustls-tls", "zip"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync"] }
 sha2 = "0.11.1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
@@ -29,6 +35,10 @@ keyring = "4.2.0"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream", "rustls", "http2", "charset"] }
 futures-util = "0.3.34"
 
+[dev-dependencies]
+# 只给测试用：核对 tauri.conf.json 里的更新公钥是真的 minisign 公钥（两个都已经在更新插件的依赖树里）
+base64 = "0.23"
+minisign-verify = "0.3"
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { LookupView } from "./features/lookup/LookupView";
 import { SettingsView } from "./features/settings/SettingsView";
+import { UpdateBanner } from "./features/update/UpdateBanner";
+import { useUpdate } from "./features/update/useUpdate";
 import { ResizeHandles } from "./features/window/ResizeHandles";
 import { WindowControls } from "./features/window/WindowControls";
 import { api, onHotkeyChanged } from "./lib/ipc";
@@ -22,6 +24,8 @@ export default function App() {
   const longSource = useLookup((state) => state.longSource);
   const resetLookup = useLookup((state) => state.reset);
   const { scale, badge } = useUiScale();
+  // 更新状态在这里建一份：顶部横幅和设置页的「更新」卡片共用
+  const update = useUpdate();
 
   useEffect(() => {
     if (!isTauri) return;
@@ -135,6 +139,8 @@ export default function App() {
             </span>
           </header>
 
+          <UpdateBanner update={update} />
+
           {notice && (
             <div className="mx-4 mt-3 shrink-0 rounded-lg border border-[rgba(255,82,48,0.35)] bg-[rgba(255,82,48,0.1)] px-4 py-3 text-[13.5px] leading-relaxed text-[#f6b09b]">
               <div className="flex items-start justify-between gap-3">
@@ -154,7 +160,7 @@ export default function App() {
             {view === "lookup" ? (
               <LookupView onOpenSettings={() => setView("settings")} />
             ) : (
-              <SettingsView onBack={() => setView("lookup")} />
+              <SettingsView onBack={() => setView("lookup")} update={update} />
             )}
           </main>
         </ZoomLayer>

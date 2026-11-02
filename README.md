@@ -7,6 +7,7 @@ macOS 上的 AI 翻译器桌面应用：查词给完整义项卡，长文给逐�
 | 想了解 | 看这里 |
 |---|---|
 | 怎么装成 App、怎么跑、怎么配模型 | [`sense/README.md`](sense/README.md) |
+| 自动更新、发布新版本、在另一台电脑上第一次安装 | [`sense/README.md`「自动更新」](sense/README.md#自动更新) |
 | 产品与工程方案 | `SENSE-v1.0/docs/SENSE-落地方案.md`（交接包本地材料，未入库） |
 | 数据契约与 prompt | [`SENSE-v1.0/spec/`](SENSE-v1.0/spec/) |
 | 变更记录 | [`CHANGELOG.md`](CHANGELOG.md) |

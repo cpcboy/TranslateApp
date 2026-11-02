@@ -51,5 +51,14 @@
     "externalBin": [
       "binaries/sense-ocr"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNBOTU2NzM3QTYyMkY2RDYKUldUVzlpS21OMmVWT3V0WlpzUDlka1l4UlRUaGFldHk5NDI5SGVIV1Z3N0lrSFVYb1VBVlRRNVUK",
+      "endpoints": [
+        "https://github.com/cpcboy/TranslateApp/releases/latest/download/latest.json"
+      ],
+      "requireSignedVersion": true
+    }
   }
 }

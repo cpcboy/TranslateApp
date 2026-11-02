@@ -12,6 +12,7 @@ mod providers;
 mod secrets;
 mod settings;
 mod stream;
+mod updater;
 mod window;
 
 use std::sync::OnceLock;
@@ -25,9 +26,10 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 /// 全局复用一个 HTTP 客户端：连接池、TLS 会话都能复用。
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
-/// 本地模型专用：绕开系统代理。
+/// 本地模型专用：绕开环境变量里的代理。
 ///
-/// reqwest 默认读 HTTP_PROXY / HTTPS_PROXY，而 NO_PROXY 里通常没有 127.0.0.1。
+/// reqwest 默认读 HTTP_PROXY / HTTPS_PROXY（不读 macOS 系统代理：更新插件的 `system-proxy` 特性
+/// 在 Cargo.toml 里关着），而 NO_PROXY 里通常没有 127.0.0.1。
 /// 一旦用户（或开发机）设了全局代理，发给 Ollama / LM Studio 的请求会被
 /// 转给代理，本地模型直接不可用，报错还很难懂。
 static LOOPBACK_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -46,7 +48,7 @@ pub(crate) fn is_loopback(base_url: &str) -> bool {
     matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
 }
 
-/// 按目标地址挑客户端：本地直连，远端才走系统代理。
+/// 按目标地址挑客户端：本地直连，远端才走环境变量里的代理（没设就直连）。
 pub fn client_for(base_url: &str) -> &'static reqwest::Client {
     if !is_loopback(base_url) {
         return http_client();
@@ -117,9 +119,12 @@ pub fn register_hotkey(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        // 更新插件只给 Rust 侧用（updater.rs）；capabilities 里不开 updater:*，前端调不到它的命令
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(window::WindowState::default())
         .manage(window::HotkeyState::default())
         .manage(capture::CaptureState::default())
+        .manage(updater::UpdateState::default())
         .invoke_handler(tauri::generate_handler![
             window::hide_window,
             window::quit_app,
@@ -148,6 +153,10 @@ pub fn run() {
             capture::start_capture,
             capture::close_overlay,
             capture::capture_blocks,
+            updater::update_status,
+            updater::update_check_now,
+            updater::update_restart,
+            updater::set_auto_update,
         ])
         .setup(|app| {
             // 默认菜单：给出 ⌘Q 退出与 Edit 菜单（输入框的 ⌘C/⌘V 依赖它）。
@@ -274,6 +283,9 @@ pub fn run() {
                     window::show(&handle);
                 });
             }
+
+            // 自动更新：开发版 / 不在 .app 里只打一行日志；否则 30 秒后开始检查（见 updater.rs）
+            updater::start(app.handle());
 
             Ok(())
         })
