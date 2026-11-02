@@ -1,0 +1,28 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+html,body{margin:0;background:#f6f8fa;color:#24292f;overflow:hidden}
+pre{position:absolute;left:28px;top:20px;margin:0;font-family:Menlo,monospace;font-size:13px;line-height:1.45}
+</style></head><body>
+<pre># SENSE
+
+Screenshot translation for macOS. Select a region of the screen and the
+translation is drawn over the original text, in the same position, size
+and colour as the source, so nothing has to be copied or pasted.
+
+Installation
+------------
+
+  * Download the latest build from the releases page and move SENSE.app
+    into the Applications folder of your Mac.
+  * Grant the screen recording permission the first time you use it.
+
+    $ ./tools/install-app.sh
+    $ open /Applications/SENSE.app
+
+Name        Value     Notes
+timeout     30        seconds, per request
+retries     3         before giving up
+
+The key never leaves the system keychain: requests are made by the app
+itself and the web view only ever sees a masked copy of it.
+</pre>
+</body></html>
