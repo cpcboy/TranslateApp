@@ -79,9 +79,13 @@ fn is_cjk(ch: char) -> bool {
 
 /// 两行文字接起来：两侧边界字符都是汉字 / 全角标点就紧挨着，否则（拉丁词之间、汉字与拉丁字母之间）隔一个空格。
 /// 英文那条老路也走这里：边界上有拉丁字符时与以前一样（隔一个空格），只有汉字之间不再塞半角空格。
+/// 另外，英文单词被连字符断开的（`inter-` + `national`、`state-of-the-` + `art`：字母加连字符结尾、下一行小写字母开头）
+/// 也紧挨着、连字符留着——`inter-national` 模型读得懂，`state-of-the-art` 本来就该是这个样子；隔一个空格的话
+/// 译文里会冒出「inter- national」。
 pub(super) fn join_lines(previous: &str, next: &str) -> String {
     let glue = match (previous.chars().last(), next.chars().next()) {
         (Some(before), Some(after)) if is_cjk(before) && is_cjk(after) => "",
+        (Some('-'), Some(after)) if after.is_ascii_lowercase() && previous.chars().rev().nth(1).is_some_and(|ch| ch.is_ascii_alphabetic()) => "",
         _ => " ",
     };
     format!("{previous}{glue}{next}")
@@ -365,6 +369,24 @@ mod tests {
         assert_eq!(join_lines("こんにちは", "世界"), "こんにちは世界");
         assert_eq!(join_lines("第一行（", "ＡＢ"), "第一行（ＡＢ", "全角字母也在全角区里");
         assert_eq!(join_lines("他说“好”", "然后"), "他说“好” 然后", "弯引号不在汉字 / 全角区：与以前一样隔一个空格");
+    }
+
+    #[test]
+    fn a_hyphen_that_breaks_a_latin_word_joins_without_a_space_but_nothing_else_changes() {
+        // 字母 + 连字符结尾、下一行小写字母开头：英文单词被连字符断开——紧挨着、连字符留着
+        assert_eq!(join_lines("an inter-", "national event"), "an inter-national event");
+        assert_eq!(join_lines("state-of-the-", "art models"), "state-of-the-art models");
+        assert_eq!(join_lines("representa-", "tion"), "representa-tion");
+        // 其余一律与以前一样：下一行大写 / 数字 / 汉字开头、连字符前面不是字母、破折号、孤零零的连字符
+        assert_eq!(join_lines("an inter-", "National event"), "an inter- National event");
+        assert_eq!(join_lines("an inter-", "2018 event"), "an inter- 2018 event");
+        assert_eq!(join_lines("an inter-", "中文"), "an inter- 中文");
+        assert_eq!(join_lines("see 5-", "10 pages"), "see 5- 10 pages");
+        assert_eq!(join_lines("see 5-", "year plan"), "see 5- year plan", "连字符前面是数字，不是被断开的单词");
+        assert_eq!(join_lines("a -", "dash"), "a - dash", "连字符前面是空格");
+        assert_eq!(join_lines("-", "dash"), "- dash", "整行只有一个连字符");
+        assert_eq!(join_lines("an em dash—", "continues"), "an em dash— continues", "破折号不是连字符");
+        assert_eq!(join_lines("an inter-", "éclat"), "an inter- éclat", "只认 ASCII 小写字母");
     }
 
     #[test]
