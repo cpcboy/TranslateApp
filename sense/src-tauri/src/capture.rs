@@ -52,6 +52,8 @@ use crate::secrets;
 
 // 中文折行段落的判定（纯函数，不碰 OCR / 窗口）：一句话被折成多行时合回一块再翻译
 mod zh_wrap;
+// 与模型之间的协议（纯函数 + 一个把「问模型」当参数的 `translate_all`）：分块、带编号的消息、按编号对齐、重试、对齐粗检
+mod protocol;
 
 /// 结果窗口的 label。
 pub const OVERLAY_WINDOW: &str = "overlay";
@@ -633,17 +635,17 @@ pub async fn run_with_image(
 
     // 翻译失败也把原文盖上去，至少让用户看到识别结果；
     // 但失败原因必须一起交给覆盖层，不能让原文冒充译文。
-    let mut failure = None;
-    match capture_target(&blocks, load_pref(app)) {
-        Some(target) => {
-            if let Err(err) = translate_blocks(app, &mut blocks, target.name).await {
+    let (failure, notice) = match capture_plan(&blocks, load_pref(app)) {
+        Some((target, direction)) => {
+            let translated = translate_blocks(app, &mut blocks, target.name, direction).await;
+            if let Err(err) = &translated {
                 eprintln!("[sense] 截图翻译失败：{err}");
-                failure = Some(err);
             }
+            settle(translated, notice)
         }
         // 识别出来的全是数字、符号：没什么可译的，也要说一声
-        None => failure = Some("选区里没有可翻译的文字（只识别出数字或符号）".to_string()),
-    }
+        None => (Some("选区里没有可翻译的文字（只识别出数字或符号）".to_string()), notice),
+    };
 
     // 有失败、位置提示、或「译文全和原文一样」的提示时，覆盖层至少要放得下这条提示：
     // 只框了一行字（比如一个版本号、一条命令）时选区太矮，提示会被截掉
@@ -1033,13 +1035,111 @@ fn merge_lines(lines: &[OcrLine], scale: f64) -> Vec<Block> {
 ///
 /// 识别（OCR）本身目前只读中英文，其它语言的截图读不准——这是 OCR 的限制，不是翻译这边的。
 fn capture_target(blocks: &[Block], pref: &str) -> Option<&'static Lang> {
-    let sample: String = blocks.iter().map(|block| block.text.as_str()).collect::<Vec<_>>().join(" ");
-    let plan = lang::plan(&sample, pref);
-    plan.source.letters.then_some(plan.target)
+    capture_plan(blocks, pref).map(|(target, _)| target)
 }
 
-/// 一次请求翻译全部块，顺序对齐；失败就保留原文。
-async fn translate_blocks(app: &AppHandle, blocks: &mut [Block], target: &str) -> Result<(), String> {
+/// 目标语言，加上对齐粗检能不能用：粗检的长度比只量过「中文页 → 英文」和「英文页 → 中文」，
+/// 别的源 → 目标组合（法语 → 英文、日文 → 中文……）每个字符的权重不同，量不准，会把对齐的译文当错位，所以不检。
+/// 英文页只要识别为英文就算（拉丁字母没把握时默认就是英文，和以前一样）。
+fn capture_plan(blocks: &[Block], pref: &str) -> Option<(&'static Lang, protocol::Direction)> {
+    let sample: String = blocks.iter().map(|block| block.text.as_str()).collect::<Vec<_>>().join(" ");
+    let plan = lang::plan(&sample, pref);
+    if !plan.source.letters {
+        return None;
+    }
+    let source = plan.source.lang.map(|lang| lang.code);
+    let direction = match (source, plan.target.name) {
+        (Some("zh"), "英文") => protocol::Direction::ToEnglish,
+        (Some("en"), "中文") => protocol::Direction::ToChinese,
+        _ => protocol::Direction::Other,
+    };
+    Some((plan.target, direction))
+}
+
+/// 截屏翻译的系统提示词。
+///
+/// 这段措辞 2026-10-31 用真实模型核对过（`deepseek-flash`，样本外页面，按页口径；预设里的 `deepseek-chat` 是它的别名，2026-11-01 又补测了 `deepseek-v4-pro`），数据在 CHANGELOG
+/// 「截屏翻译：整页『译文条数对不上』改成带编号的协议」：每条带编号、模型照抄编号译回，应用按编号对齐，取代了「等长字符串数组、条数是唯一校验」的老协议。
+/// 第 5 条（半句话、单个符号 / 单词也用自己的编号单独译）是在 PDF 两栏页上量出来的：没有它，模型会顺着句意把译文重新分配到
+/// 各个断行上（编号对、位置错一格）；加上之后第一轮的部分失败与对齐粗检触发都明显少了，别的页面上没有变差。
+/// 第 4 条「每条尽量简短」对整段验证过，没有让模型删正文（CHANGELOG「验证 · 2026-10-31 — 截屏翻译提示词」）。
+/// 逐字钉在 `tests/fixtures/capture-prompt.to-{en,zh}.txt`（评测用的就是这份原文）；改措辞之前先看 CHANGELOG：
+/// 完整优先、写明条数、「必须恰好 N 条」这几类改法在老协议下试过，都有代价，没采用；这里也别加「不要删减信息」之类的完整性措辞。
+/// 开头那句是 tools/mock-provider.mjs 认「截屏翻译」请求的标记（MARKERS.capture），必须原样保留。
+fn capture_system_prompt(target: &str) -> String {
+    format!(
+        "你是一位翻译，正在翻译屏幕上一段连续的文字。input 是按阅读顺序排好的 JSON 数组，\
+         每个元素形如 {{\"i\":编号,\"t\":原文}}，相邻两条通常属于同一段内容。\n\n要求：\n\
+         1. 先通读全部条目，理解整体在讲什么，再逐条翻译成{target}；指代、术语、语气前后保持一致。\n\
+         2. 输出 JSON 数组，每个元素形如 {{\"i\":编号,\"t\":译文}}，编号照抄输入，一个编号一个元素。\
+         只输出数组本身，不要解释、不要代码块。\n\
+         3. 命令行、代码、变量名、路径、URL、版本号、错误码、日志级别原样保留，不要翻译。\n\
+         4. 每条尽量简短，以适配原来的版面宽度。\n\
+         5. 有的条目只是被折行或分栏拆开的半句话，或者只是一个符号、一个词：照样用它自己的编号单独翻译，\
+         哪怕读起来不通顺，不要并进相邻的条目。"
+    )
+}
+
+/// 向模型问一次（流式；截屏翻译没有「停止」按钮，所以不带取消）：返回完整的回复文本，和回复有没有被 max_tokens 截断。
+async fn ask_model(
+    client: &reqwest::Client,
+    provider: &provider_registry::Provider,
+    key: Option<&str>,
+    system: &str,
+    reasoning: Option<&serde_json::Value>,
+    user: String,
+) -> Result<protocol::Reply, String> {
+    let body = openai_compat::build_body(&provider.model, system, &user, 0.2, reasoning, openai_compat::MAX_TOKENS);
+    let outcome = openai_compat::stream_chat_adaptive(client, provider, key, &body, reasoning, &mut |_: &str| {}, None)
+        .await
+        .map_err(|err| err.message())?;
+    Ok(reply_from(outcome.text, outcome.finish_reason.as_deref()))
+}
+
+/// 模型的一次回复：文本，和有没有被 max_tokens 截断（`finish_reason` 是 `length`）。
+fn reply_from(text: String, finish_reason: Option<&str>) -> protocol::Reply {
+    protocol::Reply { truncated: finish_reason == Some("length"), text }
+}
+
+/// 问模型的方式。
+struct Delivery {
+    /// 各块同时发（云端 provider）。本地模型（不要 Key 的）一次只处理一个请求：同时发只会排队超时，一块一块来
+    parallel: bool,
+    /// 译成什么方向：对齐粗检按它取长度比；方向传反了，会把对齐的译文当成错位；中英以外的目标不检
+    to_english: protocol::Direction,
+}
+
+fn delivery(direction: protocol::Direction, requires_key: bool) -> Delivery {
+    Delivery { parallel: requires_key, to_english: direction }
+}
+
+/// 翻译这一步的结果怎么落到覆盖层的两个槽：整次失败的原因，和要附的提示。
+/// 一部分没译成时，那句话排在位置提示（`notice`，如果有）前面，一起说。
+fn settle(translated: Result<Option<String>, String>, notice: Option<String>) -> (Option<String>, Option<String>) {
+    match translated {
+        Ok(None) => (None, notice),
+        Ok(Some(partial)) => (
+            None,
+            Some(match notice {
+                Some(existing) => format!("{partial}{existing}"),
+                None => partial,
+            }),
+        ),
+        Err(err) => (Some(err), notice),
+    }
+}
+
+/// 一块都没译成（至少有一块、而且全失败了）才是整次失败；没有块时没东西可译，不算失败。
+fn all_failed(outcome: &protocol::Outcome) -> bool {
+    let total = outcome.translations.len();
+    total > 0 && outcome.failed() == total
+}
+
+/// 翻译整屏的块。分块并行发、按编号对齐，没译成的块保留原文：
+/// - `Ok(None)`：全部译成；
+/// - `Ok(Some(话))`：有的块没译成（原文原样留着，`translated` 仍为 false），这句话要交给覆盖层，不能让原文冒充译文；
+/// - `Err`：一块都没译成。
+async fn translate_blocks(app: &AppHandle, blocks: &mut [Block], target: &str, direction: protocol::Direction) -> Result<Option<String>, String> {
     let provider = provider_registry::active(app)?;
     let key = if provider.requires_key {
         match secrets::get_key(&provider.id)? {
@@ -1051,66 +1151,46 @@ async fn translate_blocks(app: &AppHandle, blocks: &mut [Block], target: &str) -
         None
     };
 
-    let payload: Vec<&str> = blocks.iter().map(|block| block.text.as_str()).collect();
-    let user = serde_json::to_string(&payload).map_err(|err| err.to_string())?;
-    // 这段提示词的措辞 2026-10-31 用真实模型核对过：deepseek-flash 上 47 个多行整段（517 个译文样本）、
-    // 在 deepseek-chat 上重复（178 个样本），第 4 条「每条尽量简短」都没有让模型删正文，所以原样保留。
-    // 也试过别的写法：完整优先的改写没有收益；写明条数 + 「一条对一条」的规则 + 小例子能压低整页「译文条数对不上」，
-    // 但好处在默认型号上不显著，还带来静默错位、个别限定语被压缩、坏 JSON 等代价，没采用。
-    // 数据、取舍和后续建议见 CHANGELOG「验证 · 2026-10-31 — 截屏翻译提示词」，改措辞之前先看那里。
-    // 开头那句是 tools/mock-provider.mjs 认「截屏翻译」请求的标记（MARKERS.capture），必须原样保留。
-    let system = format!(
-        "你是一位翻译，正在翻译屏幕上一段连续的文字。input 是按阅读顺序排好的 JSON 字符串数组，\
-         相邻两条通常属于同一段内容。\n\n要求：\n\
-         1. 先通读全部条目，理解整体在讲什么，再逐条翻译成{target}；指代、术语、语气前后保持一致。\n\
-         2. 输出同样长度、同样顺序的 JSON 字符串数组，只输出数组本身，不要解释、不要代码块。\n\
-         3. 命令行、代码、变量名、路径、URL、版本号、错误码、日志级别原样保留，不要翻译。\n\
-         4. 每条尽量简短，以适配原来的版面宽度。"
-    );
-
-    // 上下文由「整屏一次送 + 先通读再翻」的提示词保证，不靠思维链。
+    let system = capture_system_prompt(target);
+    // 上下文由「整屏一起送 + 先通读再翻」的提示词保证，不靠思维链。
     // 实测开思考要多等 2–5 秒，换来的是翻译任务里几乎看不出的提升。
     let reasoning = provider_registry::reasoning_fields(&provider.id);
-    let body = openai_compat::build_body(
-        &provider.model,
-        &system,
-        &user,
-        0.2,
-        reasoning.as_ref(),
-        openai_compat::MAX_TOKENS,
-    );
+    let client = crate::client_for(&provider.base_url);
+    let (provider_ref, key_ref, reasoning_ref) = (&provider, key.as_deref(), reasoning.as_ref());
+    let ask = |user: String| ask_model(client, provider_ref, key_ref, &system, reasoning_ref, user);
 
-    let mut raw = String::new();
-    let outcome = openai_compat::stream_chat_adaptive(
-        crate::client_for(&provider.base_url),
-        &provider,
-        key.as_deref(),
-        &body,
-        reasoning.as_ref(),
-        &mut |delta: &str| raw.push_str(delta),
-        None,
-    )
-    .await
-    .map_err(|err| err.message())?;
+    let Delivery { parallel, to_english } = delivery(direction, provider.requires_key);
+    let outcome = {
+        let texts: Vec<&str> = blocks.iter().map(|block| block.text.as_str()).collect();
+        protocol::translate_all(&texts, parallel, to_english, ask).await
+    };
 
-    let translations = parse_translation_array(&outcome.text)?;
-    if translations.len() != blocks.len() {
-        return Err(format!(
-            "译文条数对不上：{} vs {}",
-            translations.len(),
-            blocks.len()
-        ));
+    let (total, failed) = (outcome.translations.len(), outcome.failed());
+    trace(app, format!("translate blocks={total} requests={} retries={} failed={failed}", outcome.requests, outcome.retries));
+    let notice = failure_notice(&outcome);
+    if all_failed(&outcome) {
+        return Err(outcome.main_reason().map(protocol::Why::describe).unwrap_or_default());
     }
-
-    apply_translations(blocks, translations);
-    Ok(())
+    apply_translations(blocks, outcome.translations);
+    Ok(notice)
 }
 
-/// 把译文按顺序套回各块。空译文保留原文（`translated` 仍为 false）；
+/// 有的块没译成时，给覆盖层的一句话：几块、为什么、这几块是什么样（保留原文，用虚线标出）。
+fn failure_notice(outcome: &protocol::Outcome) -> Option<String> {
+    let failed = outcome.failed();
+    if failed == 0 {
+        return None;
+    }
+    let reason = outcome.main_reason().map(protocol::Why::describe).unwrap_or_default();
+    Some(format!("有 {failed} 块没能译出：{}。那几块仍是原文，用虚线下划线标出。", reason.trim_end_matches(['。', '.'])))
+}
+
+/// 把译文套回各块。没译成的块（`Err`）和空译文保留原文（`translated` 仍为 false）；
 /// 译文和原文一样（模型按提示词把命令、版本号、专有名词原样保留了）的标 `unchanged`：
 /// 覆盖层不去动这样的块，原来的像素一点不改，比用另一种字体照着再画一遍更像原文。
-fn apply_translations(blocks: &mut [Block], translations: Vec<String>) {
-    for (block, text) in blocks.iter_mut().zip(translations) {
+fn apply_translations(blocks: &mut [Block], translations: Vec<Result<String, protocol::Why>>) {
+    for (block, item) in blocks.iter_mut().zip(translations) {
+        let Ok(text) = item else { continue };
         let text = text.trim().to_string();
         if !text.is_empty() {
             block.unchanged = same_text(&block.text, &text);
@@ -1123,18 +1203,6 @@ fn apply_translations(blocks: &mut [Block], translations: Vec<String>) {
 /// 两段文字只差空白（OCR 的空格与模型的空格不一定一致）也算一样。
 fn same_text(a: &str, b: &str) -> bool {
     a.split_whitespace().eq(b.split_whitespace())
-}
-
-/// 模型偶尔会包一层 ```json，这里统一剥掉再解析。
-fn parse_translation_array(raw: &str) -> Result<Vec<String>, String> {
-    let mut text = raw.trim();
-    if let Some(rest) = text.strip_prefix("```") {
-        let rest = rest.trim_start_matches("json").trim_start();
-        text = rest.trim_end_matches("```").trim();
-    }
-    let start = text.find('[').ok_or("译文里没有 JSON 数组")?;
-    let end = text.rfind(']').ok_or("译文 JSON 不完整")?;
-    serde_json::from_str::<Vec<String>>(&text[start..=end]).map_err(|err| format!("译文解析失败：{err}"))
 }
 
 #[cfg(test)]
@@ -2173,7 +2241,7 @@ mod tests {
     #[test]
     fn translations_are_applied_in_order_and_identical_ones_are_flagged_unchanged() {
         let mut blocks = vec![plain_block("New task"), plain_block("V5.9.3"), plain_block("git commit -m fix")];
-        apply_translations(&mut blocks, vec!["新建任务".into(), "  V5.9.3 ".into(), "git  commit -m fix".into()]);
+        apply_translations(&mut blocks, vec![Ok("新建任务".into()), Ok("  V5.9.3 ".into()), Ok("git  commit -m fix".into())]);
         assert_eq!(blocks[0].text, "新建任务");
         assert!(blocks[0].translated && !blocks[0].unchanged);
         assert_eq!(blocks[1].text, "V5.9.3", "两头的空白去掉");
@@ -2184,10 +2252,134 @@ mod tests {
     #[test]
     fn an_empty_translation_keeps_the_original_and_is_not_marked_translated() {
         let mut blocks = vec![plain_block("Library")];
-        apply_translations(&mut blocks, vec!["   ".into()]);
+        apply_translations(&mut blocks, vec![Ok("   ".into())]);
         assert_eq!(blocks[0].text, "Library");
         assert!(!blocks[0].translated, "没有译文就是没译，覆盖层要按「原文」画并带提示");
         assert!(!blocks[0].unchanged, "没译成不能当成「译文和原文一样」");
+    }
+
+    #[test]
+    fn a_block_that_failed_keeps_its_original_while_its_neighbours_are_translated() {
+        let mut blocks = vec![plain_block("Home"), plain_block("Docs"), plain_block("Blog")];
+        apply_translations(&mut blocks, vec![Ok("首页".into()), Err(protocol::Why::Missing), Ok("博客".into())]);
+        assert_eq!(blocks.iter().map(|block| block.text.as_str()).collect::<Vec<_>>(), ["首页", "Docs", "博客"]);
+        assert_eq!(blocks.iter().map(|block| block.translated).collect::<Vec<_>>(), [true, false, true]);
+        assert!(!blocks[1].unchanged, "没译成不能当成「译文和原文一样」：覆盖层会照原样盖住它");
+    }
+
+    fn outcome_of(translations: Vec<Result<String, protocol::Why>>) -> protocol::Outcome {
+        protocol::Outcome { translations, requests: 1, retries: 0 }
+    }
+
+    #[test]
+    fn a_partial_failure_tells_the_user_how_many_blocks_and_why() {
+        assert_eq!(failure_notice(&outcome_of(vec![Ok("a".into()), Ok("b".into())])), None);
+        let notice = failure_notice(&outcome_of(vec![Ok("a".into()), Err(protocol::Why::Missing), Err(protocol::Why::Missing)])).unwrap();
+        assert!(notice.starts_with("有 2 块没能译出："), "{notice}");
+        assert!(notice.contains("模型没有给出这几条的译文"), "{notice}");
+        assert!(notice.contains("仍是原文"), "{notice}");
+        // 原因是一句话时不重复句号
+        let notice = failure_notice(&outcome_of(vec![Ok("a".into()), Err(protocol::Why::Request("请求太频繁了。".into()))])).unwrap();
+        assert!(notice.contains("请求太频繁了。那几块") && !notice.contains("。。"), "{notice}");
+    }
+
+    #[test]
+    fn the_translation_step_hands_the_overlay_its_failure_and_its_notice_in_the_right_slots() {
+        // 全译成：什么都不加，位置提示（如果有）原样留着
+        assert_eq!(settle(Ok(None), None), (None, None));
+        assert_eq!(settle(Ok(None), Some("位置提示".into())), (None, Some("位置提示".into())));
+        // 一部分没译成：那句话要交给覆盖层，排在位置提示前面
+        assert_eq!(settle(Ok(Some("有 2 块没能译出。".into())), None), (None, Some("有 2 块没能译出。".into())));
+        assert_eq!(
+            settle(Ok(Some("有 2 块没能译出。".into())), Some("位置提示".into())),
+            (None, Some("有 2 块没能译出。位置提示".into()))
+        );
+        // 整次失败：原因进失败槽，位置提示照旧
+        assert_eq!(settle(Err("连不上".into()), Some("位置提示".into())), (Some("连不上".into()), Some("位置提示".into())));
+    }
+
+    #[test]
+    fn local_providers_go_one_chunk_at_a_time_and_the_direction_follows_the_source_and_target() {
+        use protocol::Direction::*;
+        let (cloud_en, cloud_zh) = (delivery(ToEnglish, true), delivery(ToChinese, true));
+        assert!(cloud_en.parallel && cloud_en.to_english == ToEnglish);
+        assert!(cloud_zh.parallel && cloud_zh.to_english == ToChinese);
+        let (local_en, local_zh) = (delivery(ToEnglish, false), delivery(ToChinese, false));
+        assert!(!local_en.parallel && local_en.to_english == ToEnglish);
+        assert!(!local_zh.parallel && local_zh.to_english == ToChinese);
+    }
+
+    #[test]
+    fn the_alignment_check_is_only_on_for_the_two_directions_whose_length_ratio_was_measured() {
+        use protocol::Direction::*;
+        let direction = |text: &str, pref: &str| capture_plan(&one_block(text), pref).map(|(_, direction)| direction);
+        let chinese = "这是一段中文，用来确认译成英文时的方向没有变。";
+        let english = "This is a plain English sentence that has to be translated into Chinese by default.";
+        // 默认方向：和以前一样开
+        assert_eq!(direction(chinese, lang::AUTO), Some(ToEnglish));
+        assert_eq!(direction(english, lang::AUTO), Some(ToChinese));
+        // 中英以外的目标、或中英以外的原文：长度比没量过，不检
+        assert_eq!(direction(chinese, "ja"), Some(Other));
+        assert_eq!(direction(chinese, "zh-Hant"), Some(Other));
+        assert_eq!(direction(english, "fr"), Some(Other));
+        assert_eq!(direction("Où est la gare, s'il vous plaît? Je voudrais acheter un billet pour demain.", "en"), Some(Other));
+        assert_eq!(direction("ありがとうございます、お願いします", lang::AUTO), Some(Other));
+        assert_eq!(direction("Привет, как дела? Спасибо большое", lang::AUTO), Some(Other));
+        assert_eq!(direction("12345 ——", lang::AUTO), None);
+    }
+
+    #[test]
+    fn a_reply_cut_off_by_the_token_limit_is_marked_truncated() {
+        assert!(reply_from("[".into(), Some("length")).truncated);
+        assert!(!reply_from("[]".into(), Some("stop")).truncated);
+        assert!(!reply_from("[]".into(), None).truncated);
+        assert_eq!(reply_from("文本".into(), None).text, "文本");
+    }
+
+    #[test]
+    fn only_a_screen_where_every_block_failed_is_a_total_failure() {
+        use protocol::Why;
+        assert!(!all_failed(&outcome_of(vec![])), "没有块就没东西可译");
+        assert!(!all_failed(&outcome_of(vec![Ok("a".into()), Err(Why::Missing)])));
+        assert!(all_failed(&outcome_of(vec![Err(Why::Missing), Err(Why::Empty)])));
+    }
+
+    #[test]
+    fn the_prompt_is_the_wording_that_was_evaluated_byte_for_byte() {
+        // 评测用的就是这两份原文；改措辞要连同 CHANGELOG 里的数据一起重新评测，再有意识地更新金标准文件
+        assert_eq!(capture_system_prompt("英文"), include_str!("../tests/fixtures/capture-prompt.to-en.txt"));
+        assert_eq!(capture_system_prompt("中文"), include_str!("../tests/fixtures/capture-prompt.to-zh.txt"));
+    }
+
+    /// tools/mock-provider.mjs 里 `MARKERS.capture` 的值：从那个文件里读，别在这里再写一遍字面量
+    /// （写了，mockProvider.test.ts 里「标记出现在 capture.rs 里」的检查就会被这个单测自己满足而失效）。
+    fn mock_capture_marker() -> String {
+        let mock = include_str!("../../tools/mock-provider.mjs");
+        let after = &mock[mock.find("capture: \"").expect("mock-provider.mjs 里有 MARKERS.capture") + "capture: \"".len()..];
+        after[..after.find('"').unwrap()].to_string()
+    }
+
+    #[test]
+    fn the_prompt_starts_with_the_marker_the_mock_provider_recognises() {
+        let marker = mock_capture_marker();
+        assert!(marker.chars().count() > 10, "标记读空了：{marker:?}");
+        for target in ["英文", "中文"] {
+            assert!(capture_system_prompt(target).starts_with(&marker), "{target}");
+        }
+    }
+
+    #[test]
+    fn the_prompt_asks_for_ids_and_does_not_pressure_the_model_to_hit_a_count_or_to_keep_everything() {
+        let prompt = capture_system_prompt("中文");
+        assert!(prompt.contains("\"i\":编号") && prompt.contains("编号照抄输入"));
+        // 老协议下试过的「必须恰好 N 条」「不要删减信息」会诱导模型凑条数 / 并回邻条，见 CHANGELOG；别加回来。
+        // 反过来「可以省略 / 概括」会让模型删正文（上一轮核对过现有措辞不删）：同样不要加
+        for banned in ["恰好", "不要删减", "译全", "共 ", "N 条", "删减", "省略", "概括"] {
+            assert!(!prompt.contains(banned), "提示词里不该有「{banned}」");
+        }
+        assert!(prompt.contains("翻译成中文") && capture_system_prompt("英文").contains("翻译成英文"));
+        // 第 5 条：半句话也用自己的编号单独译（PDF 两栏页上量出来的，见 CHANGELOG）；它说的是每个编号各译各的，不是凑条数
+        assert!(prompt.contains("5. 有的条目只是被折行或分栏拆开的半句话") && prompt.contains("不要并进相邻的条目"));
     }
 
     #[test]
@@ -2196,12 +2388,6 @@ mod tests {
         assert!(!same_text("Scheduled", "scheduled"), "大小写不同算不同");
         assert!(!same_text("© Scheduled", "已计划"));
         assert!(!same_text("a b", "ab"), "空格不能被吃掉");
-    }
-
-    #[test]
-    fn translation_array_survives_code_fence() {
-        let raw = "```json\n[\"甲\",\"乙\"]\n```";
-        assert_eq!(parse_translation_array(raw).unwrap(), vec!["甲", "乙"]);
     }
 
     #[test]
