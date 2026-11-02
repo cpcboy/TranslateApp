@@ -37,6 +37,27 @@
 - 全屏 App 下能否呼出依赖 `visibleOnAllWorkspaces`，需人工在全屏窗口中确认一次
 - D2 开工前需要决定：模型流式文本进入卡片后，CSP 是否还要再收紧（当前 `connect-src` 已限定）
 
+### 合并 · 2026-11-01 — 把「OCR 多语言」分支接到「多语言翻译」分支（已含 `main` `edfb682`）上
+
+**为什么**：`ocr-multilingual`（日 / 韩 / 阿拉伯 / 泰文截图读得出来）切出时 `main` 还是旧的截屏翻译协议，而本机 `/Applications/SENSE.app` 已经是带编号协议的版本，直接装会把它换回旧协议。负责人决定先接上多语言翻译分支（它已经把 `main` 并进来了，见 §3），再一起装。**本条只是合并，没有新功能。**
+
+**怎么合的**：`git merge refs/heads/claude/multilingual-translation-support-1a0803`（不 rebase，两边的提交哈希都保留：`6f27c62` / `d338a0d` 与 `a93c2d0` / `c4dc383` / `10eff0f` 都在）。五个文件有冲突：
+- `capture.rs`：`run_with_image` 用同一个入口 `choose_target`——先 `capture_plan`（目标语言 + 对齐粗检的方向），再 `set_target_direction`（把目标语言的书写方向记到每块上）；这样两步不会被拆开，测试也走同一个入口（评审 A、B 的 P1：之前正式流程里这一步没有测试守着，删掉它 385 个用例全绿）。并块时 `room_left` 的合并与 `block_of[index] = position` 两句都留；`translate_blocks` 取多语言分支带方向的版本。
+- `TranslateOverlay.tsx`：`data-anchor` 与 `data-untranslated` 都留。
+- `MAINTENANCE_RULES.md`、`sense/README.md`、夹具 README：两边的条目都留，§3 只追加。
+- `ocr.swift` 没有被合并碰过，第三遍的逻辑与 `6f27c62` 逐字一样；中、英文默认路径（前两遍、翻译方向、提示词）一个字没动。
+
+**影响面**：合并后中、英文页面的识别输出仍与只做前两遍时逐项一致（`real_ocr_chinese_and_english_screenshots_come_out_exactly_as_with_two_passes`，在并入后的 27 张夹具上仍过）；法 / 德等非中英页面的对齐粗检仍然不开（`protocol::Direction`）。
+
+**验证**：`cargo test --offline` 385 个全过（其中 21 个用真辅助程序：1 个自检 + 20 个真 Vision，都真的在跑，没有跳过）；`npm test` 452 个；`npm run typecheck`、`npm run build` 通过。真 debug 二进制 + 本地 mock 模型（带编号协议）：日文设置页 15 行 → 15 块，译文整页成功（15/15）；阿拉伯文页 15 行 → 15 块（15/15），译文贴着原文右边；英文 README 页 20 行 → 16 块（16/16，英文硬折行合并在起作用）。独立对抗评审两位：无 P0；P1 一条（上面的 `choose_target`，已修，并确认删掉 `set_target_direction` 现在会让 `every_block_records_whether_the_target_language_is_right_to_left` 失败）；P2：§3 里我那一行原文被改动了（已还原、哈希放进新行）、`merge_lines` 的说明不够准（已补）。
+
+**已知局限**（评审提出、没改）：
+- 一块里各行的 `rtl` 只取第一行的：一条被 Vision 拆成两段的视觉行、左半是英文右半是阿拉伯文时，整块按从左往右排（罕见）。
+- 从 `choose_target` 返回的 `direction` 交给 `translate_blocks` 这一步，没有测试守着（要真发请求才走得到；方向对对齐粗检的影响在 `protocol.rs` 的用例里钉过）。
+
+**未验证**：已安装版本里的真实框选与覆盖层点击；没有安装（装机要负责人另外点头，三个分支一起装一次）。
+**回滚**：`git revert -m 1 <本合并提交>`（回到合并前的 `ocr-multilingual`，即 `d338a0d`）；整个分支都不要时直接丢弃分支，没有 push、没有安装。
+
 ### 新增 · 2026-11-01 — 截屏翻译：日文、韩文、阿拉伯文、泰文的截图读得出来（OCR 补第三遍），阿拉伯文原文的译文顶着右边起笔
 
 **需求**：上一步「多语言翻译」（见下一条）让截屏翻译不再拒绝非中英文页，但 OCR（Swift 辅助程序，Vision）仍只读中英文——口径 8 留下的后续：让 OCR 读得出日、韩、俄、乌克兰、阿拉伯、希伯来、泰、越南、印地、希腊，以及法 / 德 / 西 / 葡 / 意 / 荷 / 波 / 土 / 印尼等拉丁语系的截图；
