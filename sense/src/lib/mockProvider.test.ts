@@ -45,9 +45,9 @@ beforeAll(async () => {
 
 afterAll(() => new Promise<void>((resolve) => server.close(() => resolve())));
 
-/** 按真实请求的形状发一次，把 SSE 增量拼成完整文本 */
-async function ask(system: string, user: string): Promise<string> {
-  const response = await fetch(`${base}/chat/completions`, {
+/** 按真实请求的形状发一次，把 SSE 增量拼成完整文本（`root` 默认是共用的那个 mock，换一个就问另一个） */
+async function ask(system: string, user: string, root = base): Promise<string> {
+  const response = await fetch(`${root}/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -111,6 +111,29 @@ describe("mock-provider 对每种请求都回对形状的数据", () => {
       expect(JSON.parse(text).map((item: { i: number }) => item.i)).toEqual([0, 2]);
     } finally {
       await new Promise<void>((resolve) => dropping.close(() => resolve()));
+    }
+  });
+
+  it("截屏翻译：UNCLOSED_LAST 的回复里最后一项只少一个 }、换行接 ]（整段不是合法 JSON），别的元素和译文照常", async () => {
+    const glitchy = createMock({ delay: 1, log: null, unclosedLast: true });
+    await new Promise<void>((resolve) => glitchy.listen(0, "127.0.0.1", resolve));
+    const address = glitchy.address();
+    const root = `http://127.0.0.1:${typeof address === "object" && address ? address.port : 0}/v1`;
+    try {
+      const system = `${MARKERS.capture}。input 是 JSON 数组`;
+      const text = await ask(system, JSON.stringify([{ i: 0, t: "a" }, { i: 1, t: "b" }, { i: 2, t: "c" }]), root);
+      expect(() => JSON.parse(text)).toThrow();
+      expect(text.endsWith('"\n]')).toBe(true);
+      expect(text.match(/\}/g)).toHaveLength(2);
+      // 补上那个 } 就是和不开这个开关时一模一样的回复
+      const repaired = JSON.parse(text.replace(/\n\]$/, "}]"));
+      expect(repaired).toEqual(JSON.parse(await ask(system, JSON.stringify([{ i: 0, t: "a" }, { i: 1, t: "b" }, { i: 2, t: "c" }]))));
+      expect(repaired.map((item: { i: number }) => item.i)).toEqual([0, 1, 2]);
+      // 没有元素就没有「最后一项」：照常回 []；别的请求类型不受影响
+      expect(await ask(system, "[]", root)).toBe("[]");
+      expect(JSON.parse(await ask(MARKERS.grammar, "Everything is fine here.", root))).toEqual([]);
+    } finally {
+      await new Promise<void>((resolve) => glitchy.close(() => resolve()));
     }
   });
 
