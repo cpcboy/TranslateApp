@@ -4,6 +4,32 @@
 
 ## [Unreleased]
 
+### 新增与修复 · 2026-11-13 — 混合语种截屏识别默认译中文 + 钉钉风格截屏后工具条
+
+**问题解决**
+
+1. **混合语种截屏翻译失效 / 目标语言倒转**：长混排截图（`> 10` 行，例如英文页夹中文标签或中英混排界面）此前容易被英文优先遍「解释」掉汉字遍；汉字与外文共存时可能错按纯中文默认译成「英文」、或手动选择中文仍被 `lang::resolve_target` 翻转成英文，且双语混排命中了纯中↔英长度比粗检导致误报。
+2. **截屏后缺少后处理工具条**：此前覆盖层无工具条，无法在截屏后切换目标语言重译、对比未翻译原图、使用钉钉风格标注或将未翻译原图与翻译后图片分别保存到本机磁盘。
+
+**改动**
+
+- **混合语种整屏识别与默认译中文（`sense/src-tauri/tools/ocr.swift`、`sense/src-tauri/src/lang.rs`、`sense/src-tauri/src/capture.rs`）**
+  - `ocr.swift` `pickRecognition` 增加对含 `conf >= 0.5` 且命中系统中文分词真词的混排选区保留中文优先遍（长选区同样生效），并保留对星级/方框图标误识的过滤与 `--selftest` 用例。
+  - `lang::script_counts` + `capture::has_mixed_languages` 识别中英/中外文混排；纯中文页偶含产品英文缩写/图标字母（如 `SENSE`、`macOS`、`AI`、`B 首页`）仍判单语中文、`auto` 维持译「英文」；真混排截屏在 `auto` 模式下默认译「中文（`zh`）」、采用 `Direction::Other` 跳过纯双语长度比误报，且手动选 `zh` 不被反向翻转；`capture_system_prompt_for` 在 `mixed=true` 时补充规则 6（结合截图上下文语义识别所有语种后统一译成目标语言，保留 `MARKERS.capture` 与非混排黄金提示词逐字节一致）。
+- **钉钉风格截屏悬浮工具条与原生导出（`sense/src/features/capture/CaptureToolbar.tsx`、`captureAnnotations.ts`、`captureExport.ts`、`TranslateOverlay.tsx`、`languages.ts`、`ipc.ts`、`capture.rs`、`lib.rs`、`ocr.swift`）**
+  - **覆盖层全周期稳态视口**：`compute_capture_window_frame` 从 `Ocr` 阶段起即按工具条与下游菜单所需宽高一次建窗并携带 `image_rect`，消除工具条弹出/重译导致的窗口二次缩放；冻结原图在 `CaptureState.snapshot.original_png` 缓存并通过 `capture_original_image` 在全周期保留挂载，切语言重译时不透出背后动态桌面。
+  - **目标语言切换**：工具条提供「自动识别（混合语种默认译中文）」及 22 种语言选择；调用 `retranslate_capture` 递增 `(translate_seq, revision)` 取消旧流式请求，前端按 `(generation, revision, stage)` 单调更新。
+  - **显示原文 / 显示结果**：一键在冻结原图与原位译文之间切换，保留标注可见性；导出按实际是否存在原图与已译块合成 Retina 分辨率 PNG。
+  - **钉钉风格图片编辑**：提供 `矩形`、`椭圆`、`箭头`、`画笔`、`文字`（支持 `Shift+Enter` 多行自增高输入框）、`撤销` / `Cmd+Z` 及 6 色 × 3 档线宽字号二级属性栏。
+  - **存为图片**：支持将未翻译原图（零重绘原生 PNG 直出）、带标注原图、翻译后图片分别通过 `save_capture_image` + `ocr.swift --save-png` 拉起 macOS 原生 `NSSavePanel` 保存至本机（弹窗期间 `OverlayTopGuard` 临时取消覆盖层置顶以防遮挡）。
+  - **显式退出**：点击画布或窗口失焦不再自动关闭覆盖层，需点击工具条「关闭」按钮或按 `Esc`（依次收起文字草稿 → 下拉弹层 → 退出整次截屏）。
+
+**验证与 QC 审查**
+
+- 软件产品 QC 角色独立对抗审查完成（`9c3d76b5`，判定：**`P0 = 0, P1 = 0`**），并顺手修复其 P2 建议（多行文字标注草稿输入自适应行数）。
+- `swiftc` 双架构编译（`arm64` + `x86_64`，`macos13.0`）+ `sense-ocr --selftest` 通过；`sense-ocr --capture`（`SENSE_OCR_TEST_CAPTURE_PNG=tests/fixtures/ocr-zh-en.png` + `SENSE_OCR_CAPTURE_OUT`）核实混排 `360×190` PNG 导出与中英 4 行识别；隔离 `HOME` + `mock-provider.mjs` + `SENSE_DEV_CAPTURE_PNG` 真应用端到端核实 `mixed=true`、`target=Some("zh")`、`POST` 日志 `task=capture target=中文`。
+- `npm run typecheck`、Vitest **31 文件 / 643 用例**、`cargo test --locked` **431 用例**、`npm run build` 与 `cargo build --locked` 全绿零警告。
+
 ### 修复 · 2026-11-13 — 截屏选区漂移、实时冻结屏、DeepSeek Flash 翻译延迟与 QC 二轮闭环
 
 **根因定位**
