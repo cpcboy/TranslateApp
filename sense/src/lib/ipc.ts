@@ -106,11 +106,19 @@ export type OverlayBlock = {
   words?: OverlayWord[];
 };
 
+export type CaptureStage = "ocr" | "translating" | "done";
+
 /**
  * 覆盖层的全部内容：翻译失败时 error 给出原因，blocks 里是识别出的原文；
  * notice 是翻译成功时要补充的一句话（比如译文没能对准原文的位置）。
  */
-export type CaptureView = { blocks: OverlayBlock[]; error: string | null; notice: string | null };
+export type CaptureView = {
+  blocks: OverlayBlock[];
+  error: string | null;
+  notice: string | null;
+  stage?: CaptureStage;
+  generation?: number;
+};
 
 export type LookupArgs = {
   word: string;
@@ -167,7 +175,7 @@ export const api = {
     invoke<HotkeyView>("set_hotkey", { kind, spec }),
   startCapture: () => invoke<void>("start_capture"),
   captureBlocks: () => invoke<CaptureView>("capture_blocks"),
-  closeOverlay: () => invoke<void>("close_overlay"),
+  closeOverlay: (generation?: number) => invoke<void>("close_overlay", { generation: generation ?? null }),
   translateText: (text: string, requestId: string) =>
     invoke<LongTextResult>("translate_text", {
       text,
@@ -220,4 +228,8 @@ export function onHotkeyChanged(handler: () => void): Promise<UnlistenFn> {
 
 export function onDelta(handler: (event: DeltaEvent) => void): Promise<UnlistenFn> {
   return listen<DeltaEvent>("sense://delta", (event) => handler(event.payload));
+}
+
+export function onCaptureUpdate(handler: (view: CaptureView) => void): Promise<UnlistenFn> {
+  return listen<CaptureView>("sense://capture-update", (event) => handler(event.payload));
 }

@@ -17,8 +17,14 @@ const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(8);
 /// 它不是整条流的时限，整条流的上限见 `stream_deadline`。
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// 等服务端开始响应（返回响应头）的时限，和以前客户端上的总时限一致。
+/// 本地模型等响应头的时限（Ollama 冷加载大模型可能超过一两分钟）。
 const HEADERS_TIMEOUT: Duration = Duration::from_secs(180);
+/// 云端请求第 1 次等响应头的时限：超过 8 秒多半撞上连接池里的半死 HTTP/2 链接，立刻换新连接重连。
+const CLOUD_FIRST_HEADERS_TIMEOUT: Duration = Duration::from_secs(8);
+/// 云端请求换新连接重试后等响应头的时限：放宽到 45 秒以兼容高峰拥堵或长文排队。
+const CLOUD_RETRY_HEADERS_TIMEOUT: Duration = Duration::from_secs(45);
+/// `NO_REASONING` 缓存条目有效期：避免某次异常 400 或网关临时波动让多日不关机的进程永久丢掉关思考参数。
+const NO_REASONING_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// 整条流式请求的时限。
 ///
@@ -46,6 +52,8 @@ pub struct ChatOutcome {
     pub finish_reason: Option<String>,
     /// 收到的 SSE 分片数。用来区分「服务端只发了这么多」和「我们解析丢了」。
     pub chunks: usize,
+    /// 收到的思考链（`reasoning_content` / `reasoning`）分片数。用来排查关思考参数是否生效，不记录任何正文。
+    pub reasoning_chunks: usize,
     /// 收到了 `[DONE]`。没有 finish_reason 也没有它，说明连接是提前关的。
     pub done: bool,
     /// 因为用户点了「停止」才结束。
@@ -160,6 +168,14 @@ pub async fn warmup(client: &reqwest::Client, provider: &Provider) {
 ///
 /// `on_delta` 收到的永远是「文本增量」，不是整包；解析失败的分片会被跳过
 /// 而不是中断整条流——模型偶尔会吐一个坏 JSON，没必要为此丢掉全部内容。
+fn header_policy(base_url: &str) -> (Duration, Duration, bool) {
+    if !crate::is_loopback(base_url) {
+        (CLOUD_FIRST_HEADERS_TIMEOUT, CLOUD_RETRY_HEADERS_TIMEOUT, true)
+    } else {
+        (HEADERS_TIMEOUT, HEADERS_TIMEOUT, false)
+    }
+}
+
 pub async fn stream_chat(
     client: &reqwest::Client,
     provider: &Provider,
@@ -167,6 +183,59 @@ pub async fn stream_chat(
     body: &Value,
     on_delta: &mut (dyn FnMut(&str) + Send),
     cancel: Option<CancelCheck<'_>>,
+) -> Result<ChatOutcome, ChatError> {
+    let (first_timeout, retry_timeout, retry_stale) = header_policy(&provider.base_url);
+    stream_chat_with_header_timeouts(
+        client,
+        provider,
+        api_key,
+        body,
+        on_delta,
+        cancel,
+        first_timeout,
+        retry_timeout,
+        retry_stale,
+    )
+    .await
+}
+
+async fn send_headers_once(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: Option<&str>,
+    body: &Value,
+    deadline: Duration,
+    headers_timeout: Duration,
+) -> Result<reqwest::Response, ChatError> {
+    let mut request = client.post(url).json(body).timeout(deadline);
+    if let Some(key) = api_key {
+        request = request.bearer_auth(key);
+    }
+    tokio::time::timeout(headers_timeout, request.send())
+        .await
+        .map_err(|_| {
+            ChatError::Timeout(format!("{} 秒内服务端没有开始响应", headers_timeout.as_secs()))
+        })?
+        .map_err(|err| {
+            if err.is_timeout() {
+                ChatError::Timeout("建立连接或等待服务端响应超时".to_string())
+            } else {
+                ChatError::Network(err.to_string())
+            }
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_chat_with_header_timeouts(
+    client: &reqwest::Client,
+    provider: &Provider,
+    api_key: Option<&str>,
+    body: &Value,
+    on_delta: &mut (dyn FnMut(&str) + Send),
+    cancel: Option<CancelCheck<'_>>,
+    first_headers_timeout: Duration,
+    retry_headers_timeout: Duration,
+    retry_stale_connection: bool,
 ) -> Result<ChatOutcome, ChatError> {
     let url = format!(
         "{}/chat/completions",
@@ -179,25 +248,40 @@ pub async fn stream_chat(
         .and_then(Value::as_u64)
         .unwrap_or(u64::from(MAX_TOKENS));
     let deadline = stream_deadline(max_tokens);
-    let mut request = client.post(&url).json(body).timeout(deadline);
-    if let Some(key) = api_key {
-        request = request.bearer_auth(key);
-    }
 
     let started = Instant::now();
-    // 等响应头单独限 180 秒：长文的整条时限放宽到十几分钟，不能让「服务端一直不响应」也等那么久
-    let response = tokio::time::timeout(HEADERS_TIMEOUT, request.send())
-        .await
-        .map_err(|_| {
-            ChatError::Timeout(format!("{} 秒内服务端没有开始响应", HEADERS_TIMEOUT.as_secs()))
-        })?
-        .map_err(|err| {
-            if err.is_timeout() {
-                ChatError::Timeout("建立连接或等待服务端响应超时".to_string())
-            } else {
-                ChatError::Network(err.to_string())
-            }
-        })?;
+    // 云端连接池如果拿到休眠前留下的半死 HTTP/2 socket，connect 不会报错、只会在等响应头时白等；
+    // 第 1 次短超时或断连（此时尚未收到任何响应头，完全幂等）立即换无池新连接重连一次。
+    let response = match send_headers_once(
+        client,
+        &url,
+        api_key,
+        body,
+        deadline,
+        first_headers_timeout,
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(first_err)
+            if retry_stale_connection
+                && !cancel.is_some_and(|stopped| stopped())
+                && matches!(first_err, ChatError::Timeout(_) | ChatError::Network(_)) =>
+        {
+            eprintln!("[sense] 等待响应头超时或连接失效，换新连接重试一次");
+            let fresh = crate::fresh_client_for(&provider.base_url);
+            send_headers_once(
+                fresh,
+                &url,
+                api_key,
+                body,
+                deadline,
+                retry_headers_timeout,
+            )
+            .await?
+        }
+        Err(err) => return Err(err),
+    };
 
     let status = response.status();
     if !status.is_success() {
@@ -211,6 +295,7 @@ pub async fn stream_chat(
     let mut first_delta_ms: Option<u128> = None;
     let mut finish_reason: Option<String> = None;
     let mut chunks = 0usize;
+    let mut reasoning_chunks = 0usize;
     let mut done = false;
     let mut cancelled = false;
 
@@ -268,6 +353,18 @@ pub async fn stream_chat(
 
             if let Some(message) = value.get("error").and_then(|item| item.get("message")) {
                 return Err(ChatError::Server(message.as_str().map(sanitize_detail).unwrap_or_default()));
+            }
+
+            if value
+                .pointer("/choices/0/delta/reasoning_content")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+                || value
+                    .pointer("/choices/0/delta/reasoning")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty())
+            {
+                reasoning_chunks += 1;
             }
 
             // 流式增量
@@ -339,14 +436,15 @@ pub async fn stream_chat(
         total_ms: started.elapsed().as_millis(),
         finish_reason,
         chunks,
+        reasoning_chunks,
         done,
         cancelled,
     })
 }
 
-/// 记住「这家网关不认关思考字段」的 (base_url, model)：之后直接不带，省掉每次一个 400 的往返。
-/// 只活在本次运行里——网关升级后重启应用就会重新试一次。
-static NO_REASONING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// 记住「这家网关不认关思考字段」的 `(base_url|model, 记录时间)`：之后直接不带，省掉每次一个 400 的往返。
+/// 带 TTL 过期与自愈清除，避免一次瞬时网关 400 把常驻数天的应用永久锁在开思考模式。
+static NO_REASONING: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
 
 fn reasoning_key(provider: &Provider) -> String {
     format!("{}|{}", provider.base_url, provider.model)
@@ -354,20 +452,49 @@ fn reasoning_key(provider: &Provider) -> String {
 
 fn reasoning_rejected_before(provider: &Provider) -> bool {
     let key = reasoning_key(provider);
-    NO_REASONING
+    let now = Instant::now();
+    let mut known = NO_REASONING
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .contains(&key)
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    known.retain(|(_, ts)| now.duration_since(*ts) < NO_REASONING_TTL);
+    known.iter().any(|(k, _)| k == &key)
 }
 
 fn remember_reasoning_rejected(provider: &Provider) {
     let key = reasoning_key(provider);
+    let now = Instant::now();
     let mut known = NO_REASONING
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !known.contains(&key) {
-        known.push(key);
+    known.retain(|(k, ts)| k != &key && now.duration_since(*ts) < NO_REASONING_TTL);
+    known.push((key, now));
+}
+
+/// 判断 400 错误体是否像「不认关思考字段」；瞬时 HTML 400 / 上下文限流之类偶发 400 不应永久记住。
+fn looks_like_reasoning_rejection(err: &ChatError, extra: &Value) -> bool {
+    let ChatError::BadRequest(detail) = err else {
+        return false;
+    };
+    let lower = detail.to_ascii_lowercase();
+    if let Some(fields) = extra.as_object() {
+        if fields.keys().any(|k| lower.contains(&k.to_ascii_lowercase())) {
+            return true;
+        }
     }
+    [
+        "unknown",
+        "unrecognized",
+        "extra",
+        "unsupported",
+        "unexpected",
+        "invalid",
+        "additional properties",
+        "not permitted",
+        "not allowed",
+        "unpermitted",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
 }
 
 /// 把 body 顶层里「关思考」的那几个键拿掉。
@@ -382,16 +509,6 @@ fn without_reasoning(body: &Value, reasoning: &Value) -> Value {
 }
 
 /// `stream_chat` + 「关思考」字段兜底，查词、长文、语法、划词、截屏都走这里。
-///
-/// 有的网关不认 `thinking` / `enable_thinking` / `reasoning` 之类的字段，会回 400。
-/// 这时去掉这些字段重发一次，而不是让用户看到 400。前提：
-/// - 只认真正的 HTTP 400。它在任何响应体之前到达，所以重发不会和已经推出去的增量叠成两份
-///   （流里的 error 事件是 `Server`，不会走到这里）；
-/// - 用户没在等待期间点「停止」；
-/// - 重发成功才记住「这家不认」。重发还是 400，说明问题不在这个字段上，下次照旧带上。
-///
-/// 已知不覆盖：回 422、或者在 200 的流里报「不认字段」的网关；以及与思考字段无关的 400
-/// （比如上下文太长）也会白白重发一次。
 pub async fn stream_chat_adaptive(
     client: &reqwest::Client,
     provider: &Provider,
@@ -419,14 +536,15 @@ pub async fn stream_chat_adaptive(
             total_ms: 0,
             finish_reason: None,
             chunks: 0,
+            reasoning_chunks: 0,
             done: false,
             cancelled: true,
         }),
         Err(err) if is_bad_request(&err) => {
-            eprintln!("[sense] provider 不认关思考字段，去掉后重试");
+            eprintln!("[sense] provider 返回 HTTP 400，去掉关思考字段重试一次");
             let plain = without_reasoning(body, extra);
             let retried = stream_chat(client, provider, api_key, &plain, on_delta, cancel).await;
-            if retried.is_ok() {
+            if retried.is_ok() && looks_like_reasoning_rejection(&err, extra) {
                 remember_reasoning_rejected(provider);
             }
             retried
@@ -811,5 +929,159 @@ mod tests {
             ChatError::Server(detail) => assert_eq!(detail, "HTTP 503", "5xx 不回传整页 HTML"),
             other => panic!("应为 Server，实际 {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn transient_gateway_400_retries_once_without_poisoning_no_reasoning() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定端口");
+        let port = listener.local_addr().expect("取端口").port();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        std::thread::spawn(move || {
+            for index in 0..3 {
+                let Ok((mut socket, _)) = listener.accept() else { return };
+                let request = read_request_text(&mut socket);
+                recorded.lock().unwrap().push(request);
+                if index == 0 {
+                    // 网关偶发 HTML 400（不含任何未知字段字样）
+                    let body = "<html><body>400 Bad Request</body></html>";
+                    let _ = socket.write_all(
+                        format!(
+                            "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    );
+                } else {
+                    let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+                    let _ = socket.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{payload}",
+                            payload.len()
+                        )
+                        .as_bytes(),
+                    );
+                }
+                let _ = socket.flush();
+            }
+        });
+        let base_url = format!("http://127.0.0.1:{port}/v1");
+
+        // 第一次请求虽靠重试成功，但错误体不是字段拒绝，不能毒化 NO_REASONING
+        let outcome = ask_adaptive(&base_url).await.expect("去掉字段重试当次仍应成功");
+        assert_eq!(outcome.text, "ok");
+        // 第二次请求应当照旧带回 thinking:disabled
+        ask_adaptive(&base_url).await.expect("第二次请求仍应成功");
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].contains("thinking"), "瞬时非字段 400 不能把 thinking 字段永久关掉");
+    }
+
+    #[tokio::test]
+    async fn stale_cloud_connection_switches_to_fresh_client_when_headers_stall() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定端口");
+        let port = listener.local_addr().expect("取端口").port();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted_ref = accepted.clone();
+        std::thread::spawn(move || {
+            // 第一个连接假装半死 socket：读完请求后迟迟不发响应头
+            if let Ok((mut dead, _)) = listener.accept() {
+                accepted_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                read_request(&mut dead);
+                std::thread::sleep(Duration::from_millis(450));
+            }
+            // 重试连接立刻正常回流
+            if let Ok((mut live, _)) = listener.accept() {
+                accepted_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                read_request(&mut live);
+                let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\ndata: [DONE]\n\n";
+                let _ = live.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{payload}",
+                        payload.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = live.flush();
+            }
+        });
+        let base_url = format!("http://127.0.0.1:{port}/v1");
+        let client = reqwest::Client::builder().no_proxy().build().expect("构建客户端");
+        let body = build_body("m", "sys", "user", 0.3, None, 100);
+        let outcome = stream_chat_with_header_timeouts(
+            &client,
+            &test_provider(&base_url),
+            Some("test-key"),
+            &body,
+            &mut |_| {},
+            None,
+            Duration::from_millis(80),
+            Duration::from_secs(2),
+            true,
+        )
+        .await
+        .expect("首条连接等待响应头超时后，应切新连接重试成功");
+        assert_eq!(outcome.text, "recovered");
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn header_policy_distinguishes_remote_gateways_from_loopback_regardless_of_api_key() {
+        assert_eq!(
+            header_policy("https://api.deepseek.com/v1"),
+            (CLOUD_FIRST_HEADERS_TIMEOUT, CLOUD_RETRY_HEADERS_TIMEOUT, true)
+        );
+        assert_eq!(
+            header_policy("http://127.0.0.1:11434/v1"),
+            (HEADERS_TIMEOUT, HEADERS_TIMEOUT, false)
+        );
+        assert_eq!(
+            header_policy("http://localhost:11434/v1"),
+            (HEADERS_TIMEOUT, HEADERS_TIMEOUT, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_chunks_are_counted_and_cache_does_not_oscillate() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定端口");
+        let port = listener.local_addr().expect("取端口").port();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut socket, _)) = listener.accept() else { return };
+                let _ = read_request_text(&mut socket);
+                let payload = concat!(
+                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think1\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think2\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                let _ = socket.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{payload}",
+                        payload.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = socket.flush();
+            }
+        });
+        let base_url = format!("http://127.0.0.1:{port}/v1");
+        let provider = test_provider(&base_url);
+        remember_reasoning_rejected(&provider);
+        assert!(reasoning_rejected_before(&provider));
+
+        let extra = thinking_off();
+        let client = reqwest::Client::builder().no_proxy().build().expect("构建客户端");
+        let body = build_body("m", "sys", "user", 0.3, Some(&extra), 100);
+        let outcome = stream_chat_adaptive(&client, &provider, None, &body, Some(&extra), &mut |_| {}, None)
+            .await
+            .expect("带 reasoning_content 的流应正常返回");
+        assert_eq!(outcome.reasoning_chunks, 2);
+        assert_eq!(outcome.text, "ok");
+        // 默认会吐思考链但又拒收 thinking 字段的中转站，在 TTL 内不应清缓存，否则下次会隔次再吃 400
+        assert!(reasoning_rejected_before(&provider));
     }
 }

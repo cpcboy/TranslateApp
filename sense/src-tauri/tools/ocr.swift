@@ -23,6 +23,7 @@
 
 import AppKit
 import Foundation
+import ImageIO
 import NaturalLanguage
 import Vision
 
@@ -1654,6 +1655,107 @@ func runSelfTest() -> Never {
     let waitStarted = Date()
     check(!finishesWithin(0.05) { Thread.sleep(forTimeInterval: 0.6) } && Date().timeIntervalSince(waitStarted) < 0.4, "期限：超过期限就放手，不等它跑完（用了 \(Date().timeIntervalSince(waitStarted)) 秒）")
 
+    // 坐标换算、选区裁剪与冻结视图朝向自检
+    check(
+        cocoaToTopLeftRect(CGRect(x: 0, y: 0, width: 1920, height: 1080), primaryHeight: 1080)
+            == CGRect(x: 0, y: 0, width: 1920, height: 1080),
+        "cocoaToTopLeftRect：主屏原样"
+    )
+    check(
+        cocoaToTopLeftRect(CGRect(x: 1920, y: 200, width: 2560, height: 1440), primaryHeight: 1080)
+            == CGRect(x: 1920, y: -560, width: 2560, height: 1440),
+        "cocoaToTopLeftRect：右侧高于主屏的副屏，top-left y 应为负"
+    )
+    check(
+        cocoaToTopLeftRect(CGRect(x: 0, y: -900, width: 1440, height: 900), primaryHeight: 1080)
+            == CGRect(x: 0, y: 1080, width: 1440, height: 900),
+        "cocoaToTopLeftRect：主屏正下方副屏"
+    )
+
+    let primaryScreen = CGRect(x: 0, y: 0, width: 1440, height: 900)
+    // 1x、2x 与缩放屏（如 1680×1050 逻辑配 3360×2100 / 2880×1800 物理像素）下，四个拖动方向与越界夹紧
+    let s1 = computeSelection(start: CGPoint(x: 100, y: 200), end: CGPoint(x: 400, y: 360), screenTopLeft: primaryScreen, imageWidth: 2880, imageHeight: 1800)
+    check(s1 != nil && s1!.x == 100 && s1!.y == 200 && s1!.w == 300 && s1!.h == 160 && s1!.scale == 2.0
+        && s1!.cropRect == CGRect(x: 200, y: 400, width: 600, height: 320),
+        "computeSelection：2x 正向拖动像素与逻辑完全对齐")
+    let s2 = computeSelection(start: CGPoint(x: 400, y: 360), end: CGPoint(x: 100, y: 200), screenTopLeft: primaryScreen, imageWidth: 2880, imageHeight: 1800)
+    check(s2 == s1, "computeSelection：右下往左上反向拖动结果一致")
+    let s3 = computeSelection(start: CGPoint(x: 100, y: 360), end: CGPoint(x: 400, y: 200), screenTopLeft: primaryScreen, imageWidth: 1440, imageHeight: 900)
+    check(s3 != nil && s3!.x == 100 && s3!.y == 200 && s3!.w == 300 && s3!.h == 160 && s3!.scale == 1.0
+        && s3!.cropRect == CGRect(x: 100, y: 200, width: 300, height: 160),
+        "computeSelection：左下往右上拖动 1x 对齐")
+    let sScaled = computeSelection(start: CGPoint(x: 100.3, y: 50.7), end: CGPoint(x: 320.6, y: 180.2), screenTopLeft: CGRect(x: 0, y: 0, width: 1680, height: 1050), imageWidth: 2880, imageHeight: 1800)
+    check(sScaled != nil && abs(sScaled!.w * sScaled!.scale - Double(sScaled!.cropRect.width)) < 1e-6
+        && abs(sScaled!.h * sScaled!.scale - Double(sScaled!.cropRect.height)) < 1e-6,
+        "computeSelection：非整数缩放（2880/1680）下 逻辑尺寸×scale 仍精确等于裁剪像素")
+    let sClamped = computeSelection(start: CGPoint(x: -40, y: -20), end: CGPoint(x: 1500, y: 950), screenTopLeft: CGRect(x: 100, y: -50, width: 1440, height: 900), imageWidth: 1440, imageHeight: 900)
+    check(sClamped != nil && sClamped!.x == 100 && sClamped!.y == -50 && sClamped!.w == 1440 && sClamped!.h == 900
+        && sClamped!.cropRect == CGRect(x: 0, y: 0, width: 1440, height: 900)
+        && sClamped!.bounds == [100, -50, 1540, 850],
+        "computeSelection：越界拖动夹回当前屏且保留全局偏移")
+    check(computeSelection(start: CGPoint(x: 200, y: 200), end: CGPoint(x: 205, y: 204), screenTopLeft: primaryScreen, imageWidth: 2880, imageHeight: 1800) == nil,
+        "computeSelection：单击 / 小于 12pt 必须拒绝")
+    check(computeSelection(start: CGPoint(x: 200, y: 200), end: CGPoint(x: 300, y: 211), screenTopLeft: primaryScreen, imageWidth: 2880, imageHeight: 1800) == nil,
+        "computeSelection：单边小于 12pt 的细条必须拒绝")
+
+    // CGImage.cropping(to:) 与翻转视图绘制方向自检：上红 (255,0,0) 下蓝 (0,0,255)
+    if let space = CGColorSpace(name: CGColorSpace.sRGB),
+       let ctx = CGContext(
+        data: nil, width: 40, height: 40, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+        bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+       ) {
+        // CGContext 原点在左下：y 20..40 是上半（红），y 0..20 是下半（蓝）
+        ctx.setFillColor(red: 1, green: 0, blue: 0, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 20, width: 40, height: 20))
+        ctx.setFillColor(red: 0, green: 0, blue: 1, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: 40, height: 20))
+        if let testCG = ctx.makeImage(),
+           let topHalf = testCG.cropping(to: CGRect(x: 0, y: 0, width: 40, height: 20)),
+           let bottomHalf = testCG.cropping(to: CGRect(x: 0, y: 20, width: 40, height: 20)),
+           let topRaster = Raster(cgImage: topHalf),
+           let bottomRaster = Raster(cgImage: bottomHalf) {
+            let (tr, _, tb) = topRaster.rgb(20, 10)
+            let (br, _, bb) = bottomRaster.rgb(20, 10)
+            check(tr > 200 && tb < 50 && br < 50 && bb > 200,
+                  "CGImage.cropping(to:)：顶上裁剪应为红、底下裁剪应为蓝，实际 top=(\(tr),\(tb)) bottom=(\(br),\(bb))")
+        } else {
+            check(false, "无法构造 CGImage 裁剪方向自检图")
+        }
+        // 直接实例化真实 FrozenSelectionView 并通过 AppKit cacheDisplay 渲染，确认屏幕显示朝向正确（顶部红、底部蓝）
+        if let space2 = CGColorSpace(name: CGColorSpace.sRGB),
+           let ctx2 = CGContext(
+            data: nil, width: 200, height: 200, bitsPerComponent: 8, bytesPerRow: 0, space: space2,
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+           ) {
+            ctx2.setFillColor(red: 1, green: 0, blue: 0, alpha: 1)
+            ctx2.fill(CGRect(x: 0, y: 100, width: 200, height: 100))
+            ctx2.setFillColor(red: 0, green: 0, blue: 1, alpha: 1)
+            ctx2.fill(CGRect(x: 0, y: 0, width: 200, height: 100))
+            if let testCG = ctx2.makeImage() {
+                let coord = CaptureCoordinator(environment: [:])
+                let view = FrozenSelectionView(
+                    frame: NSRect(x: 0, y: 0, width: 200, height: 200),
+                    cgImage: testCG,
+                    screenTopLeft: CGRect(x: 0, y: 0, width: 200, height: 200),
+                    coordinator: coord
+                )
+                if let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+                    view.cacheDisplay(in: view.bounds, to: rep)
+                    if let renderedCG = rep.cgImage, let renderedRaster = Raster(cgImage: renderedCG) {
+                        let (topR, _, topB) = renderedRaster.rgb(5, 5)
+                        let (botR, _, botB) = renderedRaster.rgb(5, renderedRaster.height - 6)
+                        check(topR > 150 && topB < 20 && botR < 20 && botB > 150,
+                              "FrozenSelectionView 实际绘制朝向：顶部必须偏红、底部必须偏蓝，实际 top=(\(topR),\(topB)) bottom=(\(botR),\(botB))")
+                    } else {
+                        check(false, "FrozenSelectionView 无法读回位图")
+                    }
+                } else {
+                    check(false, "FrozenSelectionView 无法创建缓存位图")
+                }
+            }
+        }
+    }
+
     if failures.isEmpty {
         print("selftest ok")
         exit(0)
@@ -1662,209 +1764,786 @@ func runSelfTest() -> Never {
     exit(1)
 }
 
+// MARK: - 坐标换算与冻结屏幕框选
+
+/// 把 AppKit 全局坐标（原点在主屏左下，y 朝上）转成顶左坐标（原点在主屏左上，y 朝下，与 Tauri / CG 一致）。
+func cocoaToTopLeftRect(_ cocoaRect: CGRect, primaryHeight: CGFloat) -> CGRect {
+    CGRect(
+        x: cocoaRect.origin.x,
+        y: primaryHeight - (cocoaRect.origin.y + cocoaRect.size.height),
+        width: cocoaRect.size.width,
+        height: cocoaRect.size.height
+    )
+}
+
+struct CaptureSelection: Equatable {
+    let x: Double
+    let y: Double
+    let w: Double
+    let h: Double
+    let scale: Double
+    let bounds: [Double]
+    let cropRect: CGRect
+}
+
+/// 由局部拖框起终点、当前屏顶左范围、冻结帧物理像素宽高算出精确对齐的裁剪矩形与覆盖层逻辑落点。
+func computeSelection(
+    start: CGPoint,
+    end: CGPoint,
+    screenTopLeft: CGRect,
+    imageWidth: Int,
+    imageHeight: Int,
+    minPoints: CGFloat = 12.0
+) -> CaptureSelection? {
+    guard screenTopLeft.width > 0, screenTopLeft.height > 0, imageWidth > 0, imageHeight > 0 else {
+        return nil
+    }
+    let maxW = screenTopLeft.width
+    let maxH = screenTopLeft.height
+    let sx = min(max(start.x, 0), maxW)
+    let sy = min(max(start.y, 0), maxH)
+    let ex = min(max(end.x, 0), maxW)
+    let ey = min(max(end.y, 0), maxH)
+    let left = min(sx, ex)
+    let top = min(sy, ey)
+    let width = abs(ex - sx)
+    let height = abs(ey - sy)
+    guard width >= minPoints, height >= minPoints else { return nil }
+
+    let scaleX = CGFloat(imageWidth) / maxW
+    let scaleY = CGFloat(imageHeight) / maxH
+    let pxLeft = max(0, min(imageWidth, Int((left * scaleX).rounded(.down))))
+    let pxTop = max(0, min(imageHeight, Int((top * scaleY).rounded(.down))))
+    let pxRight = max(pxLeft + 1, min(imageWidth, Int(((left + width) * scaleX).rounded(.up))))
+    let pxBottom = max(pxTop + 1, min(imageHeight, Int(((top + height) * scaleY).rounded(.up))))
+    let cropRect = CGRect(x: pxLeft, y: pxTop, width: pxRight - pxLeft, height: pxBottom - pxTop)
+
+    return CaptureSelection(
+        x: Double(screenTopLeft.minX + CGFloat(pxLeft) / scaleX),
+        y: Double(screenTopLeft.minY + CGFloat(pxTop) / scaleY),
+        w: Double(CGFloat(pxRight - pxLeft) / scaleX),
+        h: Double(CGFloat(pxBottom - pxTop) / scaleY),
+        scale: Double(scaleX),
+        bounds: [Double(screenTopLeft.minX), Double(screenTopLeft.minY), Double(screenTopLeft.maxX), Double(screenTopLeft.maxY)],
+        cropRect: cropRect
+    )
+}
+
+// MARK: - OCR 识别（内存 CGImage 并发多遍）
+
+private final class ConcurrentOcrState: @unchecked Sendable {
+    var chineseReq: VNRecognizeTextRequest?
+    var chineseErr: Error?
+    var englishReq: VNRecognizeTextRequest?
+    var englishErr: Error?
+    var raster: Raster?
+    var autoReq: VNRecognizeTextRequest?
+    var autoPerformed = false
+}
+
+func makeTextRequest(languages: [String], automatic: Bool = false) -> VNRecognizeTextRequest {
+    let request = VNRecognizeTextRequest()
+    request.recognitionLevel = .accurate
+    request.usesLanguageCorrection = true
+    request.recognitionLanguages = languages
+    request.automaticallyDetectsLanguage = automatic
+    return request
+}
+
+struct OcrFailure: Error {
+    let message: String
+}
+
+func recognizeImage(_ cg: CGImage, startedAt: Date, environment: [String: String]) -> Result<[[String: Any]], OcrFailure> {
+    let width = CGFloat(cg.width)
+    let height = CGFloat(cg.height)
+    let megapixels = Double(width * height) / 1_000_000
+    let thirdPassAllowed = environment["SENSE_OCR_PASSES"] != "2"
+    let thirdPassBudgetOverride = environment["SENSE_OCR_THIRD_PASS_BUDGET_MS"].flatMap(Double.init).map { $0 / 1000 }
+    // ≤0.25MP 小选区原规则本来就一律触发第三遍；无超时覆写时直接并发预跑，省掉一次串行等待
+    let canPreflightAutomatic = thirdPassAllowed && megapixels <= tinyImageMaxMegapixels && thirdPassBudgetOverride == nil
+
+    let state = ConcurrentOcrState()
+    let firstPassStarted = Date()
+    DispatchQueue.concurrentPerform(iterations: canPreflightAutomatic ? 4 : 3) { idx in
+        let localHandler = VNImageRequestHandler(cgImage: cg, options: [:])
+        switch idx {
+        case 0:
+            let req = makeTextRequest(languages: ["zh-Hans", "en-US"])
+            do {
+                try localHandler.perform([req])
+                state.chineseReq = req
+            } catch {
+                state.chineseErr = error
+                state.chineseReq = req
+            }
+        case 1:
+            let req = makeTextRequest(languages: ["en-US", "zh-Hans"])
+            do {
+                try localHandler.perform([req])
+                state.englishReq = req
+            } catch {
+                state.englishErr = error
+                state.englishReq = req
+            }
+        case 2:
+            state.raster = Raster(cgImage: cg)
+        case 3:
+            let req = makeTextRequest(languages: ["en-US", "zh-Hans"], automatic: true)
+            state.autoPerformed = (try? localHandler.perform([req])) != nil
+            state.autoReq = req
+        default:
+            break
+        }
+    }
+    let firstPassSeconds = Date().timeIntervalSince(firstPassStarted)
+
+    guard let chineseFirst = state.chineseReq, let englishFirst = state.englishReq else {
+        return .failure(OcrFailure(message: "OCR 失败: 内部识别任务未完成"))
+    }
+    let performError = state.chineseErr ?? state.englishErr
+    let raster = state.raster
+
+    func usableLines(_ request: VNRecognizeTextRequest) -> [(VNRecognizedTextObservation, VNRecognizedText)]? {
+        request.results?.compactMap { observation in
+            guard let candidate = observation.topCandidates(1).first, candidate.confidence >= 0.3 else { return nil }
+            return (observation, candidate)
+        }
+    }
+
+    typealias RecognizedLine = (VNRecognizedTextObservation, VNRecognizedText)
+    func passLine(_ item: RecognizedLine) -> PassLine {
+        PassLine(text: item.1.string, box: item.0.boundingBox, confidence: item.1.confidence)
+    }
+
+    let chineseLines = usableLines(chineseFirst)
+    let englishLines = usableLines(englishFirst)
+    guard var chosen = chooseRecognition(chineseFirst: chineseLines, englishFirst: englishLines, line: passLine) else {
+        return .failure(OcrFailure(message: "OCR 失败: \(performError.map { "\($0)" } ?? "没有识别结果")"))
+    }
+
+    let chineseForTrigger = chineseLines.map { $0.map(passLine) }
+    let englishForTrigger = englishLines.map { $0.map(passLine) }
+    let chosenForTrigger = chosen.map(passLine)
+    let chineseEverything: [PassLine] = (chineseFirst.results ?? []).compactMap { observation in
+        observation.topCandidates(1).first.map { PassLine(text: $0.string, box: observation.boundingBox, confidence: $0.confidence) }
+    }
+
+    var detectedRectCount = -1
+    func detectTextRects() -> [CGRect] {
+        let detectHandler = VNImageRequestHandler(cgImage: cg, options: [:])
+        let detector = VNDetectTextRectanglesRequest()
+        let rects = (try? detectHandler.perform([detector])) != nil ? (detector.results ?? []).map { $0.boundingBox } : []
+        detectedRectCount = rects.count
+        return rects
+    }
+
+    final class AutomaticPassOutcome: @unchecked Sendable {
+        var performed = false
+    }
+
+    var usedAutomatic = false
+    var automaticTimedOut = false
+    let triedAutomatic = thirdPassAllowed && canAffordAutomaticPass(firstPassSeconds: firstPassSeconds)
+        && shouldTryAutomaticLanguage(
+            chineseFirst: chineseForTrigger, englishFirst: englishForTrigger,
+            chosen: chosenForTrigger, chosenIsChinese: chineseForTrigger == chosenForTrigger,
+            megapixels: megapixels, textRects: detectTextRects
+        )
+    if triedAutomatic {
+        if canPreflightAutomatic, let automatic = state.autoReq {
+            if state.autoPerformed,
+               let lines = usableLines(automatic),
+               hasForeignText(lines.map(passLine), imageHeight: Double(height), tiny: megapixels <= tinyImageMaxMegapixels, chineseFirst: chineseEverything, englishFirst: englishForTrigger ?? []) {
+                chosen = lines
+                usedAutomatic = true
+            }
+        } else {
+            let automatic = makeTextRequest(languages: ["en-US", "zh-Hans"], automatic: true)
+            let outcome = AutomaticPassOutcome()
+            let budget = thirdPassBudgetOverride ?? max(0, automaticPassDeadlineSeconds - Date().timeIntervalSince(startedAt))
+            if finishesWithin(budget, {
+                let autoHandler = VNImageRequestHandler(cgImage: cg, options: [:])
+                outcome.performed = (try? autoHandler.perform([automatic])) != nil
+            }) {
+                if outcome.performed,
+                   let lines = usableLines(automatic),
+                   hasForeignText(lines.map(passLine), imageHeight: Double(height), tiny: megapixels <= tinyImageMaxMegapixels, chineseFirst: chineseEverything, englishFirst: englishForTrigger ?? []) {
+                    chosen = lines
+                    usedAutomatic = true
+                }
+            } else {
+                automaticTimedOut = true
+            }
+        }
+    }
+    if environment["SENSE_OCR_TRACE"] != nil {
+        FileHandle.standardError.write("trace: rects=\(detectedRectCount) triedAutomatic=\(triedAutomatic) usedAutomatic=\(usedAutomatic) timedOut=\(automaticTimedOut)\n".data(using: .utf8)!)
+    }
+
+    var out: [[String: Any]] = []
+    for (observation, candidate) in chosen {
+        let box = observation.boundingBox
+        let x = Double(box.origin.x * width)
+        let y = Double((1 - box.origin.y - box.size.height) * height)
+        let w = Double(box.size.width * width)
+        let h = Double(box.size.height * height)
+        guard [x, y, w, h, Double(candidate.confidence)].allSatisfy({ $0.isFinite }) else { continue }
+        var line: [String: Any] = [
+            "text": candidate.string,
+            "x": x,
+            "y": y,
+            "w": w,
+            "h": h,
+            "conf": Double(candidate.confidence),
+        ]
+
+        var words: [[String: Any]] = []
+        let text = candidate.string
+        var cursor = text.startIndex
+        while cursor < text.endIndex {
+            var end = cursor
+            while end < text.endIndex && !text[end].isWhitespace { end = text.index(after: end) }
+            if end > cursor, let wordBox = try? candidate.boundingBox(for: cursor..<end) {
+                let rect = wordBox.boundingBox
+                let wordX = Double(rect.origin.x * width)
+                let wordW = Double(rect.size.width * width)
+                guard wordX.isFinite, wordW.isFinite else { cursor = end < text.endIndex ? text.index(after: end) : end; continue }
+                words.append([
+                    "t": String(text[cursor..<end]),
+                    "x": wordX,
+                    "w": wordW,
+                ])
+            }
+            cursor = end < text.endIndex ? text.index(after: end) : end
+        }
+        if !words.isEmpty { line["words"] = words }
+
+        func pixel(_ value: Double) -> Int { Int(max(-1e7, min(1e7, value))) }
+        if let raster = raster,
+           let style = analyzeLine(raster, box: PixelRect(
+               x: pixel(x.rounded(.down)), y: pixel(y.rounded(.down)),
+               w: pixel(w.rounded(.up)), h: pixel(h.rounded(.up))
+           )) {
+            line["bg"] = [style.bg.0, style.bg.1, style.bg.2]
+            if let fg = style.fg { line["fg"] = [fg.0, fg.1, fg.2] }
+            if let ink = style.ink {
+                line["ink"] = ["x": ink.x, "y": ink.y, "w": ink.w, "h": ink.h]
+                line["room"] = style.room
+                line["room_left"] = style.roomLeft
+            }
+            if let cover = style.cover { line["cover"] = ["x": cover.x, "y": cover.y, "w": cover.w, "h": cover.h] }
+        }
+        out.append(line)
+    }
+    return .success(out)
+}
+
+func emitJsonLine(_ obj: Any) {
+    guard let data = try? JSONSerialization.data(withJSONObject: obj, options: []) else { return }
+    FileHandle.standardOutput.write(data)
+    FileHandle.standardOutput.write(Data([0x0A]))
+    fflush(stdout)
+}
+
+func loadCGImage(fromFile path: String) -> CGImage? {
+    let url = URL(fileURLWithPath: path)
+    guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+        return nil
+    }
+    return CGImageSourceCreateImageAtIndex(src, 0, nil)
+}
+
+/// 冻结单个显示器当前屏幕画面（先用 CGDisplayCreateImage 直取，取不到时退回 screencapture -x -R）。
+func snapshotDisplay(_ screen: NSScreen, topLeftRect: CGRect) -> CGImage? {
+    if let num = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber {
+        let displayID = CGDirectDisplayID(num.uint32Value)
+        if let cg = CGDisplayCreateImage(displayID) {
+            return cg
+        }
+    }
+    let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("sense-freeze-\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString).png")
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+    let rx = Int(topLeftRect.origin.x.rounded())
+    let ry = Int(topLeftRect.origin.y.rounded())
+    let rw = max(1, Int(topLeftRect.size.width.rounded()))
+    let rh = max(1, Int(topLeftRect.size.height.rounded()))
+    proc.arguments = ["-x", "-R", "\(rx),\(ry),\(rw),\(rh)", tmp.path]
+    proc.standardOutput = FileHandle.nullDevice
+    proc.standardError = FileHandle.nullDevice
+    guard (try? proc.run()) != nil else { return nil }
+    proc.waitUntilExit()
+    guard proc.terminationStatus == 0 else { return nil }
+    return loadCGImage(fromFile: tmp.path)
+}
+
+func prewarmVisionInBackground() {
+    DispatchQueue.global(qos: .userInitiated).async {
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(
+                data: nil, width: 16, height: 16, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+              ) else { return }
+        ctx.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: 16, height: 16))
+        guard let tiny = ctx.makeImage() else { return }
+        let req = makeTextRequest(languages: ["en-US", "zh-Hans"])
+        let h = VNImageRequestHandler(cgImage: tiny, options: [:])
+        _ = try? h.perform([req])
+    }
+}
+
+final class SelectionWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+}
+
+final class FrozenSelectionView: NSView {
+    private var frozenImage: NSImage?
+    private var cgImage: CGImage?
+    private let screenTopLeft: CGRect
+    private weak var coordinator: CaptureCoordinator?
+    private var dragStart: CGPoint?
+    private var dragCurrent: CGPoint?
+    private var isDragging = false
+
+    override var isFlipped: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override var acceptsFirstResponder: Bool { true }
+
+    init(frame: NSRect, cgImage: CGImage, screenTopLeft: CGRect, coordinator: CaptureCoordinator) {
+        self.cgImage = cgImage
+        self.frozenImage = NSImage(cgImage: cgImage, size: frame.size)
+        self.screenTopLeft = screenTopLeft
+        self.coordinator = coordinator
+        super.init(frame: frame)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    func releaseImage() {
+        frozenImage = nil
+        cgImage = nil
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .crosshair)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let img = frozenImage else { return }
+        img.draw(in: bounds, from: .zero, operation: .copy, fraction: 1.0, respectFlipped: true, hints: nil)
+
+        if let s = dragStart, let e = dragCurrent {
+            let x = min(s.x, e.x)
+            let y = min(s.y, e.y)
+            let w = abs(e.x - s.x)
+            let h = abs(e.y - s.y)
+            let sel = CGRect(x: x, y: y, width: w, height: h).intersection(bounds)
+
+            // 选区外四块暗色遮罩，选区内部保持冻结原图 100% 原亮度
+            NSColor(white: 0, alpha: 0.36).setFill()
+            if !sel.isNull && !sel.isEmpty {
+                NSRect(x: 0, y: 0, width: bounds.width, height: sel.minY).fill()
+                NSRect(x: 0, y: sel.maxY, width: bounds.width, height: bounds.height - sel.maxY).fill()
+                NSRect(x: 0, y: sel.minY, width: sel.minX, height: sel.height).fill()
+                NSRect(x: sel.maxX, y: sel.minY, width: bounds.width - sel.maxX, height: sel.height).fill()
+
+                NSColor(white: 0, alpha: 0.55).setStroke()
+                let outer = NSBezierPath(rect: sel.insetBy(dx: -0.5, dy: -0.5))
+                outer.lineWidth = 1
+                outer.stroke()
+
+                NSColor.white.withAlphaComponent(0.95).setStroke()
+                let inner = NSBezierPath(rect: sel.insetBy(dx: 0.5, dy: 0.5))
+                inner.lineWidth = 1
+                inner.stroke()
+
+                if sel.width >= 12 && sel.height >= 12 {
+                    drawPill("\(Int(sel.width.rounded())) × \(Int(sel.height.rounded()))", near: sel)
+                }
+            } else {
+                NSColor(white: 0, alpha: 0.22).setFill()
+                bounds.fill()
+            }
+        } else {
+            NSColor(white: 0, alpha: 0.22).setFill()
+            bounds.fill()
+            drawBanner("拖动框选翻译 · Esc 取消")
+        }
+    }
+
+    private func drawPill(_ text: String, near sel: CGRect) {
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: NSColor.white,
+        ]
+        let size = (text as NSString).size(withAttributes: attrs)
+        let padX: CGFloat = 8
+        let padY: CGFloat = 3
+        let pillW = size.width + padX * 2
+        let pillH = size.height + padY * 2
+        let y = sel.minY >= pillH + 6 ? sel.minY - pillH - 4 : min(bounds.height - pillH - 4, sel.maxY + 4)
+        let x = min(max(4, sel.minX), max(4, bounds.width - pillW - 4))
+        let pill = CGRect(x: x, y: y, width: pillW, height: pillH)
+        NSColor(white: 0.08, alpha: 0.88).setFill()
+        NSBezierPath(roundedRect: pill, xRadius: 5, yRadius: 5).fill()
+        (text as NSString).draw(at: CGPoint(x: pill.minX + padX, y: pill.minY + padY), withAttributes: attrs)
+    }
+
+    private func drawBanner(_ text: String) {
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 12.5, weight: .medium),
+            .foregroundColor: NSColor(white: 0.96, alpha: 1),
+        ]
+        let size = (text as NSString).size(withAttributes: attrs)
+        let padX: CGFloat = 14
+        let padY: CGFloat = 6
+        let pillW = size.width + padX * 2
+        let pillH = size.height + padY * 2
+        let pill = CGRect(x: (bounds.width - pillW) / 2, y: 20, width: pillW, height: pillH)
+        NSColor(white: 0.08, alpha: 0.86).setFill()
+        NSBezierPath(roundedRect: pill, xRadius: pillH / 2, yRadius: pillH / 2).fill()
+        (text as NSString).draw(at: CGPoint(x: pill.minX + padX, y: pill.minY + padY), withAttributes: attrs)
+    }
+
+    private func clampedLocalPoint(_ event: NSEvent) -> CGPoint {
+        let raw = convert(event.locationInWindow, from: nil)
+        return CGPoint(x: min(max(raw.x, 0), bounds.width), y: min(max(raw.y, 0), bounds.height))
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let pt = clampedLocalPoint(event)
+        dragStart = pt
+        dragCurrent = pt
+        isDragging = true
+        NSCursor.crosshair.set()
+        needsDisplay = true
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard isDragging else { return }
+        dragCurrent = clampedLocalPoint(event)
+        needsDisplay = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard isDragging, let start = dragStart else { return }
+        let end = clampedLocalPoint(event)
+        isDragging = false
+        guard let cg = cgImage,
+              let sel = computeSelection(
+                  start: start,
+                  end: end,
+                  screenTopLeft: screenTopLeft,
+                  imageWidth: cg.width,
+                  imageHeight: cg.height
+              ) else {
+            // 误触单击 / 极小拖框：留在冻结屏幕重选，不截成大框
+            dragStart = nil
+            dragCurrent = nil
+            needsDisplay = true
+            return
+        }
+        coordinator?.complete(selection: sel, screenImage: cg)
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        coordinator?.cancel()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        // 吞掉空格（49）及其它键：禁止切到系统窗口模式、不发响铃
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let isPeriod = event.charactersIgnoringModifiers == "." && flags.contains(.command)
+        let isW = event.charactersIgnoringModifiers == "w" && flags.contains(.command)
+        let isC = event.charactersIgnoringModifiers == "c" && flags.contains(.control)
+        if event.keyCode == 53 || isPeriod || isW || isC {
+            coordinator?.cancel()
+        }
+    }
+}
+
+final class CaptureCoordinator {
+    private var windows: [SelectionWindow] = []
+    private var views: [FrozenSelectionView] = []
+    private var eventMonitor: Any?
+    private var resignObserver: NSObjectProtocol?
+    private var parentWatchdog: Timer?
+    private var idleWatchdog: Timer?
+    private var finished = false
+    private let initialParentPid = getppid()
+    private let environment: [String: String]
+
+    init(environment: [String: String]) {
+        self.environment = environment
+    }
+
+    func start() -> Never {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+
+        let screens = NSScreen.screens
+        let primaryHeight = screens.first(where: { $0.frame.origin == .zero })?.frame.height ?? screens.first?.frame.height ?? 0
+        var captures: [(screen: NSScreen, topLeft: CGRect, cg: CGImage)] = []
+        for screen in screens {
+            let topLeft = cocoaToTopLeftRect(screen.frame, primaryHeight: primaryHeight)
+            if let cg = snapshotDisplay(screen, topLeftRect: topLeft) {
+                captures.append((screen, topLeft, cg))
+            }
+        }
+        guard !captures.isEmpty else {
+            FileHandle.standardError.write("截不到屏幕画面（请检查屏幕录制权限）\n".data(using: .utf8)!)
+            exit(2)
+        }
+
+        // 后台预热 Vision，把冷启动藏进用户拖框时间里
+        prewarmVisionInBackground()
+
+        let mouseGlobal = NSEvent.mouseLocation
+        var keyWindow: SelectionWindow?
+
+        for item in captures {
+            let win = SelectionWindow(
+                contentRect: item.screen.frame,
+                styleMask: [.borderless],
+                backing: .buffered,
+                defer: false
+            )
+            win.isOpaque = true
+            win.hasShadow = false
+            win.isReleasedWhenClosed = false
+            win.backgroundColor = .black
+            win.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
+            win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+            win.acceptsMouseMovedEvents = true
+            win.setFrame(item.screen.frame, display: true)
+
+            let view = FrozenSelectionView(
+                frame: CGRect(origin: .zero, size: item.screen.frame.size),
+                cgImage: item.cg,
+                screenTopLeft: item.topLeft,
+                coordinator: self
+            )
+            win.contentView = view
+            win.orderFrontRegardless()
+            if item.screen.frame.contains(mouseGlobal) || keyWindow == nil {
+                keyWindow = win
+            }
+            windows.append(win)
+            views.append(view)
+        }
+
+        app.activate(ignoringOtherApps: true)
+        if let kw = keyWindow {
+            kw.makeKeyAndOrderFront(nil)
+            if let content = kw.contentView {
+                kw.makeFirstResponder(content)
+            }
+        }
+        NSCursor.crosshair.set()
+
+        let launchedAt = Date()
+        resignObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification,
+            object: app,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self = self, !self.finished else { return }
+            // 前 300ms 让 WindowServer 完成上一窗口失活与焦点交接；之后（如 Cmd+Tab/Spotlight）失活即刻退出冻屏
+            if Date().timeIntervalSince(launchedAt) >= 0.3 {
+                self.cancel()
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self = self, !self.finished else { return }
+            if !app.isActive {
+                app.activate(ignoringOtherApps: true)
+            }
+        }
+
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .rightMouseDown]) { [weak self] event in
+            guard let self = self else { return nil }
+            if event.type == .rightMouseDown {
+                self.cancel()
+                return nil
+            }
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            let isPeriod = event.charactersIgnoringModifiers == "." && flags.contains(.command)
+            let isW = event.charactersIgnoringModifiers == "w" && flags.contains(.command)
+            let isC = event.charactersIgnoringModifiers == "c" && flags.contains(.control)
+            if event.keyCode == 53 || isPeriod || isW || isC {
+                self.cancel()
+                return nil
+            }
+            // 吞掉空格（49）及多余按键，不让系统发出提示音
+            return nil
+        }
+
+        parentWatchdog = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            if getppid() == 1 || getppid() != self.initialParentPid {
+                self.cancel()
+            }
+        }
+        idleWatchdog = Timer.scheduledTimer(withTimeInterval: 115.0, repeats: false) { [weak self] _ in
+            self?.cancel()
+        }
+
+        app.run()
+        exit(0)
+    }
+
+    private func teardownWindows() {
+        parentWatchdog?.invalidate()
+        parentWatchdog = nil
+        idleWatchdog?.invalidate()
+        idleWatchdog = nil
+        if let observer = resignObserver {
+            NotificationCenter.default.removeObserver(observer)
+            resignObserver = nil
+        }
+        if let monitor = eventMonitor {
+            NSEvent.removeMonitor(monitor)
+            eventMonitor = nil
+        }
+        for view in views {
+            view.releaseImage()
+        }
+        views.removeAll()
+        for win in windows {
+            win.orderOut(nil)
+            win.close()
+        }
+        windows.removeAll()
+        NSCursor.arrow.set()
+        NSApplication.shared.deactivate()
+    }
+
+    func cancel() {
+        guard !finished else { return }
+        finished = true
+        teardownWindows()
+        emitJsonLine(["event": "cancelled"])
+        exit(0)
+    }
+
+    func complete(selection: CaptureSelection, screenImage: CGImage) {
+        guard !finished else { return }
+        guard let cropped = screenImage.cropping(to: selection.cropRect) else {
+            FileHandle.standardError.write("选区裁剪失败\n".data(using: .utf8)!)
+            finished = true
+            teardownWindows()
+            exit(2)
+        }
+        finished = true
+        teardownWindows()
+        // 第 1 行立刻写出选区坐标与真实缩放：Rust 随即释放热键锁并提前打开覆盖层
+        emitJsonLine([
+            "event": "selected",
+            "x": selection.x,
+            "y": selection.y,
+            "w": selection.w,
+            "h": selection.h,
+            "scale": selection.scale,
+            "bounds": selection.bounds,
+        ])
+        let ocrStarted = Date()
+        let env = self.environment
+        // 回到 runloop 立即把 orderOut 刷新给 WindowServer，同时在后台并发跑 Vision 识别，
+        // 结果与 exit 切回主线程收尾，避免与 app.run() 并发退出
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = recognizeImage(cropped, startedAt: ocrStarted, environment: env)
+            DispatchQueue.main.async {
+                switch result {
+                case .success(let lines):
+                    emitJsonLine(["event": "ocr", "lines": lines])
+                    exit(0)
+                case .failure(let err):
+                    FileHandle.standardError.write("\(err.message)\n".data(using: .utf8)!)
+                    exit(3)
+                }
+            }
+        }
+    }
+}
+
+func runCaptureMode(environment: [String: String]) -> Never {
+    // 仅供 cargo test 免交互端到端验证两阶段协议与裁剪精度
+    if let testPng = environment["SENSE_OCR_TEST_CAPTURE_PNG"], !testPng.isEmpty {
+        if environment["SENSE_OCR_TEST_CAPTURE_CANCEL"] == "1" {
+            emitJsonLine(["event": "cancelled"])
+            exit(0)
+        }
+        guard let cg = loadCGImage(fromFile: testPng) else {
+            FileHandle.standardError.write("读不到测试截图\n".data(using: .utf8)!)
+            exit(2)
+        }
+        let scale = environment["SENSE_OCR_TEST_CAPTURE_SCALE"].flatMap(Double.init).flatMap { $0 > 0 ? $0 : nil } ?? 1.0
+        let screenW = CGFloat(cg.width) / CGFloat(scale)
+        let screenH = CGFloat(cg.height) / CGFloat(scale)
+        let screenTopLeft = CGRect(x: 0, y: 0, width: screenW, height: screenH)
+        let parts = (environment["SENSE_OCR_TEST_CAPTURE_RECT"] ?? "").split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+        let (rx, ry, rw, rh): (CGFloat, CGFloat, CGFloat, CGFloat) = parts.count == 4
+            ? (CGFloat(parts[0]), CGFloat(parts[1]), CGFloat(parts[2]), CGFloat(parts[3]))
+            : (0, 0, screenW, screenH)
+        guard let sel = computeSelection(
+            start: CGPoint(x: rx, y: ry),
+            end: CGPoint(x: rx + rw, y: ry + rh),
+            screenTopLeft: screenTopLeft,
+            imageWidth: cg.width,
+            imageHeight: cg.height
+        ), let cropped = cg.cropping(to: sel.cropRect) else {
+            emitJsonLine(["event": "cancelled"])
+            exit(0)
+        }
+        emitJsonLine([
+            "event": "selected",
+            "x": sel.x,
+            "y": sel.y,
+            "w": sel.w,
+            "h": sel.h,
+            "scale": sel.scale,
+            "bounds": sel.bounds,
+        ])
+        switch recognizeImage(cropped, startedAt: Date(), environment: environment) {
+        case .success(let lines):
+            emitJsonLine(["event": "ocr", "lines": lines])
+            exit(0)
+        case .failure(let err):
+            FileHandle.standardError.write("\(err.message)\n".data(using: .utf8)!)
+            exit(3)
+        }
+    }
+
+    let coordinator = CaptureCoordinator(environment: environment)
+    coordinator.start()
+}
+
 // MARK: - 入口
 
 let args = CommandLine.arguments
 if args.count >= 2 && args[1] == "--selftest" { runSelfTest() }
+if args.count >= 2 && args[1] == "--capture" { runCaptureMode(environment: ProcessInfo.processInfo.environment) }
 
 /// 辅助程序启动的时刻：第三遍的期限从这里算起（Rust 那边的 60 秒也是从启动算起）
 let processStarted = Date()
 
 guard args.count >= 2,
-      let image = NSImage(contentsOfFile: args[1]),
-      let tiff = image.tiffRepresentation,
-      let rep = NSBitmapImageRep(data: tiff),
-      let cg = rep.cgImage
+      let cg = loadCGImage(fromFile: args[1])
 else {
     FileHandle.standardError.write("读不到图片\n".data(using: .utf8)!)
     exit(2)
 }
 
-let width = CGFloat(cg.width)
-let height = CGFloat(cg.height)
-
-// 前两遍：Vision 以 recognitionLanguages 的第一个语言为主，只放一种顺序总有一头不行（见 `pickRecognition`）。
-// 关掉自动语言检测，省一点时间；两种语言都明确给了。
-func makeRequest(languages: [String]) -> VNRecognizeTextRequest {
-    let request = VNRecognizeTextRequest()
-    request.recognitionLevel = .accurate
-    request.usesLanguageCorrection = true
-    request.recognitionLanguages = languages
-    request.automaticallyDetectsLanguage = false
-    return request
-}
-
-let englishFirst = makeRequest(languages: ["en-US", "zh-Hans"])
-let chineseFirst = makeRequest(languages: ["zh-Hans", "en-US"])
-
-/// 第三遍：自动识别语言，只在前两遍没把字读明白时才跑（见 `shouldTryAutomaticLanguage`）。
-/// 日文假名、韩文、阿拉伯文、泰文只有它读得出来。
-/// 语言纠错保持打开：关掉它，日、韩、阿拉伯、泰文的字符错误率不变（调参用的页面与留出的测试页上都一样），这一遍的耗时少四成以上。
-/// 但 Vision 给的置信度整体低了一档（泰文置信度 1.0 的行从 88% 降到 11%），`hasForeignText` 要求的 0.5 就会把少数真外文页挡在门外
-/// （留出的泰文页 60 张里 3–4 张）。要提速，得连同采信的门槛一起重新调、重新量，这次没动。
-func makeAutomaticRequest() -> VNRecognizeTextRequest {
-    let request = makeRequest(languages: ["en-US", "zh-Hans"])
-    request.automaticallyDetectsLanguage = true
-    return request
-}
-
-let handler = VNImageRequestHandler(cgImage: cg, options: [:])
-var performError: Error?
-let firstPassStarted = Date()
-do {
-    // 两个请求放在同一次 perform 里；分成两次 perform 并不更快。代价是识别时间变长：典型的小图（360×190 到 1100×780）
-    // 约 1.3–2.3 倍（0.35–0.8 秒 → 0.5–1.8 秒）；CPU 时间英文页约 2 倍，中文大图 3–4 倍（旧程序根本读不出那些字，
-    // 5120×2880 的密集中文页约 3 秒 → 10–12 秒）
-    try handler.perform([chineseFirst, englishFirst])
-} catch {
-    // 一个请求失败时 perform 会抛出，但另一个请求的结果已经有了，见 chooseRecognition
-    performError = error
-}
-
-let firstPassSeconds = Date().timeIntervalSince(firstPassStarted)
-
-// 像素分析读不出来（极端的图片格式）就不给 bg / fg / ink / room，使用方退回旧做法
-let raster = Raster(cgImage: cg)
-
-/// 置信度太低的多数是图标、边线、噪点，留给页面反而更乱。没跑出结果的那一遍（results 是 nil）返回 nil
-func usableLines(_ request: VNRecognizeTextRequest) -> [(VNRecognizedTextObservation, VNRecognizedText)]? {
-    request.results?.compactMap { observation in
-        guard let candidate = observation.topCandidates(1).first, candidate.confidence >= 0.3 else { return nil }
-        return (observation, candidate)
-    }
-}
-
-typealias RecognizedLine = (VNRecognizedTextObservation, VNRecognizedText)
-func passLine(_ item: RecognizedLine) -> PassLine {
-    PassLine(text: item.1.string, box: item.0.boundingBox, confidence: item.1.confidence)
-}
-
-let chineseLines = usableLines(chineseFirst)
-let englishLines = usableLines(englishFirst)
-guard var chosen = chooseRecognition(chineseFirst: chineseLines, englishFirst: englishLines, line: passLine) else {
-    FileHandle.standardError.write("OCR 失败: \(performError.map { "\($0)" } ?? "没有识别结果")\n".data(using: .utf8)!)
+switch recognizeImage(cg, startedAt: processStarted, environment: ProcessInfo.processInfo.environment) {
+case .success(let out):
+    let data = try JSONSerialization.data(withJSONObject: out, options: [])
+    FileHandle.standardOutput.write(data)
+case .failure(let err):
+    FileHandle.standardError.write("\(err.message)\n".data(using: .utf8)!)
     exit(3)
 }
-
-// 补第三遍：前两遍没把图里的字读明白，而且补的这遍读出了真的日文 / 韩文 / 阿拉伯文 / 泰文，才改用它；
-// 否则 `chosen` 原样不动，输出与补这一遍之前完全一样。
-let chineseForTrigger = chineseLines.map { $0.map(passLine) }
-let englishForTrigger = englishLines.map { $0.map(passLine) }
-let chosenForTrigger = chosen.map(passLine)
-/// 中文优先那遍读出的全部行（不论置信度）：`isExplainedByChinese` 要看它在同一位置读出了哪些汉字，读歪的汉字置信度常常很低
-let chineseEverything: [PassLine] = (chineseFirst.results ?? []).compactMap { observation in
-    observation.topCandidates(1).first.map { PassLine(text: $0.string, box: observation.boundingBox, confidence: $0.confidence) }
-}
-let megapixels = Double(width * height) / 1_000_000
-
-/// 文字区域检测器：独立一次 perform，不碰前两遍。只在触发条件需要它时才跑（见 `shouldTryAutomaticLanguage`）
-var detectedRectCount = -1
-func detectTextRects() -> [CGRect] {
-    let detector = VNDetectTextRectanglesRequest()
-    let rects = (try? handler.perform([detector])) != nil ? (detector.results ?? []).map { $0.boundingBox } : []
-    detectedRectCount = rects.count
-    return rects
-}
-
-let environment = ProcessInfo.processInfo.environment
-// 仅供测试：SENSE_OCR_PASSES=2 只做前两遍、不补第三遍——用来核对「中文、英文截图补了第三遍也不改输出」
-let thirdPassAllowed = environment["SENSE_OCR_PASSES"] != "2"
-// 仅供测试：SENSE_OCR_THIRD_PASS_BUDGET_MS 把第三遍的期限改成这么多毫秒——用来走「超时放弃」那条路
-let thirdPassBudgetOverride = environment["SENSE_OCR_THIRD_PASS_BUDGET_MS"].flatMap(Double.init).map { $0 / 1000 }
-
-/// 第三遍在后台线程里跑，结果交回来：线程写、等到信号之后主线程读
-final class AutomaticPassOutcome: @unchecked Sendable {
-    var performed = false
-}
-
-var usedAutomatic = false
-var automaticTimedOut = false
-let triedAutomatic = thirdPassAllowed && canAffordAutomaticPass(firstPassSeconds: firstPassSeconds)
-    && shouldTryAutomaticLanguage(
-        chineseFirst: chineseForTrigger, englishFirst: englishForTrigger,
-        chosen: chosenForTrigger, chosenIsChinese: chineseForTrigger == chosenForTrigger,
-        megapixels: megapixels, textRects: detectTextRects
-    )
-if triedAutomatic {
-    let automatic = makeAutomaticRequest()
-    let outcome = AutomaticPassOutcome()
-    // 剩下的时间在这里才量：前面的检测器也要花时间
-    let budget = thirdPassBudgetOverride ?? max(0, automaticPassDeadlineSeconds - Date().timeIntervalSince(processStarted))
-    if finishesWithin(budget, { outcome.performed = (try? handler.perform([automatic])) != nil }) {
-        if outcome.performed,
-           let lines = usableLines(automatic),
-           hasForeignText(lines.map(passLine), imageHeight: Double(height), tiny: megapixels <= tinyImageMaxMegapixels, chineseFirst: chineseEverything, englishFirst: englishForTrigger ?? []) {
-            chosen = lines
-            usedAutomatic = true
-        }
-    } else {
-        automaticTimedOut = true
-    }
-}
-if environment["SENSE_OCR_TRACE"] != nil {
-    FileHandle.standardError.write("trace: rects=\(detectedRectCount) triedAutomatic=\(triedAutomatic) usedAutomatic=\(usedAutomatic) timedOut=\(automaticTimedOut)\n".data(using: .utf8)!)
-}
-
-var out: [[String: Any]] = []
-for (observation, candidate) in chosen {
-    let box = observation.boundingBox
-    let x = Double(box.origin.x * width)
-    let y = Double((1 - box.origin.y - box.size.height) * height)
-    let w = Double(box.size.width * width)
-    let h = Double(box.size.height * height)
-    // 非有限数（NaN / ∞）写进 JSON 会让 JSONSerialization 抛 NSException——那是 Objective-C 异常，Swift 的 catch 接不住，
-    // 整个辅助程序直接崩，截屏翻译就彻底不可用。Vision 实际不会给，但这一行零成本，宁可丢掉这一行
-    guard [x, y, w, h, Double(candidate.confidence)].allSatisfy({ $0.isFinite }) else { continue }
-    var line: [String: Any] = [
-        "text": candidate.string,
-        "x": x,
-        "y": y,
-        "w": w,
-        "h": h,
-        "conf": Double(candidate.confidence),
-    ]
-
-    // 逐词框：按空白切词，各取 Vision 给的子串框。译文字号靠它反推，
-    // 行首的图标（被读成 ©、•、C 之类的单个字符）自己成一个词，不会混进文字的宽度里
-    var words: [[String: Any]] = []
-    let text = candidate.string
-    var cursor = text.startIndex
-    while cursor < text.endIndex {
-        var end = cursor
-        while end < text.endIndex && !text[end].isWhitespace { end = text.index(after: end) }
-        if end > cursor, let wordBox = try? candidate.boundingBox(for: cursor..<end) {
-            let rect = wordBox.boundingBox
-            let wordX = Double(rect.origin.x * width)
-            let wordW = Double(rect.size.width * width)
-            guard wordX.isFinite, wordW.isFinite else { cursor = end < text.endIndex ? text.index(after: end) : end; continue }
-            words.append([
-                "t": String(text[cursor..<end]),
-                "x": wordX,
-                "w": wordW,
-            ])
-        }
-        cursor = end < text.endIndex ? text.index(after: end) : end
-    }
-    if !words.isEmpty { line["words"] = words }
-
-    // Int(Double) 遇到超出范围的值会直接崩溃：先夹进一个宽松的范围（超出图片的部分 analyzeLine 自己会裁掉）
-    func pixel(_ value: Double) -> Int { Int(max(-1e7, min(1e7, value))) }
-    if let raster = raster,
-       let style = analyzeLine(raster, box: PixelRect(
-           x: pixel(x.rounded(.down)), y: pixel(y.rounded(.down)),
-           w: pixel(w.rounded(.up)), h: pixel(h.rounded(.up))
-       )) {
-        line["bg"] = [style.bg.0, style.bg.1, style.bg.2]
-        if let fg = style.fg { line["fg"] = [fg.0, fg.1, fg.2] }
-        if let ink = style.ink {
-            line["ink"] = ["x": ink.x, "y": ink.y, "w": ink.w, "h": ink.h]
-            line["room"] = style.room
-            line["room_left"] = style.roomLeft
-        }
-        if let cover = style.cover { line["cover"] = ["x": cover.x, "y": cover.y, "w": cover.w, "h": cover.h] }
-    }
-    out.append(line)
-}
-
-let data = try JSONSerialization.data(withJSONObject: out, options: [])
-FileHandle.standardOutput.write(data)

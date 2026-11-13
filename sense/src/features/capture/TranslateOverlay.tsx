@@ -1,7 +1,9 @@
-import { Component, useEffect, useMemo, useState, type ReactNode } from "react";
+import { Component, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { api, type OverlayBlock } from "../../lib/ipc";
+import { api, onCaptureUpdate, type CaptureStage, type CaptureView, type OverlayBlock } from "../../lib/ipc";
 import { OVERLAY_FONT, createCanvasMeasure, plainPlan, planOverlay, sanitizeBlocks, type BlockPlan } from "./overlayLayout";
+
+const STAGE_ORDER: Record<CaptureStage, number> = { ocr: 0, translating: 1, done: 2 };
 
 /**
  * 译文覆盖层：窗口正好压在选区上，按 OCR 的位置逐块画出来。
@@ -9,7 +11,7 @@ import { OVERLAY_FONT, createCanvasMeasure, plainPlan, planOverlay, sanitizeBloc
  * 用原文底下的底色盖住原文，译文写在原来的位置、用原文的字号和颜色——这就是「原位替换」。
  * 怎么排（字号怎么定、底色字色怎么取、放不下怎么办）都在 overlayLayout.ts。
  *
- * 结构分两层：外层 `TranslateOverlay` 只管「取数据 + Esc / 点击 / 失焦关闭」，自己几乎不算东西；
+ * 结构分两层：外层 `TranslateOverlay` 只管「取数据 + 订阅流式进度 + Esc / 点击 / 失焦关闭」，自己几乎不算东西；
  * 里面的 `OverlayView`（排版、画层、提示条）包在错误边界里。渲染一旦抛出来，整棵树卸载，
  * 关闭用的处理器跟着没了，屏幕上就留下一个关不掉、看不见的透明置顶窗。
  * 所以画的部分出了错，最多退成一条带着译文的错误提示——关闭的处理器必须还在。
@@ -20,49 +22,106 @@ export function TranslateOverlay() {
   const [error, setError] = useState<string | null>(null);
   // 翻译成功了，但有话要说（比如没能确定选区位置，译文不一定对准原文）
   const [notice, setNotice] = useState<string | null>(null);
+  const [stage, setStage] = useState<CaptureStage>("done");
   const [hint, setHint] = useState(true);
 
+  const generationRef = useRef<number | undefined>(undefined);
+  const stageRef = useRef<CaptureStage>("ocr");
+  const initializedRef = useRef(false);
+  const graceUntilRef = useRef<number>(Date.now() + 400);
+  const sawPushEventRef = useRef(false);
+
   useEffect(() => {
+    let disposed = false;
+
+    const applyView = (view: CaptureView, fromPush: boolean) => {
+      if (disposed) return;
+      if (fromPush) sawPushEventRef.current = true;
+      const incomingGen = typeof view?.generation === "number" ? view.generation : undefined;
+      const incomingStage: CaptureStage = view?.stage ?? "done";
+
+      if (initializedRef.current && incomingGen !== undefined && generationRef.current !== undefined) {
+        if (incomingGen < generationRef.current) return;
+        if (incomingGen === generationRef.current) {
+          if (STAGE_ORDER[incomingStage] < STAGE_ORDER[stageRef.current]) return;
+          if (!fromPush && sawPushEventRef.current && STAGE_ORDER[incomingStage] <= STAGE_ORDER[stageRef.current]) {
+            return;
+          }
+        }
+      }
+
+      const stageChanged = !initializedRef.current || incomingStage !== stageRef.current;
+      initializedRef.current = true;
+      if (incomingGen !== undefined) generationRef.current = incomingGen;
+      if (stageChanged) {
+        stageRef.current = incomingStage;
+        graceUntilRef.current = Date.now() + 400;
+      }
+
+      // IPC 边界上先清洗：后面就不用处处防 null。数据格式不对（不是数组）是错误，不能当成「没识别到文字」；
+      // 只是丢了几条不合格的，当提示说一声
+      const { blocks: clean, problem } = sanitizeBlocks(view?.blocks);
+      const malformed = !Array.isArray(view?.blocks);
+      setStage(incomingStage);
+      setBlocks(clean);
+      setError(view?.error ?? (malformed ? problem : null));
+      setNotice([view?.notice, malformed ? null : problem].filter(Boolean).join("；") || null);
+    };
+
+    let unlistenUpdate: (() => void) | undefined;
+    void onCaptureUpdate((view) => applyView(view, true)).then((fn) => {
+      if (disposed) {
+        fn();
+        return;
+      }
+      unlistenUpdate = fn;
+    });
+
     void api
       .captureBlocks()
-      .then((view) => {
-        // IPC 边界上先清洗：后面就不用处处防 null。数据格式不对（不是数组）是错误，不能当成「没识别到文字」；
-        // 只是丢了几条不合格的，当提示说一声
-        const { blocks: clean, problem } = sanitizeBlocks(view?.blocks);
-        const malformed = !Array.isArray(view?.blocks);
-        setBlocks(clean);
-        setError(view?.error ?? (malformed ? problem : null));
-        setNotice([view?.notice, malformed ? null : problem].filter(Boolean).join("；") || null);
-      })
+      .then((view) => applyView(view, false))
       .catch((err) => {
+        if (disposed) return;
+        initializedRef.current = true;
+        stageRef.current = "done";
+        setStage("done");
         setBlocks([]);
         setError(String(err).replace(/^Error:\s*/, ""));
       });
 
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") void api.closeOverlay();
+      if (event.key === "Escape") void api.closeOverlay(generationRef.current);
     };
     window.addEventListener("keydown", onKey);
     const timer = window.setTimeout(() => setHint(false), 2200);
 
-    // 点到别的窗口就收起来：否则这层一直浮在最上面，Esc 又发不到它
-    const mountedAt = Date.now();
-    let unlisten: (() => void) | undefined;
+    // 点到别的窗口就收起来：否则这层一直浮在最上面，Esc 又发不到它；
+    // OCR 阶段以及阶段切换后的短暂重算/调窗宽限期内忽略失焦
+    let unlistenFocus: (() => void) | undefined;
     void getCurrentWindow()
       .onFocusChanged(({ payload }) => {
-        if (!payload && Date.now() - mountedAt > 200) void api.closeOverlay();
+        if (disposed || payload) return;
+        if (stageRef.current === "ocr") return;
+        if (Date.now() < graceUntilRef.current) return;
+        void api.closeOverlay(generationRef.current);
       })
       .then((fn) => {
-        unlisten = fn;
+        if (disposed) {
+          fn();
+          return;
+        }
+        unlistenFocus = fn;
       })
       .catch(() => {
         /* 拿不到焦点事件就退回只靠 Esc */
       });
 
     return () => {
+      disposed = true;
       window.removeEventListener("keydown", onKey);
       window.clearTimeout(timer);
-      unlisten?.();
+      unlistenUpdate?.();
+      unlistenFocus?.();
     };
   }, []);
 
@@ -70,25 +129,27 @@ export function TranslateOverlay() {
     <div
       className="relative h-full w-full overflow-hidden"
       style={{ fontFamily: OVERLAY_FONT }}
-      onClick={() => void api.closeOverlay()}
+      onClick={() => void api.closeOverlay(generationRef.current)}
     >
       <OverlayBoundary blocks={blocks}>
-        <OverlayView blocks={blocks} error={error} notice={notice} hint={hint} />
+        <OverlayView blocks={blocks} error={error} notice={notice} stage={stage} hint={hint} />
       </OverlayBoundary>
     </div>
   );
 }
 
 /** 排版、画层和各种提示条：全部数据相关的计算都在这里，出错由外面的错误边界接住。 */
-function OverlayView({
+export function OverlayView({
   blocks,
   error,
   notice,
+  stage,
   hint,
 }: {
   blocks: OverlayBlock[] | null;
   error: string | null;
   notice: string | null;
+  stage: CaptureStage;
   hint: boolean;
 }) {
   // 窗口正好压在选区上，innerWidth / innerHeight 就是选区的逻辑尺寸
@@ -103,11 +164,21 @@ function OverlayView({
       return blocks.map((block) => plainPlan(block, bounds));
     }
   }, [blocks]);
-  const nothingToReplace = isNothingToReplace(blocks);
+  const nothingToReplace = stage === "done" && isNothingToReplace(blocks);
+  const statusText = stage === "ocr" ? "识别中… · Esc 取消" : stage === "translating" && !error ? "翻译中… · Esc 取消" : null;
 
   return (
     <>
-      {blocks && <OverlayLayers blocks={blocks} plans={plans} />}
+      {blocks && <OverlayLayers blocks={blocks} plans={plans} pending={stage === "translating"} />}
+
+      {statusText && (
+        <div
+          role="status"
+          className="pointer-events-none absolute left-2 top-2 z-10 rounded-full bg-[rgba(14,14,18,0.9)] px-3 py-1 text-[12px] text-[#f6f3ed]"
+        >
+          {statusText}
+        </div>
+      )}
 
       {nothingToReplace && !error && (
         <div
@@ -118,7 +189,7 @@ function OverlayView({
         </div>
       )}
 
-      {blocks !== null && blocks.length === 0 && !error && (
+      {stage === "done" && blocks !== null && blocks.length === 0 && !error && (
         <div className="absolute left-2 top-2 rounded bg-[rgba(14,14,18,0.95)] px-3 py-2 text-[13px] text-[#f6f3ed]">
           没识别到文字
         </div>
@@ -143,7 +214,7 @@ function OverlayView({
         </div>
       )}
 
-      {hint && !error && !notice && !nothingToReplace && blocks !== null && blocks.length > 0 && (
+      {hint && stage === "done" && !error && !notice && !nothingToReplace && blocks !== null && blocks.length > 0 && (
         <div className="pointer-events-none absolute right-2 top-2 rounded-full bg-[rgba(14,14,18,0.9)] px-3 py-1 text-[12px] text-[#b0aaa1]">
           Esc 关闭
         </div>
@@ -220,20 +291,32 @@ export function isNothingToReplace(blocks: OverlayBlock[] | null): boolean {
  * 一部分译成、一部分没译成（模型漏了几条）时，没译成的块画的是原文：压暗之外再加一道虚线下划线，
  * 用户一眼看得出是哪几块，不会把夹在译文里的原文当成译文。全都没译成时（失败提示已经说明）不加，整屏的虚线只是噪声。
  */
-export function OverlayLayers({ blocks, plans }: { blocks: OverlayBlock[]; plans: BlockPlan[] }) {
+export function OverlayLayers({
+  blocks,
+  plans,
+  pending = false,
+}: {
+  blocks: OverlayBlock[];
+  plans: BlockPlan[];
+  pending?: boolean;
+}) {
   const someTranslated = blocks.some((block) => block?.translated === true);
+  const shouldDraw = (block: OverlayBlock | undefined) => {
+    if (!block || block.unchanged) return false;
+    return !pending || block.translated === true;
+  };
   return (
     <>
-      {plans.map((plan, index) => (blocks[index]?.unchanged ? null : <CoverView key={`cover-${index}`} plan={plan} />))}
+      {plans.map((plan, index) => (shouldDraw(blocks[index]) ? <CoverView key={`cover-${index}`} plan={plan} /> : null))}
       {plans.map((plan, index) =>
-        blocks[index]?.unchanged ? null : (
+        shouldDraw(blocks[index]) ? (
           <TextView
             key={`text-${index}`}
             plan={plan}
             translated={blocks[index]?.translated ?? false}
-            flagUntranslated={someTranslated}
+            flagUntranslated={!pending && someTranslated}
           />
-        ),
+        ) : null,
       )}
     </>
   );

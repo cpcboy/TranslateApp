@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { OverlayBlock } from "../../lib/ipc";
-import { OverlayBoundary, OverlayFallback, OverlayLayers, describeFailure, isNothingToReplace } from "./TranslateOverlay";
+import { OverlayBoundary, OverlayFallback, OverlayLayers, OverlayView, describeFailure, isNothingToReplace } from "./TranslateOverlay";
 import type { BlockPlan } from "./overlayLayout";
 
 const plan = (overrides: Partial<BlockPlan> = {}): BlockPlan => ({
@@ -159,6 +159,18 @@ describe("OverlayLayers：覆盖层的画层", () => {
     expect(renderToStaticMarkup(<OverlayLayers blocks={[]} plans={[]} />)).toBe("");
     expect(renderToStaticMarkup(<OverlayLayers blocks={[block()]} plans={[]} />)).toBe("");
   });
+
+  it("流式翻译尚未全部完成时（pending=true）：已译完的块立刻原位覆盖，未译完的块保留屏幕原文、不误画虚线下划线", () => {
+    const blocks = [block({ translated: true, text: "新建任务" }), block({ translated: false, text: "Open" })];
+    const plans = [plan({ lines: ["新建任务"] }), plan({ lines: ["Open"] })];
+    const html = renderToStaticMarkup(<OverlayLayers blocks={blocks} plans={plans} pending />);
+    expect(count(html, 'data-role="cover"')).toBe(1);
+    expect(count(html, 'data-role="text"')).toBe(1);
+    expect(html).toContain("新建任务");
+    expect(html).not.toContain("Open");
+    expect(html).not.toContain("data-untranslated");
+    expect(html).not.toContain("underline");
+  });
 });
 
 describe("isNothingToReplace：全部原样保留时要给一条说明", () => {
@@ -219,5 +231,66 @@ describe("错误边界：画的部分出错时退成一条带着译文的提示�
       </OverlayBoundary>,
     );
     expect(html).toBe("<p>子元素</p>");
+  });
+});
+
+function withMockBrowser<T>(fn: () => T): T {
+  const prevWindow = (globalThis as Record<string, unknown>).window;
+  const prevDocument = (globalThis as Record<string, unknown>).document;
+  (globalThis as Record<string, unknown>).window = { innerWidth: 800, innerHeight: 600 };
+  (globalThis as Record<string, unknown>).document = { createElement: () => ({ getContext: () => null }) };
+  try {
+    return fn();
+  } finally {
+    if (prevWindow === undefined) delete (globalThis as Record<string, unknown>).window;
+    else (globalThis as Record<string, unknown>).window = prevWindow;
+    if (prevDocument === undefined) delete (globalThis as Record<string, unknown>).document;
+    else (globalThis as Record<string, unknown>).document = prevDocument;
+  }
+}
+
+describe("OverlayView 两阶段状态渲染", () => {
+  it("ocr 阶段：显示「识别中… · Esc 取消」，即使 blocks=[] 也不误报「没识别到文字」", () => {
+    const htmlNull = renderToStaticMarkup(
+      <OverlayView blocks={null} error={null} notice={null} stage="ocr" hint />,
+    );
+    expect(htmlNull).toContain("识别中… · Esc 取消");
+    expect(htmlNull).not.toContain("没识别到文字");
+
+    const htmlEmpty = withMockBrowser(() =>
+      renderToStaticMarkup(<OverlayView blocks={[]} error={null} notice={null} stage="ocr" hint />),
+    );
+    expect(htmlEmpty).toContain("识别中… · Esc 取消");
+    expect(htmlEmpty).not.toContain("没识别到文字");
+  });
+
+  it("translating 阶段：显示「翻译中… · Esc 取消」，不误报「译文和原文一样」，先译完的块提前显示", () => {
+    const blocks = [
+      block({ text: "新建任务", translated: true, unchanged: false }),
+      block({ text: "Open", translated: false, unchanged: true, y: 50 }),
+    ];
+    const html = withMockBrowser(() =>
+      renderToStaticMarkup(<OverlayView blocks={blocks} error={null} notice={null} stage="translating" hint />),
+    );
+    expect(html).toContain("翻译中… · Esc 取消");
+    expect(html).toContain("新建任务");
+    expect(html).not.toContain("Open");
+    expect(html).not.toContain("译文和原文一样");
+    expect(html).not.toContain("Esc 关闭");
+  });
+
+  it("done 阶段：空块显示「没识别到文字」，有正常译文显示「Esc 关闭」", () => {
+    const emptyHtml = withMockBrowser(() =>
+      renderToStaticMarkup(<OverlayView blocks={[]} error={null} notice={null} stage="done" hint />),
+    );
+    expect(emptyHtml).toContain("没识别到文字");
+
+    const doneHtml = withMockBrowser(() =>
+      renderToStaticMarkup(<OverlayView blocks={[block({ text: "新建任务" })]} error={null} notice={null} stage="done" hint />),
+    );
+    expect(doneHtml).toContain("新建任务");
+    expect(doneHtml).toContain("Esc 关闭");
+    expect(doneHtml).not.toContain("识别中");
+    expect(doneHtml).not.toContain("翻译中");
   });
 });

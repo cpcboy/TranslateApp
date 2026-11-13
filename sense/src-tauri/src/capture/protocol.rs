@@ -175,17 +175,79 @@ fn element_header(bytes: &[u8], at: usize) -> Option<(i64, usize)> {
     Some((id, pos))
 }
 
+fn collect_heads(text: &str) -> Vec<(usize, i64, usize)> {
+    let bytes = text.as_bytes();
+    bytes
+        .iter()
+        .enumerate()
+        .filter(|(_, byte)| **byte == b'{')
+        .filter_map(|(at, _)| element_header(bytes, at).map(|(id, value_start)| (at, id, value_start)))
+        .collect()
+}
+
+/// 严格正向扫描未完流里的 JSON 字符串闭合引号：跳过 `\` 转义字符（含 `\"}`），
+/// 只有遇到真正的未转义 `"` 且后面（忽略空白）紧跟 `}` 才算该条译文已完整闭合。
+fn strict_closing_quote(region: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i < region.len() {
+        match region[i] {
+            b'\\' => i = i.checked_add(2)?,
+            b'"' => {
+                let rest = skip_ws(region, i + 1);
+                return (region.get(rest) == Some(&b'}')).then_some(i);
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// 从流式尚未闭合的 JSON 回复前缀里提取已写完 `{"i":…,"t":"…"}` 的译文条目，供 UI 逐块渐进渲染。
+/// 严格按 JSON 转义规则找闭合引号，绝不把译文内部 `\"}` 误当成收尾，也跳过超范围、空白或相互冲突的重复编号。
+pub(super) fn preview_entries(raw: &str, want: &[usize]) -> Vec<(usize, String)> {
+    let body = strip_fence(raw);
+    let start = body.find('[').map(|i| i + 1).unwrap_or(0);
+    let slice = &body[start..];
+    let heads = collect_heads(slice);
+    let mut seen: std::collections::HashMap<usize, Option<String>> = std::collections::HashMap::new();
+    for (index, (_, id, value_start)) in heads.iter().enumerate() {
+        let Ok(uid) = usize::try_from(*id) else { continue };
+        if !want.contains(&uid) {
+            continue;
+        }
+        let limit = heads.get(index + 1).map_or(slice.len(), |next| next.0);
+        let region = &slice[*value_start..limit.max(*value_start)];
+        let Some(close) = strict_closing_quote(region.as_bytes()) else { continue };
+        let (decoded, _) = decode_inner(&region[..close]);
+        if has_element_debris(&decoded) {
+            continue;
+        }
+        let trimmed = decoded.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match seen.get_mut(&uid) {
+            None => {
+                seen.insert(uid, Some(trimmed.to_string()));
+            }
+            Some(existing) => {
+                if existing.as_deref() != Some(trimmed) {
+                    *existing = None;
+                }
+            }
+        }
+    }
+    want.iter()
+        .filter_map(|uid| seen.get(uid).and_then(|v| v.as_ref().map(|t| (*uid, t.clone()))))
+        .collect()
+}
+
 /// 逐元素扫描：找每个 `{"i":N,"t":"` 的位置，元素的值延伸到下一个元素头（或末尾）之前、
 /// 最后一个「引号 + 可选空白 + }」。没有收尾的（被截断）记进 `dropped`。只在严格解析失败时用。
 /// 例外：最后一个元素少了 `}`、但数组已经闭合时也收下，并且先于「引号 + }」判断（见 `unclosed_last_quote`）。
 fn lenient_scan(text: &str) -> Parsed {
     let bytes = text.as_bytes();
-    let heads: Vec<(usize, i64, usize)> = bytes
-        .iter()
-        .enumerate()
-        .filter(|(_, byte)| **byte == b'{')
-        .filter_map(|(at, _)| element_header(bytes, at).map(|(id, value_start)| (at, id, value_start)))
-        .collect();
+    let heads = collect_heads(text);
 
     let mut parsed = Parsed::default();
     for (index, (_, id, value_start)) in heads.iter().enumerate() {
@@ -554,6 +616,20 @@ where
     type Fut = Fut;
 }
 
+/// 支持流式预览的问一次模型接口：除 user 消息外，还拿到本块需要译出的 `want` 编号与是否允许流式上屏的标志
+/// （仅首轮问询为 `true`，错位整块重发与补缺为 `false`，避免未收敛的重试半句闪屏）。
+pub(super) trait AskStream: Fn(String, Vec<usize>, bool) -> Self::Fut {
+    type Fut: Future<Output = Result<Reply, String>>;
+}
+
+impl<F, Fut> AskStream for F
+where
+    F: Fn(String, Vec<usize>, bool) -> Fut,
+    Fut: Future<Output = Result<Reply, String>>,
+{
+    type Fut = Fut;
+}
+
 /// 一个块跑完的结果。
 struct ChunkRun {
     /// 这一块里每一条的结局，与 `plan.own` 同序
@@ -574,16 +650,16 @@ struct ChunkRun {
 /// 第一次检查会跳过含「没译成」的窗口（缺一条，前后 7 个窗口就没法查）。所以错位只在补缺**之后**才查得出来时，
 /// 这一块**直接整块降级、不再整块重发**：补缺那一步已经是第二次请求，再整块问一遍就是第三次。
 /// 评测记录里这条路径出现过 3 次，都不是最终方案的记录。
-async fn run_chunk<A: Ask>(texts: &[&str], plan: &ChunkPlan, to_english: Direction, ask: &A) -> ChunkRun {
+async fn run_chunk<A: AskStream>(texts: &[&str], plan: &ChunkPlan, to_english: Direction, ask: &A) -> ChunkRun {
     let want: Vec<usize> = plan.own.clone().collect();
     let shown: Vec<usize> = plan.shown.clone().collect();
     let (mut requests, mut retries) = (0, 0);
-    let mut result = ask_round(texts, shown.clone(), &want, ask, &mut requests).await;
+    let mut result = ask_round(texts, shown.clone(), &want, ask, &mut requests, true).await;
     let first_request_failed = result.iter().all(|item| matches!(item, Err(Why::Request(_))));
 
     if !misaligned(texts, plan.own.start, &result, to_english).is_empty() {
         retries += 1;
-        let again = ask_round(texts, shown, &want, ask, &mut requests).await;
+        let again = ask_round(texts, shown, &want, ask, &mut requests, false).await;
         // 第二次整个请求都失败了（断网）就退回第一次的回复，由下面的降级兜底
         if !again.iter().all(|item| matches!(item, Err(Why::Request(_)))) {
             result = again;
@@ -598,7 +674,7 @@ async fn run_chunk<A: Ask>(texts: &[&str], plan: &ChunkPlan, to_english: Directi
             .collect();
         if !failed.is_empty() {
             retries += 1;
-            let again = ask_round(texts, failed.clone(), &failed, ask, &mut requests).await;
+            let again = ask_round(texts, failed.clone(), &failed, ask, &mut requests, false).await;
             for (id, item) in failed.iter().zip(again) {
                 result[id - plan.own.start] = item;
             }
@@ -621,9 +697,16 @@ fn misaligned(texts: &[&str], first: usize, result: &[Result<String, Why>], to_e
 }
 
 /// 发一次请求（`shown` 里的编号发出去）并按 `want` 对齐。
-async fn ask_round<A: Ask>(texts: &[&str], shown: Vec<usize>, want: &[usize], ask: &A, requests: &mut usize) -> Vec<Result<String, Why>> {
+async fn ask_round<A: AskStream>(
+    texts: &[&str],
+    shown: Vec<usize>,
+    want: &[usize],
+    ask: &A,
+    requests: &mut usize,
+    allow_preview: bool,
+) -> Vec<Result<String, Why>> {
     *requests += 1;
-    let reply = match ask(user_message(texts, shown)).await {
+    let reply = match ask(user_message(texts, shown), want.to_vec(), allow_preview).await {
         Ok(reply) => reply,
         Err(message) => return want.iter().map(|_| Err(Why::Request(message.clone()))).collect(),
     };
@@ -661,12 +744,33 @@ async fn ask_round<A: Ask>(texts: &[&str], shown: Vec<usize>, want: &[usize], as
 /// 一个块都没成功时不再问：Key 不对、断网，再问一遍只会让用户多等一轮才看到同样的错。
 /// 第一次请求成功、补缺那一步才失败的块不再整块问：回复本身就有问题，再问多半还要补缺，请求数会涨到 4 次。
 /// 本地模型（`parallel` 为假）一块一块来，没有这一步。
+#[allow(dead_code)]
 pub(super) async fn translate_all<A: Ask>(texts: &[&str], parallel: bool, to_english: impl Into<Direction>, ask: A) -> Outcome {
     translate_all_with(texts, parallel, to_english, RETRY_PAUSE, ask).await
 }
 
+pub(super) async fn translate_all_streaming<A: AskStream>(
+    texts: &[&str],
+    parallel: bool,
+    to_english: impl Into<Direction>,
+    ask: A,
+) -> Outcome {
+    translate_all_with_streaming(texts, parallel, to_english, RETRY_PAUSE, ask).await
+}
+
 /// `translate_all`，等多久再问可调（测试里是 0，不用起计时器）。
+#[allow(dead_code)]
 async fn translate_all_with<A: Ask>(texts: &[&str], parallel: bool, to_english: impl Into<Direction>, pause: Duration, ask: A) -> Outcome {
+    translate_all_with_streaming(texts, parallel, to_english, pause, |msg, _want, _allow_preview| ask(msg)).await
+}
+
+async fn translate_all_with_streaming<A: AskStream>(
+    texts: &[&str],
+    parallel: bool,
+    to_english: impl Into<Direction>,
+    pause: Duration,
+    ask: A,
+) -> Outcome {
     let to_english = to_english.into();
     use futures_util::StreamExt;
 
@@ -2100,5 +2204,59 @@ mod tests {
     fn two_empty_translations_of_the_same_id_are_still_just_empty() {
         let (slots, _) = align(&[entry(0, ""), entry(0, "  "), entry(1, ""), entry(1, "乙")], &[0, 1]);
         assert_eq!(slots, vec![Slot::Empty, Slot::Conflict], "两次都是空的还是「空」；一空一非空才是「两种译文」");
+    }
+
+    #[test]
+    fn preview_entries_extracts_only_closed_in_range_non_empty_non_conflicting_items() {
+        // 未闭合的 ```json 前缀 + 已闭合的 0、1 + 未闭合的 2：只返回 0 和 1
+        let stream = "```json\n[{\"i\":0,\"t\":\"  甲  \"},{\"i\":1,\"t\":\"乙\"},{\"i\":2,\"t\":\"半句";
+        assert_eq!(preview_entries(stream, &[0, 1, 2]), vec![(0, "甲".into()), (1, "乙".into())]);
+
+        // 末尾少了 `}` 但数组已闭合的条目也不在预览期提前猜，留给最终 strict/lenient 阶段
+        let unclosed_brace = "[{\"i\":0,\"t\":\"甲\"},{\"i\":1,\"t\":\"丙\"\n]";
+        assert_eq!(preview_entries(unclosed_brace, &[0, 1]), vec![(0, "甲".into())]);
+
+        // 超出 want 范围、空白译文、冲突重复编号、含 JSON 碎片都被过滤
+        let noisy = r#"[{"i":99,"t":"越界"},{"i":0,"t":"   "},{"i":1,"t":"一版"},{"i":1,"t":"二版"},{"i":2,"t":"好{\"i\":3,\"t\":\"坏"}]"#;
+        assert_eq!(preview_entries(noisy, &[0, 1, 2]), vec![]);
+
+        // 相同译文重复出现不算冲突
+        let dup_same = r#"[{"i":0,"t":"甲"},{"i":0,"t":"甲"}]"#;
+        assert_eq!(preview_entries(dup_same, &[0]), vec![(0, "甲".into())]);
+
+        // 译文内部包含转义 `\"}"` 时流还没闭合：不能把 `\"}"` 误判成条目收尾导致半截闪屏
+        let mid_escaped = r#"[{"i":0,"t":"配置示例 {\"k\":\"v\"} 正在写"#;
+        assert_eq!(preview_entries(mid_escaped, &[0]), vec![]);
+        let closed_escaped = r#"[{"i":0,"t":"配置示例 {\"k\":\"v\"} 即可"}"#;
+        assert_eq!(preview_entries(closed_escaped, &[0]), vec![(0, "配置示例 {\"k\":\"v\"} 即可".into())]);
+    }
+
+    #[test]
+    fn translate_all_streaming_enables_preview_only_on_first_round_not_retries() {
+        let texts = ["Hello", "World"];
+        let calls: Mutex<Vec<(Vec<usize>, bool)>> = Mutex::new(Vec::new());
+        let outcome = futures_executor_block_on(translate_all_with_streaming(
+            &texts,
+            false,
+            Direction::ToChinese,
+            Duration::ZERO,
+            |_msg, want, allow_preview| {
+                calls.lock().unwrap().push((want.clone(), allow_preview));
+                let reply = if allow_preview {
+                    // 首轮漏掉 id 1，触发补缺第二轮
+                    r#"[{"i":0,"t":"你好"}]"#.into()
+                } else {
+                    r#"[{"i":1,"t":"世界"}]"#.into()
+                };
+                ready(Ok(Reply { text: reply, truncated: false }))
+            },
+        ));
+        assert_eq!(outcome.translations, vec![Ok("你好".into()), Ok("世界".into())]);
+        let recorded = calls.into_inner().unwrap();
+        assert_eq!(recorded, vec![(vec![0, 1], true), (vec![1], false)]);
+    }
+
+    fn futures_executor_block_on<F: Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(fut)
     }
 }

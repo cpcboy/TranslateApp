@@ -34,6 +34,11 @@ static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 /// 转给代理，本地模型直接不可用，报错还很难懂。
 static LOOPBACK_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
+/// 无连接池直连客户端：当复用池里拿到的 HTTP/2 或长连接变成黑洞、等响应头超时时，
+/// 用它强制重新建一条全新的 TCP + TLS 连接，避免在同一条死链接上再次排队。
+static FRESH_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+static FRESH_LOOPBACK_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
 /// 这个地址是不是本机。保存与「测试连接」的 https 规则、客户端选择共用它。
 ///
 /// 用 reqwest 自己的 URL 解析器取主机：它才是真正决定请求发到哪里的那一个。
@@ -56,12 +61,36 @@ pub fn client_for(base_url: &str) -> &'static reqwest::Client {
     LOOPBACK_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .no_proxy()
-            .connect_timeout(Duration::from_secs(5))
+            .connect_timeout(Duration::from_secs(4))
             // 同 http_client：只管非流式请求，流式请求单独放宽
             .timeout(Duration::from_secs(180))
-            .pool_idle_timeout(Duration::from_secs(60))
+            .pool_idle_timeout(Duration::from_secs(20))
+            .tcp_keepalive(Duration::from_secs(15))
             .build()
             .expect("构建本地 HTTP 客户端失败")
+    })
+}
+
+/// 不走复用连接池的客户端：强制建立新的 TCP + TLS 连接。
+pub fn fresh_client_for(base_url: &str) -> &'static reqwest::Client {
+    if is_loopback(base_url) {
+        return FRESH_LOOPBACK_CLIENT.get_or_init(|| {
+            reqwest::Client::builder()
+                .no_proxy()
+                .connect_timeout(Duration::from_secs(4))
+                .timeout(Duration::from_secs(180))
+                .pool_max_idle_per_host(0)
+                .build()
+                .expect("构建无池本地 HTTP 客户端失败")
+        });
+    }
+    FRESH_HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(4))
+            .timeout(Duration::from_secs(180))
+            .pool_max_idle_per_host(0)
+            .build()
+            .expect("构建无池 HTTP 客户端失败")
     })
 }
 
@@ -70,14 +99,16 @@ pub fn http_client() -> &'static reqwest::Client {
         reqwest::Client::builder()
             // 连接要快。180 秒总时限只管非流式请求（/models 等）：reqwest 的 timeout 管到
             // 响应体读完，流式请求会按 max_tokens 单独放宽，见 openai_compat::stream_deadline。
-            .connect_timeout(Duration::from_secs(5))
+            .connect_timeout(Duration::from_secs(4))
             .timeout(Duration::from_secs(180))
-            // 查词是一次一次来的，连接必须留着复用：每次重新握手要多 100–300ms。
-            // 很多网关/LB 在 60–120s 就掐掉空闲连接；留太久会拿到半关闭的连接，
-            // 表现为「连不上模型服务」，比多握一次手更糟。
-            .pool_idle_timeout(Duration::from_secs(60))
+            // 查词 / 截屏请求复用池：缩短空闲淘汰并打开 HTTP/2 IDLE PING，
+            // 防止休眠唤醒或 EdgeOne/NAT 悄悄掐断空闲连接后，下次复用到半死 socket 卡满几十秒。
+            .pool_idle_timeout(Duration::from_secs(20))
             .pool_max_idle_per_host(4)
-            .tcp_keepalive(Duration::from_secs(60))
+            .tcp_keepalive(Duration::from_secs(15))
+            .http2_keep_alive_interval(Duration::from_secs(15))
+            .http2_keep_alive_timeout(Duration::from_secs(5))
+            .http2_keep_alive_while_idle(true)
             .build()
             .expect("构建 HTTP 客户端失败")
     })
