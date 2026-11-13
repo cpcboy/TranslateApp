@@ -1,8 +1,9 @@
 // 在 node 环境用轻量 hooks 运行时驱动真实的 TranslateOverlay / OverlayView，
-// 验证 StrictMode 清理、代数/阶段单调与推拉竞态、失焦保护期、以及扩缩窗期间 bounds 同步与 resize 重排。
+// 验证 StrictMode 清理、代数/修订/阶段单调与推拉竞态、工具条重译/切换原文/标注/保存/关闭、
+// 以及扩缩窗期间 bounds 同步与 resize 重排。
 import type { ReactElement } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { CaptureView, OverlayBlock } from "../../lib/ipc";
+import type { CaptureView, OverlayBlock, SaveImageKind, SaveImageResult } from "../../lib/ipc";
 
 type Cell = { v?: unknown; current?: unknown; fn?: unknown; deps?: unknown[]; cleanup?: unknown };
 
@@ -63,7 +64,6 @@ vi.mock("react", async (importOriginal) => {
       rt.hooks[i] = { fn, deps };
       return fn;
     },
-    // useState / useRef / useMemo / useCallback / useEffect
     useEffect: (fn: () => void | (() => void), deps?: unknown[]) => {
       const i = rt.idx++;
       const cell: Cell = rt.hooks[i] ?? {};
@@ -85,28 +85,18 @@ vi.mock("react", async (importOriginal) => {
   };
 });
 
-const winMock = vi.hoisted(() => ({
-  focusHandlers: [] as Array<(event: { payload: boolean }) => void>,
-  focusUnlistenCalls: 0,
-}));
-
-vi.mock("@tauri-apps/api/window", () => ({
-  getCurrentWindow: () => ({
-    onFocusChanged: (handler: (event: { payload: boolean }) => void) => {
-      winMock.focusHandlers.push(handler);
-      return Promise.resolve(() => {
-        winMock.focusUnlistenCalls++;
-        winMock.focusHandlers = winMock.focusHandlers.filter((item) => item !== handler);
-      });
-    },
-  }),
-}));
-
 const ipcMock = vi.hoisted(() => ({
   captureBlocks: vi.fn<() => Promise<CaptureView>>(),
+  captureOriginalImage: vi.fn<() => Promise<string | null>>(),
+  retranslateCapture: vi.fn<(target: string) => Promise<void>>(),
+  saveCaptureImage: vi.fn<(kind: SaveImageKind, pngBase64: string | null) => Promise<SaveImageResult>>(),
   closeOverlay: vi.fn<(generation?: number) => Promise<void>>(),
   updateHandlers: [] as Array<(view: CaptureView) => void>,
   updateUnlistenCalls: 0,
+}));
+
+const exportMock = vi.hoisted(() => ({
+  renderCapturePngBase64: vi.fn<() => Promise<string>>(),
 }));
 
 vi.mock("../../lib/ipc", async (importOriginal) => {
@@ -116,6 +106,9 @@ vi.mock("../../lib/ipc", async (importOriginal) => {
     api: {
       ...actual.api,
       captureBlocks: ipcMock.captureBlocks,
+      captureOriginalImage: ipcMock.captureOriginalImage,
+      retranslateCapture: ipcMock.retranslateCapture,
+      saveCaptureImage: ipcMock.saveCaptureImage,
       closeOverlay: ipcMock.closeOverlay,
     },
     onCaptureUpdate: (handler: (view: CaptureView) => void) => {
@@ -128,7 +121,12 @@ vi.mock("../../lib/ipc", async (importOriginal) => {
   };
 });
 
-import { OverlayView, TranslateOverlay, sanitizeBounds } from "./TranslateOverlay";
+vi.mock("./captureExport", () => ({
+  renderCapturePngBase64: exportMock.renderCapturePngBase64,
+}));
+
+import { CaptureToolbar } from "./CaptureToolbar";
+import { OverlayView, TranslateOverlay, sanitizeBounds, sanitizeImageRect } from "./TranslateOverlay";
 
 type El = ReactElement<{
   onClick?: () => void;
@@ -202,6 +200,23 @@ function renderOverlay(commitEffects = true): El {
   return el;
 }
 
+function findElement(node: unknown, predicate: (el: El) => boolean): El | null {
+  if (!node || typeof node !== "object") return null;
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const found = findElement(child, predicate);
+      if (found) return found;
+    }
+    return null;
+  }
+  const el = node as El;
+  if ("type" in el && predicate(el)) return el;
+  if (el.props && "children" in el.props) {
+    return findElement(el.props.children, predicate);
+  }
+  return null;
+}
+
 function findOverlayViewProps(root: El): {
   blocks: OverlayBlock[] | null;
   error: string | null;
@@ -209,13 +224,21 @@ function findOverlayViewProps(root: El): {
   stage: "ocr" | "translating" | "done";
   hint: boolean;
   bounds?: { w: number; h: number } | null;
+  hideTranslation?: boolean;
+  hideFloatingEsc?: boolean;
 } {
-  const boundary = root.props.children as El;
-  const view = boundary.props.children as El;
-  return view.props as ReturnType<typeof findOverlayViewProps>;
+  const el = findElement(root, (item) => item.type === OverlayView);
+  if (!el) throw new Error("OverlayView not found");
+  return el.props as ReturnType<typeof findOverlayViewProps>;
+}
+
+function findToolbarProps(root: El): Record<string, unknown> | null {
+  const el = findElement(root, (item) => item.type === CaptureToolbar);
+  return el ? (el.props as Record<string, unknown>) : null;
 }
 
 const flush = async () => {
+  await Promise.resolve();
   await Promise.resolve();
   await Promise.resolve();
 };
@@ -238,16 +261,22 @@ beforeEach(() => {
   vi.setSystemTime(new Date("2026-11-13T10:00:00Z"));
   resetHooks();
   setupMockGlobals();
-  winMock.focusHandlers = [];
-  winMock.focusUnlistenCalls = 0;
   ipcMock.captureBlocks.mockReset();
+  ipcMock.captureOriginalImage.mockReset();
+  ipcMock.captureOriginalImage.mockResolvedValue("data:image/png;base64,iVBORw0KGgo=");
+  ipcMock.retranslateCapture.mockReset();
+  ipcMock.retranslateCapture.mockResolvedValue();
+  ipcMock.saveCaptureImage.mockReset();
+  ipcMock.saveCaptureImage.mockResolvedValue({ saved: true, path: "/tmp/out.png" });
   ipcMock.closeOverlay.mockReset();
   ipcMock.closeOverlay.mockResolvedValue();
   ipcMock.updateHandlers = [];
   ipcMock.updateUnlistenCalls = 0;
+  exportMock.renderCapturePngBase64.mockReset();
+  exportMock.renderCapturePngBase64.mockResolvedValue("RAW_PNG_BASE64");
 });
 
-describe("TranslateOverlay 运行时状态机与扩缩窗回归测试", () => {
+describe("TranslateOverlay 运行时状态机与工具条回归测试", () => {
   it("StrictMode 双挂载与卸载：清理全部监听与定时器，不留重复订阅", async () => {
     ipcMock.captureBlocks.mockResolvedValue({
       blocks: [],
@@ -255,35 +284,38 @@ describe("TranslateOverlay 运行时状态机与扩缩窗回归测试", () => {
       notice: null,
       stage: "ocr",
       generation: 1,
+      revision: 1,
       bounds: { w: 164, h: 40 },
     });
 
-    // 手动模拟 StrictMode：effect 跑一次 → 立即 cleanup → 再跑一次
     rt.idx = 0;
     TranslateOverlay();
-    const firstEffect = rt.effects[0];
-    const firstCleanup = firstEffect();
-    expect(typeof firstCleanup).toBe("function");
-    (firstCleanup as () => void)();
+    const firstCleanups = rt.effects.map((eff) => eff());
+    for (const cleanup of firstCleanups) {
+      expect(typeof cleanup).toBe("function");
+      (cleanup as () => void)();
+    }
     await flush();
     expect(ipcMock.updateUnlistenCalls).toBe(1);
-    expect(winMock.focusUnlistenCalls).toBe(1);
+    expect(windowState.listeners.get("resize")?.size ?? 0).toBe(0);
     expect(windowState.listeners.get("keydown")?.size ?? 0).toBe(0);
     expect(windowState.clearedTimers.length).toBe(1);
 
-    const secondCleanup = firstEffect();
+    const secondCleanups = rt.effects.map((eff) => eff());
     await flush();
     expect(ipcMock.updateHandlers.length).toBe(1);
-    expect(winMock.focusHandlers.length).toBe(1);
+    expect(windowState.listeners.get("resize")?.size ?? 0).toBe(1);
     expect(windowState.listeners.get("keydown")?.size ?? 0).toBe(1);
 
-    (secondCleanup as () => void)();
+    for (const cleanup of secondCleanups) {
+      (cleanup as () => void)();
+    }
     expect(ipcMock.updateUnlistenCalls).toBe(2);
-    expect(winMock.focusUnlistenCalls).toBe(2);
+    expect(windowState.listeners.get("resize")?.size ?? 0).toBe(0);
     expect(windowState.listeners.get("keydown")?.size ?? 0).toBe(0);
   });
 
-  it("代数与阶段单调 + 推拉竞态：先收到 push 进阶视图后，迟到的 captureBlocks 与旧代推送不得倒退", async () => {
+  it("代数、修订号与阶段单调 + 推拉竞态：旧 revision / 旧 generation 推送与迟到拉取均不倒退", async () => {
     let resolvePull!: (view: CaptureView) => void;
     ipcMock.captureBlocks.mockImplementation(
       () =>
@@ -295,104 +327,227 @@ describe("TranslateOverlay 运行时状态机与扩缩窗回归测试", () => {
     renderOverlay();
     await flush();
 
-    // 推送先到达：gen=3, translating, 已译 1 块
+    // gen=3, rev=1, translating 先到达
     ipcMock.updateHandlers[0]({
       blocks: [sampleBlock({ text: "第一块", translated: true })],
       error: null,
       notice: null,
       stage: "translating",
       generation: 3,
-      bounds: { w: 164, h: 40 },
+      revision: 1,
+      bounds: { w: 480, h: 160 },
+      image_rect: { x: 40, y: 0, w: 400, h: 100 },
+      has_image: true,
     });
     let props = findOverlayViewProps(renderOverlay());
     expect(props.stage).toBe("translating");
     expect(props.blocks?.map((b) => b.text)).toEqual(["第一块"]);
+    expect(ipcMock.captureOriginalImage).toHaveBeenCalledTimes(1);
 
-    // 迟到的首帧拉取回来了较早的 gen=3, stage=ocr, blocks=[]：由于已有同代或更晚推送，必须被忽略
+    // 迟到拉取返回 gen=3, rev=1, stage=ocr：不得倒退
     resolvePull({
       blocks: [],
       error: null,
       notice: null,
       stage: "ocr",
       generation: 3,
-      bounds: { w: 164, h: 40 },
+      revision: 1,
+      bounds: { w: 480, h: 160 },
     });
     await flush();
     props = findOverlayViewProps(renderOverlay());
     expect(props.stage).toBe("translating");
     expect(props.blocks?.map((b) => b.text)).toEqual(["第一块"]);
 
-    // 上一代 gen=2 的 done 推送也必须被忽略
+    // 切换目标语言后 rev=2 的 done 到达
     ipcMock.updateHandlers[0]({
-      blocks: [sampleBlock({ text: "旧代脏数据" })],
+      blocks: [sampleBlock({ text: "新しいタスク", translated: true })],
       error: null,
       notice: null,
       stage: "done",
-      generation: 2,
-      bounds: { w: 200, h: 100 },
+      generation: 3,
+      revision: 2,
+      target_lang: "ja",
+      bounds: { w: 480, h: 160 },
+      image_rect: { x: 40, y: 0, w: 400, h: 100 },
+      has_image: true,
     });
     props = findOverlayViewProps(renderOverlay());
-    expect(props.blocks?.map((b) => b.text)).toEqual(["第一块"]);
+    expect(props.stage).toBe("done");
+    expect(props.blocks?.map((b) => b.text)).toEqual(["新しいタスク"]);
 
-    // 新一代 gen=4 的 ocr 正常接管
+    // 旧 rev=1 的 done 迟到，即使 stage=done 也不得覆盖 rev=2
+    ipcMock.updateHandlers[0]({
+      blocks: [sampleBlock({ text: "旧修订脏数据" })],
+      error: null,
+      notice: null,
+      stage: "done",
+      generation: 3,
+      revision: 1,
+      bounds: { w: 480, h: 160 },
+    });
+    props = findOverlayViewProps(renderOverlay());
+    expect(props.blocks?.map((b) => b.text)).toEqual(["新しいタスク"]);
+
+    // 新一代 gen=4 的 ocr 正常接管并重新拉原图
     ipcMock.updateHandlers[0]({
       blocks: [],
       error: null,
       notice: null,
       stage: "ocr",
       generation: 4,
-      bounds: { w: 164, h: 40 },
+      revision: 1,
+      has_image: true,
+      bounds: { w: 480, h: 160 },
     });
+    await flush();
     props = findOverlayViewProps(renderOverlay());
     expect(props.stage).toBe("ocr");
     expect(props.blocks).toEqual([]);
+    expect(ipcMock.captureOriginalImage).toHaveBeenCalledTimes(2);
   });
 
-  it("失焦保护期、Ocr 阶段防误关与 Esc/点击携带当前 generation", async () => {
+  it("点击画布不关闭，按 Esc 依次收起文字草稿/弹层再关窗，工具条关闭按钮立即携带 generation 退出", async () => {
     ipcMock.captureBlocks.mockResolvedValue({
-      blocks: [],
-      error: null,
-      notice: null,
-      stage: "ocr",
-      generation: 7,
-      bounds: { w: 164, h: 40 },
-    });
-
-    const root = renderOverlay();
-    await flush();
-
-    // Ocr 阶段即使超过 400ms 宽限期也不得因失焦关闭
-    vi.advanceTimersByTime(600);
-    winMock.focusHandlers[0]({ payload: false });
-    expect(ipcMock.closeOverlay).not.toHaveBeenCalled();
-
-    // 进入 done 并扩窗：刷新 400ms 宽限期，200ms 内触发失焦不得关闭
-    ipcMock.updateHandlers[0]({
       blocks: [sampleBlock()],
       error: null,
       notice: null,
       stage: "done",
       generation: 7,
-      bounds: { w: 300, h: 84 },
+      revision: 1,
+      has_image: true,
+      target_lang: "zh",
+      bounds: { w: 480, h: 180 },
+      image_rect: { x: 40, y: 8, w: 400, h: 100 },
     });
-    vi.advanceTimersByTime(200);
-    winMock.focusHandlers[0]({ payload: false });
+
+    let root = renderOverlay();
+    await flush();
+    root = renderOverlay();
+
+    // 单击背景不能关窗（用户需要在画布上标注和点工具条）
+    root.props.onClick?.();
     expect(ipcMock.closeOverlay).not.toHaveBeenCalled();
 
-    // 过了 400ms 宽限期后失焦，携带 generation=7 关闭
-    vi.advanceTimersByTime(250);
-    winMock.focusHandlers[0]({ payload: false });
-    expect(ipcMock.closeOverlay).toHaveBeenCalledWith(7);
-
-    // Esc 与点击都携带 generation=7
+    // 打开语言弹层后按 Esc：先关弹层不退出
+    const toolbar = findToolbarProps(root)!;
+    expect(toolbar).not.toBeNull();
+    (toolbar.onTogglePopover as (p: "lang") => void)("lang");
+    root = renderOverlay();
     const keydown = [...(windowState.listeners.get("keydown") ?? [])][0];
     keydown({ key: "Escape" });
-    expect(ipcMock.closeOverlay).toHaveBeenCalledTimes(2);
+    expect(ipcMock.closeOverlay).not.toHaveBeenCalled();
+
+    // 弹层已收起，再按 Esc 才关闭 generation=7
+    root = renderOverlay();
+    keydown({ key: "Escape" });
+    expect(ipcMock.closeOverlay).toHaveBeenCalledTimes(1);
     expect(ipcMock.closeOverlay).toHaveBeenLastCalledWith(7);
 
-    root.props.onClick?.();
-    expect(ipcMock.closeOverlay).toHaveBeenCalledTimes(3);
+    // 点工具条「关闭」同样携带 generation=7
+    const toolbarAgain = findToolbarProps(root)!;
+    (toolbarAgain.onClose as () => void)();
+    expect(ipcMock.closeOverlay).toHaveBeenCalledTimes(2);
     expect(ipcMock.closeOverlay).toHaveBeenLastCalledWith(7);
+  });
+
+  it("工具条完整闭环：切换原文/结果、切换目标语言重译、画标注与撤销、分别导出原图与译后图", async () => {
+    ipcMock.captureBlocks.mockResolvedValue({
+      blocks: [sampleBlock()],
+      error: null,
+      notice: null,
+      stage: "done",
+      generation: 9,
+      revision: 1,
+      has_image: true,
+      target_lang: "zh",
+      scale: 2,
+      bounds: { w: 500, h: 200 },
+      image_rect: { x: 0, y: 0, w: 500, h: 140 },
+    });
+
+    let root = renderOverlay();
+    await flush();
+    root = renderOverlay();
+
+    // 1) 冻结原图已加载，切到显示原文 -> hideTranslation=true，切回显示结果 -> hideTranslation=false
+    expect(findElement(root, (el) => el.props["data-testid"] === "capture-original-image")).not.toBeNull();
+    (findToolbarProps(root)!.onToggleOriginal as (v: boolean) => void)(true);
+    root = renderOverlay();
+    expect(findOverlayViewProps(root).hideTranslation).toBe(true);
+    (findToolbarProps(root)!.onToggleOriginal as (v: boolean) => void)(false);
+    root = renderOverlay();
+    expect(findOverlayViewProps(root).hideTranslation).toBe(false);
+
+    // 2) 选择目标语言 -> 调 retranslateCapture("ja") 且工具条进入 retranslating，切入 translating 流式期冻结原图保持挂载不透底，收到 done 后清除
+    (findToolbarProps(root)!.onSelectLang as (code: string) => void)("ja");
+    root = renderOverlay();
+    expect(ipcMock.retranslateCapture).toHaveBeenCalledWith("ja");
+    expect(findToolbarProps(root)!.retranslating).toBe(true);
+    ipcMock.updateHandlers[0]({
+      blocks: [sampleBlock({ text: "新規タスク", translated: true })],
+      error: null,
+      notice: null,
+      stage: "translating",
+      generation: 9,
+      revision: 2,
+      target_lang: "ja",
+      has_image: true,
+      bounds: { w: 500, h: 200 },
+      image_rect: { x: 0, y: 0, w: 500, h: 140 },
+    });
+    root = renderOverlay();
+    expect(findElement(root, (el) => el.props["data-testid"] === "capture-original-image")).not.toBeNull();
+    ipcMock.updateHandlers[0]({
+      blocks: [sampleBlock({ text: "新規タスク" })],
+      error: null,
+      notice: null,
+      stage: "done",
+      generation: 9,
+      revision: 2,
+      target_lang: "ja",
+      has_image: true,
+      bounds: { w: 500, h: 200 },
+      image_rect: { x: 0, y: 0, w: 500, h: 140 },
+    });
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.retranslating).toBe(false);
+    expect(findToolbarProps(root)!.targetLang).toBe("ja");
+
+    // 3) 选中「矩形」在标注 SVG 上拖拽一条矩形标注，再用「撤销」撤回
+    (findToolbarProps(root)!.onSelectTool as (tool: "rect") => void)("rect");
+    root = renderOverlay();
+    const svg = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    expect(svg).not.toBeNull();
+    (svg.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 1,
+      clientX: 10,
+      clientY: 12,
+      stopPropagation: () => {},
+      currentTarget: {},
+    });
+    root = renderOverlay();
+    const svgMoving = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svgMoving.props.onPointerMove as (e: unknown) => void)({ clientX: 80, clientY: 60 });
+    root = renderOverlay();
+    const svgUp = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svgUp.props.onPointerUp as () => void)();
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.annotationsCount).toBe(1);
+
+    // 4) 分别保存未翻译原图（null 载荷走 Rust 直接复制原生 PNG）与翻译后图片（带 Canvas 合成 Base64）
+    await (findToolbarProps(root)!.onSave as (kind: SaveImageKind) => Promise<void>)("original");
+    expect(ipcMock.saveCaptureImage).toHaveBeenLastCalledWith("original", null);
+
+    await (findToolbarProps(root)!.onSave as (kind: SaveImageKind) => Promise<void>)("translated");
+    expect(exportMock.renderCapturePngBase64).toHaveBeenCalledTimes(1);
+    expect(ipcMock.saveCaptureImage).toHaveBeenLastCalledWith("translated", "RAW_PNG_BASE64");
+
+    // 撤销清空标注
+    (findToolbarProps(root)!.onUndo as () => void)();
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.annotationsCount).toBe(0);
   });
 
   it("P1-2 回归：window.innerWidth 滞留在 80x22 时，view.bounds={300,84} 与 resize 兜底都能避免遮盖裁成 0x0", async () => {
@@ -408,7 +563,6 @@ describe("TranslateOverlay 运行时状态机与扩缩窗回归测试", () => {
       ink: { x: 222, y: 64, w: 58, h: 14 },
     });
 
-    // 1) 通过 bounds 原子同步窗口目标尺寸（此时 window.innerWidth 仍旧是 80x22）
     resetHooks();
     rt.idx = 0;
     const withBoundsEl = OverlayView({
@@ -425,7 +579,6 @@ describe("TranslateOverlay 运行时状态机与扩缩窗回归测试", () => {
     expect(withBoundsCover.plans[0].cover.w).toBeGreaterThan(0);
     expect(withBoundsCover.plans[0].cover.h).toBeGreaterThan(0);
 
-    // 2) 不传 bounds 时退回 window + resize 监听：80x22 先被裁到边缘，触发 resize 为 300x84 后立刻重排恢复
     resetHooks();
     windowState.listeners.clear();
     rt.idx = 0;
@@ -464,10 +617,39 @@ describe("TranslateOverlay 运行时状态机与扩缩窗回归测试", () => {
     expect(resizedCover.plans[0].cover.w).toBeGreaterThan(0);
     expect(resizedCover.plans[0].cover.h).toBeGreaterThan(0);
 
-    // sanitizeBounds 过滤非法值
     expect(sanitizeBounds({ w: 300, h: 84 })).toEqual({ w: 300, h: 84 });
     expect(sanitizeBounds({ w: 0, h: 84 })).toBeNull();
     expect(sanitizeBounds({ w: Number.NaN, h: 84 })).toBeNull();
     expect(sanitizeBounds(null)).toBeNull();
+    expect(sanitizeImageRect({ x: 10, y: 0, w: 300, h: 120 })).toEqual({ x: 10, y: 0, w: 300, h: 120 });
+    expect(sanitizeImageRect({ x: -1, y: 0, w: 300, h: 120 })).toBeNull();
+  });
+
+  it("极小选区 60x24 扩窗后：状态/报错浮层不被裁剪到 60x24，且语言下拉传出适配窗口余高的 popoverMaxHeight", async () => {
+    ipcMock.captureBlocks.mockResolvedValue({
+      blocks: [],
+      error: "超时",
+      notice: null,
+      stage: "done",
+      generation: 12,
+      revision: 1,
+      has_image: true,
+      bounds: { w: 580, h: 292 },
+      image_rect: { x: 40, y: 0, w: 60, h: 24 },
+    });
+    let root = renderOverlay();
+    await flush();
+    root = renderOverlay();
+
+    const chrome = findElement(root, (el) => el.props["data-testid"] === "capture-chrome")!;
+    expect(chrome).not.toBeNull();
+    const chromeStyle = chrome.props.style as { width: number; minHeight: number };
+    expect(chromeStyle.width).toBeGreaterThanOrEqual(300);
+    expect(chromeStyle.minHeight).toBeGreaterThanOrEqual(84);
+
+    const toolbar = findToolbarProps(root)!;
+    expect(typeof toolbar.popoverMaxHeight).toBe("number");
+    expect(toolbar.popoverMaxHeight as number).toBeGreaterThanOrEqual(108);
+    expect(toolbar.popoverMaxHeight as number).toBeLessThanOrEqual(220);
   });
 });

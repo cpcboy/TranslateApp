@@ -54,14 +54,25 @@ mod protocol;
 pub const OVERLAY_WINDOW: &str = "overlay";
 
 /// 覆盖层带失败提示时的最小尺寸（逻辑像素）：12.5px 的提示两三行刚好放下。
+#[cfg(test)]
 const ALERT_MIN_WIDTH: f64 = 300.0;
+#[cfg(test)]
 const ALERT_MIN_HEIGHT: f64 = 84.0;
 /// 覆盖层在 `Ocr` / `Translating` 阶段承载状态胶囊（「识别中… · Esc 取消」「翻译中… · Esc 取消」）的最小尺寸。
+#[cfg(test)]
 const STATUS_MIN_WIDTH: f64 = 164.0;
+#[cfg(test)]
 const STATUS_MIN_HEIGHT: f64 = 40.0;
+/// 截屏后悬浮工具条（语种选择 / 原文结果切换 / 标注 / 保存 / 关闭）所需最小宽度与外边距预留。
+const TOOLBAR_MIN_WIDTH: f64 = 580.0;
+const TOOLBAR_RESERVE: f64 = 56.0;
+const TOOLBAR_EXTRA_SMALL: f64 = 268.0;
+const TOOLBAR_EXTRA_NORMAL: f64 = 100.0;
 
 /// 选区阶段最久等这么久（sidecar 内部在 115 秒会自动取消，这里留 5 秒余量兜底）。
 const SELECT_TIMEOUT: Duration = Duration::from_secs(120);
+/// 原生保存面板最久等待用户操作的时间。
+const SAVE_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// OCR 出来的一行（图片像素坐标，原点左上）。
 ///
@@ -179,6 +190,7 @@ pub struct Block {
 
 impl Block {
     /// 整块平移（覆盖层窗口为了不伸出屏幕往回挪时，块要同步补偿，仍对准原文）。
+    #[cfg(test)]
     fn shift(&mut self, dx: f64, dy: f64) {
         self.x += dx;
         self.y += dy;
@@ -259,6 +271,15 @@ pub struct OverlayBounds {
     pub h: f64,
 }
 
+/// 冻结原图在覆盖层窗口内部的逻辑矩形（`blocks` 与标注 SVG/Canvas 皆以它为原点）。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ImageRect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct OverlayFrame {
     win_x: f64,
@@ -269,15 +290,48 @@ struct OverlayFrame {
     shift_y: f64,
 }
 
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CaptureWindowFrame {
+    win: OverlayFrame,
+    image: ImageRect,
+}
+
+#[derive(Clone)]
 struct CaptureSnapshot {
     blocks: Vec<Block>,
+    /// 选中区域合并后的原始 OCR 块（选区局部坐标、未替换译文），供工具条切换语言重译。
+    raw_blocks: Vec<Block>,
     /// 翻译这一步失败的原因。覆盖层必须把它说出来：只画原文，用户会以为「翻译过了」
     error: Option<String>,
     /// 提示：翻译成功了，但有话要告诉用户（比如译文没能对准原文的位置）
     notice: Option<String>,
     stage: CaptureStage,
     bounds: Option<OverlayBounds>,
+    image_rect: Option<ImageRect>,
+    original_png: Option<Arc<Vec<u8>>>,
+    scale: f64,
+    target_lang: Option<String>,
+    revision: u64,
+    mixed: bool,
+}
+
+impl Default for CaptureSnapshot {
+    fn default() -> Self {
+        Self {
+            blocks: Vec::new(),
+            raw_blocks: Vec::new(),
+            error: None,
+            notice: None,
+            stage: CaptureStage::default(),
+            bounds: None,
+            image_rect: None,
+            original_png: None,
+            scale: 1.0,
+            target_lang: None,
+            revision: 0,
+            mixed: false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -288,6 +342,8 @@ pub struct CaptureState {
     /// 第几次截屏。后来者胜：新的一次开始后，还在识别 / 翻译的旧一次做完也不再更新或弹窗，
     /// 否则旧译文会盖在新的上面、旧覆盖层的失焦事件也会误关新窗
     generation: Arc<AtomicU64>,
+    /// 同一代截屏里重译的序号：在工具条连续切换语言时取消在途旧请求并丢弃过期事件
+    translate_seq: Arc<AtomicU64>,
 }
 
 /// 离开作用域就把「选框开着」标志放掉，早退和 panic 都不会卡死之后的截屏。
@@ -299,7 +355,28 @@ impl Drop for BusyGuard<'_> {
     }
 }
 
-/// 覆盖层拿到的全部内容：识别块、失败原因、补充提示、当前阶段、代数与目标尺寸。
+/// 离开作用域删除临时图片文件，防止泄露。
+struct TempFileGuard(PathBuf);
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// 弹出原生 NSSavePanel 期间临时取消覆盖层置顶，离开作用域自动恢复。
+struct OverlayTopGuard<'a>(&'a AppHandle);
+
+impl Drop for OverlayTopGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(overlay) = self.0.get_webview_window(OVERLAY_WINDOW) {
+            let _ = overlay.set_always_on_top(true);
+            let _ = overlay.set_focus();
+        }
+    }
+}
+
+/// 覆盖层拿到的全部内容：识别块、失败原因、补充提示、当前阶段、代数、重译序号与图像区域。
 #[derive(Debug, Clone, Serialize)]
 pub struct CaptureView {
     pub blocks: Vec<Block>,
@@ -307,7 +384,18 @@ pub struct CaptureView {
     pub notice: Option<String>,
     pub stage: CaptureStage,
     pub generation: u64,
+    pub revision: u64,
     pub bounds: Option<OverlayBounds>,
+    pub image_rect: Option<ImageRect>,
+    pub has_image: bool,
+    pub target_lang: Option<String>,
+    pub scale: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SaveImageResult {
+    pub saved: bool,
+    pub path: Option<String>,
 }
 
 /// 覆盖层最终放在屏幕哪里（全局逻辑坐标），以及要不要附带一句提示。
@@ -408,6 +496,10 @@ fn publish_view(app: &AppHandle, state: &CaptureState, view: CaptureView) {
         slot.notice = view.notice.clone();
         slot.stage = view.stage;
         slot.bounds = view.bounds;
+        slot.image_rect = view.image_rect;
+        slot.target_lang = view.target_lang.clone();
+        slot.revision = view.revision;
+        slot.scale = if view.scale.is_finite() && view.scale > 0.0 { view.scale } else { 1.0 };
     }
     let _ = app.emit("sense://capture-update", &view);
 }
@@ -415,6 +507,8 @@ fn publish_view(app: &AppHandle, state: &CaptureState, view: CaptureView) {
 #[tauri::command]
 pub fn close_overlay(app: AppHandle, state: State<'_, CaptureState>, generation: Option<u64>) {
     if try_cancel_generation(&state.generation, generation) {
+        state.translate_seq.fetch_add(1, Ordering::SeqCst);
+        reset_capture_snapshot(&state);
         close(&app, OVERLAY_WINDOW);
     }
 }
@@ -432,22 +526,305 @@ pub fn capture_blocks(app: AppHandle, state: State<'_, CaptureState>) -> Capture
         notice: snap.notice,
         stage: snap.stage,
         generation: state.generation.load(Ordering::SeqCst),
+        revision: snap.revision,
         bounds: snap.bounds,
+        image_rect: snap.image_rect,
+        has_image: snap.original_png.is_some(),
+        target_lang: snap.target_lang,
+        scale: if snap.scale.is_finite() && snap.scale > 0.0 { snap.scale } else { 1.0 },
     };
     // 覆盖层真的取到了什么，留一行日志：从访达启动时只能靠它复盘
     trace(
         &app,
         format!(
-            "overlay fetched gen={} stage={:?} bounds={:?} blocks={} error={:?} notice={:?}",
+            "overlay fetched gen={} rev={} stage={:?} bounds={:?} image_rect={:?} target={:?} blocks={} has_image={} error={:?} notice={:?}",
             view.generation,
+            view.revision,
             view.stage,
             view.bounds,
+            view.image_rect,
+            view.target_lang,
             view.blocks.len(),
+            view.has_image,
             view.error,
             view.notice
         ),
     );
     view
+}
+
+#[tauri::command]
+pub fn capture_original_image(state: State<'_, CaptureState>) -> Option<String> {
+    let png = state
+        .snapshot
+        .lock()
+        .ok()
+        .and_then(|slot| slot.original_png.clone())?;
+    Some(format!("data:image/png;base64,{}", base64_encode(&png)))
+}
+
+#[tauri::command]
+pub async fn retranslate_capture(
+    app: AppHandle,
+    state: State<'_, CaptureState>,
+    target_lang: String,
+) -> Result<(), String> {
+    let generation = state.generation.load(Ordering::SeqCst);
+    let my_seq = state.translate_seq.fetch_add(1, Ordering::SeqCst) + 1;
+    let (snap, next_rev) = {
+        let mut slot = state
+            .snapshot
+            .lock()
+            .map_err(|_| "截屏状态锁不可用".to_string())?;
+        if slot.raw_blocks.is_empty() {
+            return Err("没有可重新翻译的文本".to_string());
+        }
+        slot.revision = slot.revision.saturating_add(1).max(2);
+        (slot.clone(), slot.revision)
+    };
+    let has_image = snap.original_png.is_some();
+    let scale = if snap.scale.is_finite() && snap.scale > 0.0 { snap.scale } else { 1.0 };
+
+    let mut blocks = snap.raw_blocks.clone();
+    let (target, direction, mixed) = if target_lang == lang::AUTO {
+        capture_plan_with_mode(&blocks, lang::AUTO)
+            .ok_or_else(|| "选区里没有可翻译的文字".to_string())?
+    } else if let Some(chosen) = lang::lang_by_code(&target_lang) {
+        let m = snap.mixed || has_mixed_languages(&blocks);
+        let dir = if m {
+            protocol::Direction::Other
+        } else {
+            let sample: String = blocks.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join(" ");
+            match (lang::detect(&sample).lang.map(|l| l.code), chosen.name) {
+                (Some("zh"), "英文") => protocol::Direction::ToEnglish,
+                (Some("en"), "中文") => protocol::Direction::ToChinese,
+                _ => protocol::Direction::Other,
+            }
+        };
+        (chosen, dir, m)
+    } else {
+        return Err(format!("不支持的目标语言：{target_lang}"));
+    };
+    set_target_direction(&mut blocks, target);
+
+    let is_cancelled = || {
+        state.generation.load(Ordering::SeqCst) != generation
+            || state.translate_seq.load(Ordering::SeqCst) != my_seq
+    };
+    if is_cancelled() {
+        return Ok(());
+    }
+
+    let preview_bounds = snap
+        .bounds
+        .or_else(|| snap.image_rect.map(|r| OverlayBounds { w: r.w, h: r.h }))
+        .unwrap_or(OverlayBounds { w: 164.0, h: 40.0 });
+    publish_view(
+        &app,
+        &state,
+        CaptureView {
+            blocks: blocks.clone(),
+            error: None,
+            notice: None,
+            stage: CaptureStage::Translating,
+            generation,
+            revision: next_rev,
+            bounds: Some(preview_bounds),
+            image_rect: snap.image_rect,
+            has_image,
+            target_lang: Some(target.code.to_string()),
+            scale,
+        },
+    );
+
+    let tr_started = std::time::Instant::now();
+    let preview_ctx = Some((blocks.clone(), preview_bounds));
+    let translated = translate_blocks(
+        &app,
+        &state,
+        preview_ctx.as_ref().map(|(b, bounds)| (b.as_slice(), *bounds)),
+        snap.image_rect,
+        has_image,
+        scale,
+        &mut blocks,
+        target,
+        direction,
+        mixed,
+        Some(generation),
+        Some((my_seq, next_rev)),
+    )
+    .await;
+    if is_cancelled() {
+        return Ok(());
+    }
+    let translate_ms = tr_started.elapsed().as_millis();
+    let (failure, notice) = settle(translated.map(|s| s.notice), None);
+    trace(
+        &app,
+        format!(
+            "retranslate gen={generation} rev={next_rev} target={} mixed={mixed} translate_ms={translate_ms} error={failure:?} notice={notice:?}",
+            target.code
+        ),
+    );
+    publish_view(
+        &app,
+        &state,
+        CaptureView {
+            blocks,
+            error: failure,
+            notice,
+            stage: CaptureStage::Done,
+            generation,
+            revision: next_rev,
+            bounds: Some(preview_bounds),
+            image_rect: snap.image_rect,
+            has_image,
+            target_lang: Some(target.code.to_string()),
+            scale,
+        },
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn save_capture_image(
+    app: AppHandle,
+    state: State<'_, CaptureState>,
+    kind: String,
+    png_base64: Option<String>,
+) -> Result<SaveImageResult, String> {
+    let png_bytes: Vec<u8> = match kind.as_str() {
+        "original" if png_base64.is_none() => state
+            .snapshot
+            .lock()
+            .ok()
+            .and_then(|slot| slot.original_png.clone())
+            .map(|arc| (*arc).clone())
+            .ok_or_else(|| "当前截屏没有可保存的原图".to_string())?,
+        "original" | "original_annotated" | "translated" => {
+            let encoded = png_base64.ok_or_else(|| "缺少要保存的图片数据".to_string())?;
+            base64_decode(&encoded)?
+        }
+        other => return Err(format!("未知的保存类型：{other}")),
+    };
+    const PNG_MAGIC: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if !png_bytes.starts_with(PNG_MAGIC) {
+        return Err("图片格式不是有效的 PNG".to_string());
+    }
+
+    let default_name = match kind.as_str() {
+        "original" => "sense-original.png",
+        "original_annotated" => "sense-original-annotated.png",
+        _ => "sense-translated.png",
+    }
+    .to_string();
+
+    if let Some(dest) = crate::window::dev_value("SENSE_DEV_SAVE_PNG_TO") {
+        std::fs::write(&dest, &png_bytes).map_err(|err| format!("写入测试图片失败：{err}"))?;
+        trace(&app, format!("dev save_png kind={kind} bytes={} path={dest}", png_bytes.len()));
+        return Ok(SaveImageResult {
+            saved: true,
+            path: Some(dest),
+        });
+    }
+
+    let src_tmp = temp_png("save-src");
+    std::fs::write(&src_tmp, &png_bytes).map_err(|err| format!("准备待保存图片失败：{err}"))?;
+    let _src_guard = TempFileGuard(src_tmp.clone());
+
+    if let Some(overlay) = app.get_webview_window(OVERLAY_WINDOW) {
+        let _ = overlay.set_always_on_top(false);
+    }
+    let _top_guard = OverlayTopGuard(&app);
+
+    let binary = ocr_binary()?;
+    let (ok, stdout, stderr) = tauri::async_runtime::spawn_blocking(move || {
+        let mut command = Command::new(&binary);
+        command.arg("--save-png").arg(&src_tmp).arg(&default_name);
+        run_with_timeout(command, SAVE_TIMEOUT)
+    })
+    .await
+    .map_err(|err| format!("保存图片线程失败：{err}"))??;
+
+    if !ok {
+        let msg = String::from_utf8_lossy(&stderr).trim().to_string();
+        return Err(if msg.is_empty() {
+            "保存图片失败".to_string()
+        } else {
+            msg
+        });
+    }
+    let res: SaveImageResult =
+        serde_json::from_slice(&stdout).map_err(|err| format!("解析保存结果失败：{err}"))?;
+    trace(&app, format!("save_png kind={kind} saved={} path={:?}", res.saved, res.path));
+    Ok(res)
+}
+
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = *chunk.get(1).unwrap_or(&0) as usize;
+        let b2 = *chunk.get(2).unwrap_or(&0) as usize;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[(triple >> 18) & 0x3f] as char);
+        out.push(TABLE[(triple >> 12) & 0x3f] as char);
+        out.push(if chunk.len() > 1 { TABLE[(triple >> 6) & 0x3f] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[triple & 0x3f] as char } else { '=' });
+    }
+    out
+}
+
+fn base64_decode(raw: &str) -> Result<Vec<u8>, String> {
+    let trimmed = raw.trim();
+    let payload = trimmed
+        .strip_prefix("data:image/png;base64,")
+        .or_else(|| trimmed.split_once(";base64,").map(|(_, after)| after))
+        .unwrap_or(trimmed);
+    let mut vals = Vec::with_capacity(payload.len());
+    let mut pad = 0usize;
+    for b in payload.bytes() {
+        if b.is_ascii_whitespace() {
+            continue;
+        }
+        if b == b'=' {
+            pad += 1;
+            vals.push(0u8);
+            continue;
+        }
+        if pad > 0 {
+            return Err("无效的 base64 图片编码".to_string());
+        }
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return Err("无效的 base64 图片编码".to_string()),
+        };
+        vals.push(v);
+    }
+    if vals.len() % 4 != 0 || pad > 2 {
+        return Err("无效的 base64 图片编码".to_string());
+    }
+    let mut out = Vec::with_capacity((vals.len() / 4) * 3);
+    for (idx, chunk) in vals.chunks_exact(4).enumerate() {
+        let is_last = (idx + 1) * 4 == vals.len();
+        let triple = ((chunk[0] as u32) << 18)
+            | ((chunk[1] as u32) << 12)
+            | ((chunk[2] as u32) << 6)
+            | (chunk[3] as u32);
+        out.push(((triple >> 16) & 0xff) as u8);
+        if !is_last || pad < 2 {
+            out.push(((triple >> 8) & 0xff) as u8);
+        }
+        if !is_last || pad == 0 {
+            out.push((triple & 0xff) as u8);
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Deserialize)]
@@ -676,10 +1053,11 @@ fn run_capture_select_with(
     }
 }
 
-fn spawn_capture_sidecar() -> Result<Option<(Placement, Screen, PendingOcr)>, String> {
+fn spawn_capture_sidecar(capture_out: &Path) -> Result<Option<(Placement, Screen, PendingOcr)>, String> {
     let binary = ocr_binary()?;
     let mut command = Command::new(&binary);
     command.arg("--capture");
+    command.env("SENSE_OCR_CAPTURE_OUT", capture_out);
     run_capture_select_with(command, SELECT_TIMEOUT)
 }
 
@@ -703,6 +1081,7 @@ fn open_overlay_window(app: &AppHandle, x: f64, y: f64, w: f64, h: f64) -> Resul
 }
 
 /// 按最小尺寸扩窗并夹进当前屏幕，算出最终窗口外框与需要同步平移给 `blocks` 的补偿量。
+#[cfg(test)]
 fn fitted_overlay_frame(
     x: f64,
     y: f64,
@@ -727,6 +1106,66 @@ fn fitted_overlay_frame(
     }
 }
 
+/// 算带工具条与原生下拉浮层的覆盖层尺寸及原图在窗内的局部坐标；
+/// 从 Ocr 起即采用这一确定几何（零二次调窗竞态），`blocks` 与冻结图皆以 `image` 为原点对齐。
+fn compute_capture_window_frame(
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    screen_bounds: Option<(f64, f64, f64, f64)>,
+) -> CaptureWindowFrame {
+    let (sx, sy, sw, sh) = screen_bounds.unwrap_or((x - 500.0, y - 500.0, w + 1000.0, h + 1000.0));
+    let image_w = w.max(1.0).min(sw.max(1.0));
+    let image_h = h.max(1.0).min(sh.max(1.0));
+    let sel_x = x.clamp(sx, (sx + sw - image_w).max(sx));
+    let sel_y = y.clamp(sy, (sy + sh - image_h).max(sy));
+
+    let win_w = image_w.max(TOOLBAR_MIN_WIDTH.min(sw.max(image_w)));
+    let max_x = (sx + sw - win_w).max(sx);
+    let win_x = sel_x.clamp(sx, max_x);
+    let image_x = (sel_x - win_x).clamp(0.0, (win_w - image_w).max(0.0));
+
+    let extra_needed = if image_h < 220.0 {
+        TOOLBAR_EXTRA_SMALL
+    } else {
+        TOOLBAR_EXTRA_NORMAL
+    };
+    let space_below = ((sy + sh) - (sel_y + image_h)).max(0.0);
+    let space_above = (sel_y - sy).max(0.0);
+
+    let (win_y, win_h, image_y) = if space_below >= TOOLBAR_RESERVE {
+        let bottom_pad = space_below.min(extra_needed).max(TOOLBAR_RESERVE);
+        (sel_y, image_h + bottom_pad, 0.0)
+    } else if space_above >= TOOLBAR_RESERVE {
+        let top_pad = space_above.min(extra_needed).max(TOOLBAR_RESERVE);
+        let wy = (sel_y - top_pad).max(sy);
+        (wy, (sel_y - wy) + image_h, sel_y - wy)
+    } else {
+        let wy = sel_y;
+        let wh = image_h.max(TOOLBAR_RESERVE).min(sh.max(image_h));
+        (wy, wh, 0.0)
+    };
+
+    CaptureWindowFrame {
+        win: OverlayFrame {
+            win_x,
+            win_y,
+            win_w,
+            win_h,
+            shift_x: 0.0,
+            shift_y: 0.0,
+        },
+        image: ImageRect {
+            x: image_x,
+            y: image_y,
+            w: image_w,
+            h: image_h,
+        },
+    }
+}
+
+#[cfg(test)]
 fn shifted_blocks(blocks: &[Block], dx: f64, dy: f64) -> Vec<Block> {
     let mut out = blocks.to_vec();
     if dx.abs() > 0.0 || dy.abs() > 0.0 {
@@ -737,6 +1176,7 @@ fn shifted_blocks(blocks: &[Block], dx: f64, dy: f64) -> Vec<Block> {
     out
 }
 
+#[cfg(test)]
 fn same_overlay_frame(a: OverlayFrame, b: OverlayFrame) -> bool {
     (a.win_x - b.win_x).abs() <= 0.5
         && (a.win_y - b.win_y).abs() <= 0.5
@@ -744,37 +1184,23 @@ fn same_overlay_frame(a: OverlayFrame, b: OverlayFrame) -> bool {
         && (a.win_h - b.win_h).abs() <= 0.5
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum OverlayGeometryOp {
     SetSize(f64, f64),
     SetPosition(f64, f64),
 }
 
+#[cfg(test)]
 fn plan_overlay_geometry_ops(cur: OverlayFrame, next: OverlayFrame) -> Vec<OverlayGeometryOp> {
     if same_overlay_frame(next, cur) {
         return Vec::new();
     }
-    // 顺序不可颠倒，见 apply_overlay_frame
+    // 顺序不可颠倒：macOS AppKit setContentSize 锚定左下角，必须先设 size 再设 position
     vec![
         OverlayGeometryOp::SetSize(next.win_w, next.win_h),
         OverlayGeometryOp::SetPosition(next.win_x, next.win_y),
     ]
-}
-
-fn apply_overlay_frame(overlay: &tauri::WebviewWindow, cur: OverlayFrame, next: OverlayFrame) {
-    // 参照 window::apply_frame：macOS AppKit 的 [NSWindow setContentSize:] 锚定左下角 frame.origin 不变、
-    // 向上增减高度；而 tao 将 set_size 与 set_position 顺序异步派发到主队列 FIFO，因此必须先 set_size
-    // 再 set_position，才能让顶左坐标精确落在 (next.win_x, next.win_y)。
-    for op in plan_overlay_geometry_ops(cur, next) {
-        match op {
-            OverlayGeometryOp::SetSize(w, h) => {
-                let _ = overlay.set_size(tauri::LogicalSize::new(w, h));
-            }
-            OverlayGeometryOp::SetPosition(x, y) => {
-                let _ = overlay.set_position(tauri::LogicalPosition::new(x, y));
-            }
-        }
-    }
 }
 
 async fn read_overlay_logical_frame(overlay: &tauri::WebviewWindow) -> Option<(f64, f64, f64, f64)> {
@@ -814,6 +1240,8 @@ pub async fn start_capture(app: AppHandle, state: State<'_, CaptureState>) -> Re
     }
     let selecting = BusyGuard(&state.selecting);
     let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    state.translate_seq.fetch_add(1, Ordering::SeqCst);
+    reset_capture_snapshot(&state);
 
     // 上一次的译文窗口还在：先收掉并等它真的消失，否则会被冻结快照拍进去。
     if close_overlay_and_wait(&app).await {
@@ -838,8 +1266,11 @@ pub async fn start_capture(app: AppHandle, state: State<'_, CaptureState>) -> Re
         }
     });
 
+    let capture_out = temp_png("capture-orig");
+    let _orig_guard = TempFileGuard(capture_out.clone());
     let select_started = std::time::Instant::now();
-    let picked = tauri::async_runtime::spawn_blocking(spawn_capture_sidecar)
+    let capture_out_env = capture_out.clone();
+    let picked = tauri::async_runtime::spawn_blocking(move || spawn_capture_sidecar(&capture_out_env))
         .await
         .map_err(|err| format!("选区线程失败：{err}"))??;
     let select_ms = select_started.elapsed().as_millis();
@@ -862,15 +1293,12 @@ pub async fn start_capture(app: AppHandle, state: State<'_, CaptureState>) -> Re
         ),
     );
 
-    // 选框刚一松手就打开覆盖层显示「识别中…」，把热感延迟压到几乎为零；
-    // 很窄的单行选区在 Ocr 与 Translating 阶段保持放得下提示胶囊（164×40），到 Done 再贴回精确选区或告警框
-    let status_frame = fitted_overlay_frame(
+    // 选框刚一松手就按最终工具条布局一次开齐覆盖层并显示「识别中…」，全程零窗口二次缩放竞态
+    let capture_frame = compute_capture_window_frame(
         placement.x,
         placement.y,
         placement.w,
         placement.h,
-        STATUS_MIN_WIDTH,
-        STATUS_MIN_HEIGHT,
         screen.bounds,
     );
     publish_view(
@@ -882,10 +1310,24 @@ pub async fn start_capture(app: AppHandle, state: State<'_, CaptureState>) -> Re
             notice: None,
             stage: CaptureStage::Ocr,
             generation,
-            bounds: Some(OverlayBounds { w: status_frame.win_w, h: status_frame.win_h }),
+            revision: 1,
+            bounds: Some(OverlayBounds {
+                w: capture_frame.win.win_w,
+                h: capture_frame.win.win_h,
+            }),
+            image_rect: Some(capture_frame.image),
+            has_image: false,
+            target_lang: None,
+            scale: screen.scale,
         },
     );
-    if let Err(err) = open_overlay_window(&app, status_frame.win_x, status_frame.win_y, status_frame.win_w, status_frame.win_h) {
+    if let Err(err) = open_overlay_window(
+        &app,
+        capture_frame.win.win_x,
+        capture_frame.win.win_y,
+        capture_frame.win.win_w,
+        capture_frame.win.win_h,
+    ) {
         reset_capture_snapshot(&state);
         std::thread::spawn(move || pending.kill_and_reap());
         return Err(err);
@@ -920,8 +1362,17 @@ pub async fn start_capture(app: AppHandle, state: State<'_, CaptureState>) -> Re
         }
     };
 
-    // sidecar 已退出并释放激活态，把焦点拉回覆盖层；窗口仍维持 status_frame（Ocr 与 Translating 共用），
-    // 防止进入「翻译中…」前提前缩回窄选区导致状态胶囊被裁切
+    let original_png = std::fs::read(&capture_out)
+        .ok()
+        .filter(|bytes| bytes.starts_with(b"\x89PNG\r\n\x1a\n"))
+        .map(Arc::new);
+    if is_current(&state.generation, generation) {
+        if let Ok(mut slot) = state.snapshot.lock() {
+            slot.original_png = original_png.clone();
+        }
+    }
+
+    // sidecar 已退出并释放激活态，把焦点拉回覆盖层
     if let Some(overlay) = app.get_webview_window(OVERLAY_WINDOW) {
         let _ = overlay.set_focus();
     }
@@ -932,8 +1383,9 @@ pub async fn start_capture(app: AppHandle, state: State<'_, CaptureState>) -> Re
         placement,
         screen,
         lines,
+        original_png,
         Some(generation),
-        Some(status_frame),
+        Some(capture_frame),
         select_ms,
         ocr_ms,
     )
@@ -949,6 +1401,7 @@ pub async fn start_capture(app: AppHandle, state: State<'_, CaptureState>) -> Re
 
 /// 覆盖层要不要放大到能放下一条提示：翻译失败、位置不准，或所有块的译文都和原文一样
 /// （前端这时不画任何块，只给一条说明——选区再小也得让人读完）。
+#[cfg(test)]
 fn needs_alert_room(failure: &Option<String>, notice: &Option<String>, blocks: &[Block]) -> bool {
     failure.is_some() || notice.is_some() || (!blocks.is_empty() && blocks.iter().all(|block| block.unchanged))
 }
@@ -984,6 +1437,11 @@ pub async fn run_with_image(
         return Err("选区太小了".to_string());
     }
 
+    let original_png = std::fs::read(png)
+        .ok()
+        .filter(|bytes| bytes.starts_with(b"\x89PNG\r\n\x1a\n"))
+        .map(Arc::new);
+
     // OCR 最多会占 60 秒，放到阻塞线程里跑，别霸占异步运行时的工作线程
     let ocr_png = png.to_path_buf();
     let ocr_started = std::time::Instant::now();
@@ -994,7 +1452,7 @@ pub async fn run_with_image(
     let ocr_ms = ocr_started.elapsed().as_millis();
     let _ = std::fs::remove_file(png);
 
-    finish_capture_blocks(app, state, placement, screen, lines, generation, None, 0, ocr_ms).await
+    finish_capture_blocks(app, state, placement, screen, lines, original_png, generation, None, 0, ocr_ms).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1004,8 +1462,9 @@ async fn finish_capture_blocks(
     placement: Placement,
     screen: Screen,
     lines: Vec<OcrLine>,
+    original_png: Option<Arc<Vec<u8>>>,
     generation: Option<u64>,
-    open_frame: Option<OverlayFrame>,
+    open_capture: Option<CaptureWindowFrame>,
     select_ms: u128,
     ocr_ms: u128,
 ) -> Result<usize, String> {
@@ -1019,23 +1478,21 @@ async fn finish_capture_blocks(
     };
 
     let view_gen = generation.unwrap_or_else(|| state.generation.load(Ordering::SeqCst));
-    trace(app, format!("ocr lines={} ocr_ms={ocr_ms}", lines.len()));
+    let has_image = original_png.is_some();
+    trace(app, format!("ocr lines={} ocr_ms={ocr_ms} has_image={has_image}", lines.len()));
+    let capture_frame = open_capture.unwrap_or_else(|| compute_capture_window_frame(x, y, w, h, screen.bounds));
+
     if lines.is_empty() {
         if generation.is_some_and(superseded) {
             return Ok(0);
         }
-        if let Some(cur) = open_frame {
+        if open_capture.is_some() {
             if let Some(overlay) = app.get_webview_window(OVERLAY_WINDOW) {
-                let empty_frame = fitted_overlay_frame(
-                    x,
-                    y,
-                    w,
-                    h,
-                    ALERT_MIN_WIDTH,
-                    ALERT_MIN_HEIGHT,
-                    screen.bounds,
-                );
-                apply_overlay_frame(&overlay, cur, empty_frame);
+                if let Ok(mut slot) = state.snapshot.lock() {
+                    slot.raw_blocks = Vec::new();
+                    slot.original_png = original_png;
+                    slot.mixed = false;
+                }
                 publish_view(
                     app,
                     state,
@@ -1045,7 +1502,15 @@ async fn finish_capture_blocks(
                         notice: None,
                         stage: CaptureStage::Done,
                         generation: view_gen,
-                        bounds: Some(OverlayBounds { w: empty_frame.win_w, h: empty_frame.win_h }),
+                        revision: 1,
+                        bounds: Some(OverlayBounds {
+                            w: capture_frame.win.win_w,
+                            h: capture_frame.win.win_h,
+                        }),
+                        image_rect: Some(capture_frame.image),
+                        has_image,
+                        target_lang: None,
+                        scale: screen.scale,
                     },
                 );
                 let _ = overlay.set_focus();
@@ -1054,10 +1519,10 @@ async fn finish_capture_blocks(
                     app,
                     format!(
                         "done gen={view_gen} select_ms={select_ms} ocr_ms={ocr_ms} blocks=0 translated=0 empty=true target_win=({:.1},{:.1},{:.1}x{:.1}) actual_win={actual:?}",
-                        empty_frame.win_x,
-                        empty_frame.win_y,
-                        empty_frame.win_w,
-                        empty_frame.win_h,
+                        capture_frame.win.win_x,
+                        capture_frame.win.win_y,
+                        capture_frame.win.win_w,
+                        capture_frame.win.win_h,
                     ),
                 );
                 return Ok(0);
@@ -1067,20 +1532,40 @@ async fn finish_capture_blocks(
         return Err("选中的区域里没识别到文字。也可能是屏幕录制权限没给：系统设置 → 隐私与安全性 → 屏幕录制。".to_string());
     }
 
-    let mut blocks = merge_lines(&lines, screen.scale);
+    let raw_blocks = merge_lines(&lines, screen.scale);
+    let mut blocks = raw_blocks.clone();
     let mut telemetry_line = String::new();
+    let mut chosen_code: Option<String> = None;
+    let mut is_mixed = false;
+
+    if !generation.is_some_and(superseded) {
+        if let Ok(mut slot) = state.snapshot.lock() {
+            slot.original_png = original_png.clone();
+        }
+    }
+
+    let initial_seq = state.translate_seq.load(Ordering::SeqCst);
 
     // 翻译失败也把原文盖上去，至少让用户看到识别结果；
     // 但失败原因必须一起交给覆盖层，不能让原文冒充译文。
-    let (failure, notice) = match choose_target(&mut blocks, load_pref(app)) {
-        Some((target, direction)) => {
+    let (failure, notice) = match choose_target_with_mode(&mut blocks, load_pref(app)) {
+        Some((target, direction, mixed)) => {
+            is_mixed = mixed;
+            chosen_code = Some(target.code.to_string());
             if generation.is_some_and(superseded) {
                 return Ok(0);
             }
-            let preview_ctx = open_frame.map(|cur| {
-                let base = shifted_blocks(&blocks, cur.shift_x, cur.shift_y);
-                let bounds = OverlayBounds { w: cur.win_w, h: cur.win_h };
-                (base, bounds)
+            if let Ok(mut slot) = state.snapshot.lock() {
+                slot.raw_blocks = raw_blocks.clone();
+                slot.original_png = original_png.clone();
+                slot.mixed = mixed;
+            }
+            let preview_ctx = open_capture.map(|cf| {
+                let bounds = OverlayBounds {
+                    w: cf.win.win_w,
+                    h: cf.win.win_h,
+                };
+                (blocks.clone(), bounds)
             });
             if let Some((ref preview_base, preview_bounds)) = preview_ctx {
                 publish_view(
@@ -1092,7 +1577,12 @@ async fn finish_capture_blocks(
                         notice: notice.clone(),
                         stage: CaptureStage::Translating,
                         generation: view_gen,
+                        revision: 1,
                         bounds: Some(preview_bounds),
+                        image_rect: Some(capture_frame.image),
+                        has_image,
+                        target_lang: chosen_code.clone(),
+                        scale: screen.scale,
                     },
                 );
             }
@@ -1101,10 +1591,15 @@ async fn finish_capture_blocks(
                 app,
                 state,
                 preview_ctx.as_ref().map(|(base, bounds)| (base.as_slice(), *bounds)),
+                Some(capture_frame.image),
+                has_image,
+                screen.scale,
                 &mut blocks,
-                target.name,
+                target,
                 direction,
+                mixed,
                 generation,
+                Some((initial_seq, 1)),
             )
             .await;
             let translate_ms = tr_started.elapsed().as_millis();
@@ -1126,32 +1621,30 @@ async fn finish_capture_blocks(
         None => (Some("选区里没有可翻译的文字（只识别出数字或符号）".to_string()), notice),
     };
 
-    if generation.is_some_and(superseded) {
+    if generation.is_some_and(superseded) || state.translate_seq.load(Ordering::SeqCst) != initial_seq {
         return Ok(0);
     }
 
-    // 有失败、位置提示、或「译文全和原文一样」的提示时，覆盖层至少要放得下这条提示：
-    // 只框了一行字（比如一个版本号、一条命令）时选区太矮，提示会被截掉
-    let (min_w, min_h) = if needs_alert_room(&failure, &notice, &blocks) {
-        (ALERT_MIN_WIDTH, ALERT_MIN_HEIGHT)
-    } else {
-        (0.0, 0.0)
-    };
-    let final_frame = fitted_overlay_frame(x, y, w, h, min_w, min_h, screen.bounds);
-    for block in &mut blocks {
-        block.shift(final_frame.shift_x, final_frame.shift_y);
+    if let Ok(mut slot) = state.snapshot.lock() {
+        slot.raw_blocks = raw_blocks;
+        slot.original_png = original_png;
+        slot.mixed = is_mixed;
     }
 
     let done_summary = format!(
-        "done gen={view_gen} select_ms={select_ms} ocr_ms={ocr_ms} {telemetry_line} blocks={} translated={} error={:?} notice={:?} target_win=({:.1},{:.1},{:.1}x{:.1})",
+        "done gen={view_gen} select_ms={select_ms} ocr_ms={ocr_ms} mixed={is_mixed} target={chosen_code:?} {telemetry_line} blocks={} translated={} error={:?} notice={:?} target_win=({:.1},{:.1},{:.1}x{:.1}) image_rect=({:.1},{:.1},{:.1}x{:.1})",
         blocks.len(),
         blocks.iter().filter(|block| block.translated).count(),
         failure,
         notice,
-        final_frame.win_x,
-        final_frame.win_y,
-        final_frame.win_w,
-        final_frame.win_h,
+        capture_frame.win.win_x,
+        capture_frame.win.win_y,
+        capture_frame.win.win_w,
+        capture_frame.win.win_h,
+        capture_frame.image.x,
+        capture_frame.image.y,
+        capture_frame.image.w,
+        capture_frame.image.h,
     );
 
     let final_view = CaptureView {
@@ -1160,12 +1653,19 @@ async fn finish_capture_blocks(
         notice,
         stage: CaptureStage::Done,
         generation: view_gen,
-        bounds: Some(OverlayBounds { w: final_frame.win_w, h: final_frame.win_h }),
+        revision: 1,
+        bounds: Some(OverlayBounds {
+            w: capture_frame.win.win_w,
+            h: capture_frame.win.win_h,
+        }),
+        image_rect: Some(capture_frame.image),
+        has_image,
+        target_lang: chosen_code,
+        scale: screen.scale,
     };
 
-    if let Some(cur) = open_frame {
+    if open_capture.is_some() {
         if let Some(overlay) = app.get_webview_window(OVERLAY_WINDOW) {
-            apply_overlay_frame(&overlay, cur, final_frame);
             publish_view(app, state, final_view);
             let _ = overlay.set_focus();
             let actual = read_overlay_logical_frame(&overlay).await;
@@ -1182,7 +1682,13 @@ async fn finish_capture_blocks(
     }
 
     publish_view(app, state, final_view);
-    let overlay = open_overlay_window(app, final_frame.win_x, final_frame.win_y, final_frame.win_w, final_frame.win_h)?;
+    let overlay = open_overlay_window(
+        app,
+        capture_frame.win.win_x,
+        capture_frame.win.win_y,
+        capture_frame.win.win_w,
+        capture_frame.win.win_h,
+    )?;
     let actual = read_overlay_logical_frame(&overlay).await;
     trace(app, format!("{done_summary} actual_win={actual:?}"));
 
@@ -1270,6 +1776,7 @@ fn monitor_under_cursor(app: &AppHandle) -> Option<(tauri::Monitor, (f64, f64, f
 
 /// 窗口 (x, y, w, h) 要挪多少才能完全落在屏幕里：正数往左/往上挪，负数往右/往下挪。
 /// 比屏幕还大放不下时，优先贴住左上边。
+#[cfg(test)]
 fn shift_into(x: f64, y: f64, w: f64, h: f64, bounds: (f64, f64, f64, f64)) -> (f64, f64) {
     let (left, top, right, bottom) = bounds;
     let fitted_x = x.min(right - w).max(left);
@@ -1607,20 +2114,65 @@ fn capture_target(blocks: &[Block], pref: &str) -> Option<&'static Lang> {
 
 /// 定目标语言和对齐粗检的方向（`capture_plan`），并把目标语言的书写方向记到每一块上（`set_target_direction`）：覆盖层靠它给译文定方向。
 /// 正式流程（`run_with_image`）和测试都走这一个入口，两步不会被拆开。
+#[cfg(test)]
 fn choose_target(blocks: &mut [Block], pref: &str) -> Option<(&'static Lang, protocol::Direction)> {
-    let (target, direction) = capture_plan(blocks, pref)?;
-    set_target_direction(blocks, target);
-    Some((target, direction))
+    choose_target_with_mode(blocks, pref).map(|(target, direction, _)| (target, direction))
 }
 
-/// 目标语言，加上对齐粗检能不能用：粗检的长度比只量过「中文页 → 英文」和「英文页 → 中文」，
-/// 别的源 → 目标组合（法语 → 英文、日文 → 中文……）每个字符的权重不同，量不准，会把对齐的译文当错位，所以不检。
-/// 英文页只要识别为英文就算（拉丁字母没把握时默认就是英文，和以前一样）。
+fn choose_target_with_mode(
+    blocks: &mut [Block],
+    pref: &str,
+) -> Option<(&'static Lang, protocol::Direction, bool)> {
+    let (target, direction, mixed) = capture_plan_with_mode(blocks, pref)?;
+    set_target_direction(blocks, target);
+    Some((target, direction, mixed))
+}
+
+/// 识别截图里是否包含多种语言（尤其是中英混排、中文+日韩俄等，以及拉丁+非拉丁多语种）。
+/// 注意排除纯中文段落里夹少量产品缩写/图标字母（例如整段中文说明里只有 `SENSE`/`macOS`/`AI` 或单个菜单字母 `B`）。
+fn has_mixed_languages(blocks: &[Block]) -> bool {
+    let mut total_han = 0usize;
+    let mut total_latin = 0usize;
+    let mut total_other = 0usize;
+    let mut separate_foreign_block = false;
+    for block in blocks {
+        let c = lang::script_counts(&block.text);
+        total_han += c.han;
+        total_latin += c.latin;
+        total_other += c.other;
+        if c.han == 0 && (c.latin >= 4 || c.other >= 2) {
+            separate_foreign_block = true;
+        }
+    }
+    if total_han >= 1 {
+        return separate_foreign_block
+            || total_other >= 4
+            || (total_latin >= 4 && total_latin * 3 >= total_han);
+    }
+    total_latin >= 4 && total_other >= 4
+}
+
+#[cfg(test)]
 fn capture_plan(blocks: &[Block], pref: &str) -> Option<(&'static Lang, protocol::Direction)> {
+    capture_plan_with_mode(blocks, pref).map(|(target, direction, _)| (target, direction))
+}
+
+/// 目标语言、对齐粗检方向，以及是否为混排多语截图：
+/// 混排截图在 `auto` 模式下结合上下文语义默认统一译成中文；手选具体语种时直接尊重用户选择；
+/// 混排时不走纯中↔纯英长度比粗检，避免保留的中文块被当成错位。
+fn capture_plan_with_mode(
+    blocks: &[Block],
+    pref: &str,
+) -> Option<(&'static Lang, protocol::Direction, bool)> {
     let sample: String = blocks.iter().map(|block| block.text.as_str()).collect::<Vec<_>>().join(" ");
+    let mixed = has_mixed_languages(blocks);
     let plan = lang::plan(&sample, pref);
     if !plan.source.letters {
         return None;
+    }
+    if mixed {
+        let target = lang::lang_by_code(pref).unwrap_or_else(|| lang::lang_by_code("zh").expect("zh 语言存在"));
+        return Some((target, protocol::Direction::Other, true));
     }
     let source = plan.source.lang.map(|lang| lang.code);
     let direction = match (source, plan.target.name) {
@@ -1628,7 +2180,7 @@ fn capture_plan(blocks: &[Block], pref: &str) -> Option<(&'static Lang, protocol
         (Some("en"), "中文") => protocol::Direction::ToChinese,
         _ => protocol::Direction::Other,
     };
-    Some((plan.target, direction))
+    Some((plan.target, direction, false))
 }
 
 /// 截屏翻译的系统提示词。
@@ -1652,6 +2204,18 @@ fn capture_system_prompt(target: &str) -> String {
          4. 每条尽量简短，以适配原来的版面宽度。\n\
          5. 有的条目只是被折行或分栏拆开的半句话，或者只是一个符号、一个词：照样用它自己的编号单独翻译，\
          哪怕读起来不通顺，不要并进相邻的条目。"
+    )
+}
+
+fn capture_system_prompt_for(target: &str, mixed: bool) -> String {
+    let base = capture_system_prompt(target);
+    if !mixed {
+        return base;
+    }
+    format!(
+        "{base}\n\
+         6. 截图中可能同时包含多种语言：先结合整张截图的上下文语义自动识别所有语言，\
+         统一准确翻译成{target}；已经自然是{target}且无需改写的完整片段可保持原样。"
     )
 }
 
@@ -1759,14 +2323,20 @@ fn apply_previews(blocks: &mut [Block], previews: &[Option<String>]) {
 /// - `Ok(TranslateStats { notice: None, .. })`：全部译成；
 /// - `Ok(TranslateStats { notice: Some(话), .. })`：有的块没译成（原文原样留着，`translated` 仍为 false）；
 /// - `Err`：一块都没译成。
+#[allow(clippy::too_many_arguments)]
 async fn translate_blocks(
     app: &AppHandle,
     state: &CaptureState,
     preview: Option<(&[Block], OverlayBounds)>,
+    image_rect: Option<ImageRect>,
+    has_image: bool,
+    scale: f64,
     blocks: &mut [Block],
-    target: &str,
+    target: &Lang,
     direction: protocol::Direction,
+    mixed: bool,
     generation: Option<u64>,
+    retranslate: Option<(u64, u64)>,
 ) -> Result<TranslateStats, String> {
     let provider = provider_registry::active(app)?;
     let key = if provider.requires_key {
@@ -1779,7 +2349,7 @@ async fn translate_blocks(
         None
     };
 
-    let system = capture_system_prompt(target);
+    let system = capture_system_prompt_for(target.name, mixed);
     // 上下文由「整屏一起送 + 先通读再翻」的提示词保证，不靠思维链。
     // 实测开思考要多等 2–5 秒，换来的是翻译任务里几乎看不出的提升。
     let reasoning = provider_registry::reasoning_fields(&provider.id);
@@ -1791,6 +2361,7 @@ async fn translate_blocks(
     let ttft_min: Mutex<Option<u128>> = Mutex::new(None);
     let reasoning_total = AtomicUsize::new(0);
     let view_gen = generation.unwrap_or_else(|| state.generation.load(Ordering::SeqCst));
+    let view_rev = retranslate.map_or(1, |(_, rev)| rev);
 
     let ask = |user: String, want: Vec<usize>, allow_preview: bool| {
         let pre_ref = &previews;
@@ -1799,12 +2370,15 @@ async fn translate_blocks(
         let reasoning_ref_count = &reasoning_total;
         let system_ref = &system;
         async move {
-            let cancel_fn = || generation.is_some_and(|g| !is_current(&state.generation, g));
+            let cancel_fn = || {
+                generation.is_some_and(|g| !is_current(&state.generation, g))
+                    || retranslate.is_some_and(|(seq, _)| state.translate_seq.load(Ordering::SeqCst) != seq)
+            };
             if cancel_fn() {
                 return Err("已取消".to_string());
             }
             let cancel: Option<openai_compat::CancelCheck<'_>> =
-                generation.map(|_| &cancel_fn as openai_compat::CancelCheck<'_>);
+                generation.or(retranslate.map(|(seq, _)| seq)).map(|_| &cancel_fn as openai_compat::CancelCheck<'_>);
 
             let mut on_text = |acc: &str| {
                 let Some((base_blocks, preview_bounds)) = preview else { return };
@@ -1853,7 +2427,12 @@ async fn translate_blocks(
                             notice: None,
                             stage: CaptureStage::Translating,
                             generation: view_gen,
+                            revision: view_rev,
                             bounds: Some(preview_bounds),
+                            image_rect,
+                            has_image,
+                            target_lang: Some(target.code.to_string()),
+                            scale,
                         },
                     );
                 }
@@ -2624,8 +3203,8 @@ mod tests {
         for expected in ["新建任务", "设置与偏好", "Tasks", "Keychain"] {
             assert!(text.contains(expected), "识别结果里没有「{expected}」——中文截图要能读出来：\n{text}");
         }
-        // 方向：中文为主就译成英文。这正是「冒出汉字会把方向带偏」要守住的那个判断
-        assert_eq!(translate_target(&merge_lines(&lines, 1.0)), Some("英文"), "中文截图要译成英文：\n{text}");
+        // 中英混排截图：在 auto 模式下结合上下文语义默认统一译成中文
+        assert_eq!(translate_target(&merge_lines(&lines, 1.0)), Some("中文"), "中英混排截图默认要译成中文：\n{text}");
         // 逐词框：译文字号靠它反推，中文行现在也会走这条路。每个词都要有正的宽度、出现在它那一行里，加起来是整行的一部分
         let mut multi_word_lines = 0;
         for line in &lines {
@@ -4106,5 +4685,97 @@ mod tests {
         let ops_br = plan_overlay_geometry_ops(status_br, alert_br);
         assert_eq!(simulate_appkit(status_br, &ops_br), (1140.0, 816.0, 300.0, 84.0));
         assert_eq!(simulate_appkit(status_br, &[ops_br[1], ops_br[0]]).1, 772.0);
+    }
+
+    #[test]
+    fn mixed_language_detection_defaults_to_chinese_without_breaking_monolingual_zh() {
+        // 纯中文界面即使夹少量产品缩写 / 图标字母，仍算纯中文，auto 下译为英文
+        let zh_article = merge_lines(&article_lines(), 1.0);
+        assert!(!has_mixed_languages(&zh_article));
+        assert_eq!(capture_plan_with_mode(&zh_article, lang::AUTO).map(|(l, _, m)| (l.code, m)), Some(("en", false)));
+
+        let zh_icon = one_block("B 首页");
+        assert!(!has_mixed_languages(&zh_icon));
+        assert_eq!(capture_plan_with_mode(&zh_icon, lang::AUTO).map(|(l, _, m)| (l.code, m)), Some(("en", false)));
+
+        // 中英混排（哪怕汉字数量更多）：auto 与手选 zh 都必须统一译为中文，不触发英文↔中文比率误报
+        let mixed_cn_en = vec![
+            merge_lines(&[line("新建任务", 10.0, 10.0, 80.0, 20.0)], 1.0).remove(0),
+            merge_lines(&[line("Tasks (0)", 10.0, 40.0, 80.0, 20.0)], 1.0).remove(0),
+            merge_lines(&[line("API Key 只存放在 Keychain 里", 10.0, 70.0, 220.0, 20.0)], 1.0).remove(0),
+        ];
+        assert!(has_mixed_languages(&mixed_cn_en));
+        assert_eq!(
+            capture_plan_with_mode(&mixed_cn_en, lang::AUTO).map(|(l, d, m)| (l.code, d, m)),
+            Some(("zh", protocol::Direction::Other, true))
+        );
+        assert_eq!(
+            capture_plan_with_mode(&mixed_cn_en, "zh").map(|(l, _, m)| (l.code, m)),
+            Some(("zh", true))
+        );
+        assert_eq!(
+            capture_plan_with_mode(&mixed_cn_en, "ja").map(|(l, _, m)| (l.code, m)),
+            Some(("ja", true))
+        );
+
+        // 单行混排 & 中文+日文混排
+        let inline_mixed = one_block("遇到 Connection refused 错误，请检查防火墙端口配置并重试");
+        assert!(has_mixed_languages(&inline_mixed));
+        assert_eq!(capture_plan_with_mode(&inline_mixed, lang::AUTO).map(|(l, _, _)| l.code), Some("zh"));
+
+        let cn_ja_mixed = one_block("请确认の設定を確認してください，完成后再继续下一步操作");
+        assert!(has_mixed_languages(&cn_ja_mixed));
+        assert_eq!(capture_plan_with_mode(&cn_ja_mixed, lang::AUTO).map(|(l, _, _)| l.code), Some("zh"));
+
+        // 提示词仅在 mixed=true 时补充第 6 条，mixed=false 与黄金夹具完全一致
+        let plain_prompt = capture_system_prompt_for("中文", false);
+        assert_eq!(plain_prompt, capture_system_prompt("中文"));
+        assert!(!plain_prompt.contains("6. 截图中可能同时包含多种语言"));
+        let mixed_prompt = capture_system_prompt_for("中文", true);
+        assert!(mixed_prompt.contains("6. 截图中可能同时包含多种语言"));
+    }
+
+    #[test]
+    fn compute_capture_window_frame_keeps_image_aligned_and_leaves_room_for_toolbar() {
+        let bounds = Some((0.0, 0.0, 1440.0, 900.0));
+
+        // 1) 普通居中选区：工具条放下方，原图偏移 (0,0)
+        let normal = compute_capture_window_frame(200.0, 150.0, 600.0, 400.0, bounds);
+        assert_eq!(normal.win.win_x, 200.0);
+        assert_eq!(normal.win.win_y, 150.0);
+        assert_eq!(normal.win.win_w, 600.0);
+        assert_eq!(normal.image, ImageRect { x: 0.0, y: 0.0, w: 600.0, h: 400.0 });
+        assert!(normal.win.win_h >= 400.0 + TOOLBAR_RESERVE);
+
+        // 2) 贴右且极窄的 200×30 选区：窗口扩至 TOOLBAR_MIN_WIDTH 且左移不冲出屏幕，原图在窗内偏移精确贴回桌面 x=1220
+        let right_small = compute_capture_window_frame(1220.0, 200.0, 200.0, 30.0, bounds);
+        assert_eq!(right_small.win.win_w, TOOLBAR_MIN_WIDTH);
+        assert_eq!(right_small.win.win_x + right_small.win.win_w, 1440.0);
+        assert_eq!(right_small.win.win_x + right_small.image.x, 1220.0);
+        assert!(right_small.win.win_h >= 30.0 + TOOLBAR_EXTRA_SMALL);
+
+        // 3) 贴近屏幕底部（下面只剩 20px）：工具条自动翻到上方，原图桌面坐标保持 (200, 480)
+        let bottom_edge = compute_capture_window_frame(200.0, 480.0, 600.0, 400.0, bounds);
+        assert!(bottom_edge.image.y >= TOOLBAR_RESERVE);
+        assert_eq!(bottom_edge.win.win_y + bottom_edge.image.y, 480.0);
+        assert!(bottom_edge.win.win_y + bottom_edge.win.win_h <= 900.0);
+
+        // 4) 全屏选区：窗口不超出屏幕
+        let full = compute_capture_window_frame(0.0, 0.0, 1440.0, 900.0, bounds);
+        assert_eq!(full.win.win_x, 0.0);
+        assert_eq!(full.win.win_y, 0.0);
+        assert_eq!(full.win.win_w, 1440.0);
+        assert_eq!(full.win.win_h, 900.0);
+        assert_eq!(full.image, ImageRect { x: 0.0, y: 0.0, w: 1440.0, h: 900.0 });
+    }
+
+    #[test]
+    fn base64_encode_decode_roundtrip_and_rejects_invalid_payloads() {
+        let sample = b"\x89PNG\r\n\x1a\nhello sense capture!";
+        let encoded = base64_encode(sample);
+        assert_eq!(base64_decode(&encoded).unwrap(), sample);
+        assert_eq!(base64_decode(&format!("data:image/png;base64,{encoded}")).unwrap(), sample);
+        assert!(base64_decode("not!valid").is_err());
+        assert!(base64_decode("abc").is_err());
     }
 }

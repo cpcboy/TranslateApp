@@ -10,7 +10,33 @@ import { api, type Language, type LanguagePair } from "./ipc";
 export const AUTO = "auto";
 
 /** 「自动」的含义，写在选择器里，随时告诉用户默认怎么译 */
-export const AUTO_HINT = "自动：中文 → 英文，其它语言 → 中文";
+export const AUTO_HINT = "自动：中文 → 英文，混合语种及其它语言 → 中文";
+
+/** 截屏工具条语种表（与 `lang::LANGS` 22 种语言对齐，防止异步配置未到时无选项可用） */
+export const CAPTURE_LANGUAGES: Language[] = [
+  { code: "zh", name: "中文", native: "简体中文" },
+  { code: "zh-Hant", name: "繁体中文", native: "繁體中文" },
+  { code: "en", name: "英文", native: "English" },
+  { code: "ja", name: "日语", native: "日本語" },
+  { code: "ko", name: "韩语", native: "한국어" },
+  { code: "fr", name: "法语", native: "Français" },
+  { code: "de", name: "德语", native: "Deutsch" },
+  { code: "es", name: "西班牙语", native: "Español" },
+  { code: "pt", name: "葡萄牙语", native: "Português" },
+  { code: "it", name: "意大利语", native: "Italiano" },
+  { code: "ru", name: "俄语", native: "Русский" },
+  { code: "uk", name: "乌克兰语", native: "Українська" },
+  { code: "ar", name: "阿拉伯语", native: "العربية" },
+  { code: "he", name: "希伯来语", native: "עברית" },
+  { code: "th", name: "泰语", native: "ไทย" },
+  { code: "vi", name: "越南语", native: "Tiếng Việt" },
+  { code: "id", name: "印尼语", native: "Bahasa Indonesia" },
+  { code: "tr", name: "土耳其语", native: "Türkçe" },
+  { code: "hi", name: "印地语", native: "हिन्दी" },
+  { code: "nl", name: "荷兰语", native: "Nederlands" },
+  { code: "pl", name: "波兰语", native: "Polski" },
+  { code: "el", name: "希腊语", native: "Ελληνικά" },
+];
 
 /** 没把握时标题上写的话：不报一个可能是错的语种 */
 export const UNSURE_SOURCE = "自动识别";

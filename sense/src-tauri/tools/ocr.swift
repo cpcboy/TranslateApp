@@ -25,6 +25,7 @@ import AppKit
 import Foundation
 import ImageIO
 import NaturalLanguage
+import UniformTypeIdentifiers
 import Vision
 
 // MARK: - 像素分析
@@ -572,11 +573,16 @@ func pickRecognition<T>(chineseFirst: [T], englishFirst: [T], line: (T) -> PassL
     let lines = chineseFirst.map(line)
     let unexplained = lines.filter { hasChineseRun($0.text) && !isAllBoxLike($0.text) && !isExplainedByEnglishPass($0, englishFirst: english) }
     let strong = unexplained.contains { $0.confidence >= 0.5 }
+    // 长短混排截屏（如 11 行以上 "Search 搜索"）：即使英文片段能解释掉汉字，高置信度真词仍必须保留，
+    // 否则超过 shortSelectionLines 后整张图的汉字会被英文优先遍悄悄丢掉。
+    let strongRealWord = lines.contains { candidate in
+        hasChineseRun(candidate.text) && hasRealWord(candidate.text) && candidate.confidence >= 0.5
+    }
     let weak = unexplained.filter { $0.confidence < 0.5 }
-    var foundChinese = strong || (weak.count >= 6 && weak.reduce(0) { $0 + hanCount($1.text) } >= 20)
+    var foundChinese = strong || strongRealWord || (weak.count >= 6 && weak.reduce(0) { $0 + hanCount($1.text) } >= 20)
     if !foundChinese && lines.count <= shortSelectionLines {
         foundChinese = lines.contains { candidate in
-            hasChineseRun(candidate.text) && hasRealWord(candidate.text) && (candidate.confidence >= 0.5 || unexplained.contains(candidate))
+            hasChineseRun(candidate.text) && hasRealWord(candidate.text) && unexplained.contains(candidate)
         }
     }
     return foundChinese ? chineseFirst : englishFirst
@@ -992,7 +998,8 @@ func runSelfTest() -> Never {
     expectPick("短选区：方框读成的汉字不算词", zh: [pass("回回回", row, 0.3), pass("口众", rect(0.1, 0.7), 0.3)], en: [], chinese: false)
     expectPick("短选区：重复的字不算词（大大、次次）", zh: [pass("大大", row, 0.3), pass("次次", rect(0.1, 0.7), 0.3)], en: [], chinese: false)
     expectPick("短选区的上限：10 行带真词的中英混排", zh: rows(10, "Search 搜索", 0.5), en: rows(10, "Search", 1), chinese: true)
-    expectPick("超过短选区的上限：11 行带真词、被英文优先解释掉的 0.5 的行", zh: rows(11, "Search 搜索", 0.5), en: rows(11, "Search", 1), chinese: false)
+    expectPick("长选区：11 行带真词、置信度 0.5 的中英混排必须保留中文", zh: rows(11, "Search 搜索", 0.5), en: rows(11, "Search", 1), chinese: true)
+    expectPick("长选区：11 行 0.3 非真词被英文优先解释掉的星级乱码仍不切中文", zh: rows(11, "實責責次次 Search", 0.3), en: rows(11, "***** Search", 1), chinese: false)
 
     // 编辑距离容差（20%）、弱证据汉字数的边界（19 / 20）
     expectPick("英文出入刚好 20%（10 个字母错 2 个）：解释得了", zh: [pass("大實 Hello world", row, 0.5)], en: [pass("* Hexlo worxd", row)], chinese: false)
@@ -1760,6 +1767,26 @@ func runSelfTest() -> Never {
     check(bannerTopY(topSafeInset: 37) == 47, "刘海安全区为 37 时顶部提示条应下移到 y=47 避开刘海")
     check(bannerTopY(topSafeInset: 32) == 42, "刘海安全区为 32 时顶部提示条应下移到 y=42")
 
+    // writePNG -> loadCGImage 往返尺寸与像素自检
+    if let space = CGColorSpace(name: CGColorSpace.sRGB),
+       let ctx = CGContext(
+        data: nil, width: 16, height: 12, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+        bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+       ) {
+        ctx.setFillColor(red: 0.1, green: 0.8, blue: 0.2, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: 16, height: 12))
+        let tmpUrl = FileManager.default.temporaryDirectory.appendingPathComponent("sense-selftest-\(UUID().uuidString).png")
+        defer { try? FileManager.default.removeItem(at: tmpUrl) }
+        if let cg = ctx.makeImage(), writePNG(cgImage: cg, to: tmpUrl), let loaded = loadCGImage(fromFile: tmpUrl.path),
+           let raster = Raster(cgImage: loaded) {
+            let (r, g, b) = raster.rgb(8, 6)
+            check(loaded.width == 16 && loaded.height == 12 && g > 180 && r < 40 && b < 80,
+                  "writePNG 写盘再读回像素应保真，实际 \(loaded.width)x\(loaded.height) rgb=(\(r),\(g),\(b))")
+        } else {
+            check(false, "writePNG 自检读写失败")
+        }
+    }
+
     if failures.isEmpty {
         print("selftest ok")
         exit(0)
@@ -2056,6 +2083,14 @@ func loadCGImage(fromFile path: String) -> CGImage? {
         return nil
     }
     return CGImageSourceCreateImageAtIndex(src, 0, nil)
+}
+
+func writePNG(cgImage: CGImage, to url: URL) -> Bool {
+    guard let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) else {
+        return false
+    }
+    CGImageDestinationAddImage(dest, cgImage, nil)
+    return CGImageDestinationFinalize(dest)
 }
 
 /// 冻结单个显示器当前屏幕画面（先用 CGDisplayCreateImage 直取，取不到时退回 screencapture -x -R）。
@@ -2535,10 +2570,20 @@ final class CaptureCoordinator {
         ])
         let ocrStarted = Date()
         let env = self.environment
-        // 回到 runloop 立即把 orderOut 刷新给 WindowServer，同时在后台并发跑 Vision 识别，
+        let captureOut = env["SENSE_OCR_CAPTURE_OUT"]
+        // 回到 runloop 立即把 orderOut 刷新给 WindowServer，同时在后台并发跑 Vision 识别与 PNG 落盘，
         // 结果与 exit 切回主线程收尾，避免与 app.run() 并发退出
         DispatchQueue.global(qos: .userInitiated).async {
+            let pngGroup = DispatchGroup()
+            if let path = captureOut, !path.isEmpty {
+                pngGroup.enter()
+                DispatchQueue.global(qos: .userInitiated).async {
+                    _ = writePNG(cgImage: cropped, to: URL(fileURLWithPath: path))
+                    pngGroup.leave()
+                }
+            }
             let result = recognizeImage(cropped, startedAt: ocrStarted, environment: env)
+            pngGroup.wait()
             DispatchQueue.main.async {
                 switch result {
                 case .success(let lines):
@@ -2582,6 +2627,9 @@ func runCaptureMode(environment: [String: String]) -> Never {
             emitJsonLine(["event": "cancelled"])
             exit(0)
         }
+        if let captureOut = environment["SENSE_OCR_CAPTURE_OUT"], !captureOut.isEmpty {
+            _ = writePNG(cgImage: cropped, to: URL(fileURLWithPath: captureOut))
+        }
         emitJsonLine([
             "event": "selected",
             "x": sel.x,
@@ -2608,11 +2656,46 @@ func runCaptureMode(environment: [String: String]) -> Never {
     coordinator.start()
 }
 
+func runSavePngMode(sourcePath: String, defaultName: String) -> Never {
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: sourcePath)), !data.isEmpty else {
+        FileHandle.standardError.write("读不到要保存的图片\n".data(using: .utf8)!)
+        exit(2)
+    }
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    app.activate(ignoringOtherApps: true)
+
+    let panel = NSSavePanel()
+    panel.allowedContentTypes = [.png]
+    panel.canCreateDirectories = true
+    panel.isExtensionHidden = false
+    panel.title = "保存截图"
+    let baseName = defaultName.trimmingCharacters(in: .whitespacesAndNewlines)
+    let safeName = baseName.isEmpty ? "sense-capture.png" : (baseName.lowercased().hasSuffix(".png") ? baseName : "\(baseName).png")
+    panel.nameFieldStringValue = safeName
+
+    let result = panel.runModal()
+    guard result == .OK, let destUrl = panel.url else {
+        emitJsonLine(["saved": false])
+        exit(0)
+    }
+    let finalUrl = destUrl.pathExtension.lowercased() == "png" ? destUrl : destUrl.appendingPathExtension("png")
+    do {
+        try data.write(to: finalUrl, options: .atomic)
+        emitJsonLine(["saved": true, "path": finalUrl.path])
+        exit(0)
+    } catch {
+        FileHandle.standardError.write("保存图片失败：\(error.localizedDescription)\n".data(using: .utf8)!)
+        exit(2)
+    }
+}
+
 // MARK: - 入口
 
 let args = CommandLine.arguments
 if args.count >= 2 && args[1] == "--selftest" { runSelfTest() }
 if args.count >= 2 && args[1] == "--capture" { runCaptureMode(environment: ProcessInfo.processInfo.environment) }
+if args.count >= 4 && args[1] == "--save-png" { runSavePngMode(sourcePath: args[2], defaultName: args[3]) }
 
 /// 辅助程序启动的时刻：第三遍的期限从这里算起（Rust 那边的 60 秒也是从启动算起）
 let processStarted = Date()

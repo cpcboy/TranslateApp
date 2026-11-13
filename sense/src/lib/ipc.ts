@@ -110,6 +110,12 @@ export type CaptureStage = "ocr" | "translating" | "done";
 
 export type OverlayBounds = { w: number; h: number };
 
+export type ImageRect = { x: number; y: number; w: number; h: number };
+
+export type SaveImageKind = "original" | "original_annotated" | "translated";
+
+export type SaveImageResult = { saved: boolean; path: string | null };
+
 /**
  * 覆盖层的全部内容：翻译失败时 error 给出原因，blocks 里是识别出的原文；
  * notice 是翻译成功时要补充的一句话（比如译文没能对准原文的位置）。
@@ -120,7 +126,12 @@ export type CaptureView = {
   notice: string | null;
   stage?: CaptureStage;
   generation?: number;
+  revision?: number;
   bounds?: OverlayBounds | null;
+  image_rect?: ImageRect | null;
+  has_image?: boolean;
+  target_lang?: string | null;
+  scale?: number;
 };
 
 export type LookupArgs = {
@@ -178,6 +189,11 @@ export const api = {
     invoke<HotkeyView>("set_hotkey", { kind, spec }),
   startCapture: () => invoke<void>("start_capture"),
   captureBlocks: () => invoke<CaptureView>("capture_blocks"),
+  captureOriginalImage: () => invoke<string | null>("capture_original_image"),
+  retranslateCapture: (targetLang: string) =>
+    invoke<void>("retranslate_capture", { targetLang }),
+  saveCaptureImage: (kind: SaveImageKind, pngBase64?: string | null) =>
+    invoke<SaveImageResult>("save_capture_image", { kind, pngBase64: pngBase64 ?? null }),
   closeOverlay: (generation?: number) => invoke<void>("close_overlay", { generation: generation ?? null }),
   translateText: (text: string, requestId: string) =>
     invoke<LongTextResult>("translate_text", {

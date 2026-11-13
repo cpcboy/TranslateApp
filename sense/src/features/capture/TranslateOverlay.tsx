@@ -1,6 +1,27 @@
-import { Component, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { api, onCaptureUpdate, type CaptureStage, type CaptureView, type OverlayBlock, type OverlayBounds } from "../../lib/ipc";
+import { Component, useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
+import {
+  api,
+  onCaptureUpdate,
+  type CaptureStage,
+  type CaptureView,
+  type ImageRect,
+  type OverlayBlock,
+  type OverlayBounds,
+  type SaveImageKind,
+} from "../../lib/ipc";
+import {
+  ANNOTATION_COLORS,
+  ANNOTATION_SIZES,
+  clampPoint,
+  computeArrowHeadPoints,
+  isMeaningfulAnnotation,
+  normalizeRect,
+  type Annotation,
+  type AnnotationSize,
+  type AnnotationTool,
+} from "./captureAnnotations";
+import { renderCapturePngBase64 } from "./captureExport";
+import { CaptureToolbar, type ToolbarPopover } from "./CaptureToolbar";
 import { OVERLAY_FONT, createCanvasMeasure, plainPlan, planOverlay, sanitizeBlocks, type BlockPlan } from "./overlayLayout";
 
 const STAGE_ORDER: Record<CaptureStage, number> = { ocr: 0, translating: 1, done: 2 };
@@ -21,76 +42,172 @@ export function sanitizeBounds(raw: unknown): OverlayBounds | null {
   return null;
 }
 
+export function sanitizeImageRect(raw: unknown): ImageRect | null {
+  if (!raw || typeof raw !== "object") return null;
+  const c = raw as { x?: unknown; y?: unknown; w?: unknown; h?: unknown };
+  if (
+    typeof c.x === "number" &&
+    Number.isFinite(c.x) &&
+    c.x >= 0 &&
+    typeof c.y === "number" &&
+    Number.isFinite(c.y) &&
+    c.y >= 0 &&
+    typeof c.w === "number" &&
+    Number.isFinite(c.w) &&
+    c.w > 0 &&
+    typeof c.h === "number" &&
+    Number.isFinite(c.h) &&
+    c.h > 0
+  ) {
+    return { x: c.x, y: c.y, w: c.w, h: c.h };
+  }
+  return null;
+}
+
 /**
- * 译文覆盖层：窗口正好压在选区上，按 OCR 的位置逐块画出来。
- *
- * 用原文底下的底色盖住原文，译文写在原来的位置、用原文的字号和颜色——这就是「原位替换」。
- * 怎么排（字号怎么定、底色字色怎么取、放不下怎么办）都在 overlayLayout.ts。
- *
- * 结构分两层：外层 `TranslateOverlay` 只管「取数据 + 订阅流式进度 + Esc / 点击 / 失焦关闭」，自己几乎不算东西；
- * 里面的 `OverlayView`（排版、画层、提示条）包在错误边界里。渲染一旦抛出来，整棵树卸载，
- * 关闭用的处理器跟着没了，屏幕上就留下一个关不掉、看不见的透明置顶窗。
- * 所以画的部分出了错，最多退成一条带着译文的错误提示——关闭的处理器必须还在。
+ * 译文与标注覆盖层：在固定桌面选区上渲染冻结原图、原位译文块、钉钉风格标注层与悬浮工具条。
+ * 与旧版不同，截屏完成后用户可以在工具条内切换目标语言、对比原图、加颜色标记/箭头/文字、
+ * 分别保存未翻译原图或翻译后图片到本机，因此失焦或点击画布本身不会自动关窗，需点「关闭」或按 Esc 退出。
  */
 export function TranslateOverlay() {
   const [blocks, setBlocks] = useState<OverlayBlock[] | null>(null);
-  // 翻译失败的原因。有它时下面画的是识别出的原文，必须明说，不能让原文冒充译文
   const [error, setError] = useState<string | null>(null);
-  // 翻译成功了，但有话要说（比如没能确定选区位置，译文不一定对准原文）
   const [notice, setNotice] = useState<string | null>(null);
   const [stage, setStage] = useState<CaptureStage>("done");
   const [bounds, setBounds] = useState<OverlayBounds | null>(null);
+  const [imageRect, setImageRect] = useState<ImageRect | null>(null);
+  const [hasImage, setHasImage] = useState(false);
+  const [originalImageUrl, setOriginalImageUrl] = useState<string | null>(null);
+  const [targetLang, setTargetLang] = useState<string | null>(null);
+  const [scale, setScale] = useState(1);
   const [hint, setHint] = useState(true);
 
+  const [showOriginal, setShowOriginal] = useState(false);
+  const [retranslating, setRetranslating] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveToast, setSaveToast] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [openPopover, setOpenPopover] = useState<ToolbarPopover>("none");
+
+  const [activeTool, setActiveTool] = useState<AnnotationTool>("none");
+  const [activeColor, setActiveColor] = useState<string>(ANNOTATION_COLORS[0].hex);
+  const [activeSize, setActiveSize] = useState<AnnotationSize["id"]>("md");
+  const [annotations, setAnnotations] = useState<Annotation[]>([]);
+  const [draftAnnotation, setDraftAnnotation] = useState<Annotation | null>(null);
+  const [textDraft, setTextDraft] = useState<{ x: number; y: number; value: string } | null>(null);
+
+  const [viewport, setViewport] = useState(() => ({
+    w: typeof window !== "undefined" ? window.innerWidth : 0,
+    h: typeof window !== "undefined" ? window.innerHeight : 0,
+  }));
+
   const generationRef = useRef<number | undefined>(undefined);
+  const revisionRef = useRef<number>(0);
   const stageRef = useRef<CaptureStage>("ocr");
-  const boundsRef = useRef<OverlayBounds | null>(null);
-  const initializedRef = useRef(false);
-  const graceUntilRef = useRef<number>(Date.now() + 400);
+  const loadedImageGenRef = useRef<number | undefined>(undefined);
+  const stageElRef = useRef<HTMLDivElement | null>(null);
+  const openPopoverRef = useRef<ToolbarPopover>("none");
+  const textDraftRef = useRef<{ x: number; y: number; value: string } | null>(null);
+  const toastTimerRef = useRef<number | undefined>(undefined);
+
+  openPopoverRef.current = openPopover;
+  textDraftRef.current = textDraft;
+
+  const sizePreset = useMemo(
+    () => ANNOTATION_SIZES.find((item) => item.id === activeSize) ?? ANNOTATION_SIZES[1],
+    [activeSize],
+  );
+
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.addEventListener !== "function") return;
+    const onResize = () => setViewport({ w: window.innerWidth, h: window.innerHeight });
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
 
   useEffect(() => {
     let disposed = false;
     let sawPushEvent = false;
 
+    const loadOriginalForGen = (gen: number) => {
+      if (loadedImageGenRef.current === gen) return;
+      loadedImageGenRef.current = gen;
+      void api
+        .captureOriginalImage()
+        .then((url) => {
+          if (disposed || generationRef.current !== gen) return;
+          if (url) setOriginalImageUrl(url);
+        })
+        .catch(() => {
+          /* 取不到原图时仍保底显示译文块与工具条 */
+        });
+    };
+
     const applyView = (view: CaptureView, fromPush: boolean) => {
       if (disposed) return;
       if (fromPush) sawPushEvent = true;
       const incomingGen = typeof view?.generation === "number" ? view.generation : undefined;
+      const incomingRev = typeof view?.revision === "number" ? view.revision : 1;
       const incomingStage: CaptureStage = view?.stage ?? "done";
       const cleanBounds = sanitizeBounds(view?.bounds);
+      const cleanImageRect = sanitizeImageRect(view?.image_rect);
 
       if (initializedRef.current && incomingGen !== undefined && generationRef.current !== undefined) {
         if (incomingGen < generationRef.current) return;
         if (incomingGen === generationRef.current) {
-          if (STAGE_ORDER[incomingStage] < STAGE_ORDER[stageRef.current]) return;
-          if (!fromPush && sawPushEvent && STAGE_ORDER[incomingStage] <= STAGE_ORDER[stageRef.current]) {
-            return;
+          if (incomingRev < revisionRef.current) return;
+          if (incomingRev === revisionRef.current) {
+            if (STAGE_ORDER[incomingStage] < STAGE_ORDER[stageRef.current]) return;
+            if (!fromPush && sawPushEvent && STAGE_ORDER[incomingStage] <= STAGE_ORDER[stageRef.current]) {
+              return;
+            }
           }
         }
       }
 
       const genChanged = incomingGen !== undefined && incomingGen !== generationRef.current;
-      const stageChanged = !initializedRef.current || incomingStage !== stageRef.current;
-      const boundsChanged =
-        boundsRef.current?.w !== cleanBounds?.w || boundsRef.current?.h !== cleanBounds?.h;
       initializedRef.current = true;
       if (incomingGen !== undefined) generationRef.current = incomingGen;
-      if (genChanged || stageChanged || boundsChanged) {
-        stageRef.current = incomingStage;
-        boundsRef.current = cleanBounds;
-        graceUntilRef.current = Date.now() + 400;
+      revisionRef.current = incomingRev;
+      stageRef.current = incomingStage;
+
+      if (genChanged) {
+        loadedImageGenRef.current = undefined;
+        setOriginalImageUrl(null);
+        setAnnotations([]);
+        setDraftAnnotation(null);
+        setTextDraft(null);
+        setActiveTool("none");
+        setShowOriginal(false);
+        setOpenPopover("none");
+        setSaveToast(null);
+        setActionError(null);
       }
 
-      // IPC 边界上先清洗：后面就不用处处防 null。数据格式不对（不是数组）是错误，不能当成「没识别到文字」；
-      // 只是丢了几条不合格的，当提示说一声
       const { blocks: clean, problem } = sanitizeBlocks(view?.blocks);
       const malformed = !Array.isArray(view?.blocks);
       setStage(incomingStage);
       setBounds(cleanBounds);
+      setImageRect(cleanImageRect);
+      setHasImage(view?.has_image === true);
+      if (view?.target_lang !== undefined) {
+        setTargetLang(view.target_lang ?? null);
+      }
+      if (typeof view?.scale === "number" && Number.isFinite(view.scale) && view.scale > 0) {
+        setScale(view.scale);
+      }
       setBlocks(clean);
       setError(view?.error ?? (malformed ? problem : null));
       setNotice([view?.notice, malformed ? null : problem].filter(Boolean).join("；") || null);
+      if (incomingStage === "done") {
+        setRetranslating(false);
+      }
+      if (view?.has_image === true && incomingGen !== undefined) {
+        loadOriginalForGen(incomingGen);
+      }
     };
+
+    const initializedRef = { current: false };
 
     let unlistenUpdate: (() => void) | undefined;
     void onCaptureUpdate((view) => applyView(view, true)).then((fn) => {
@@ -108,60 +225,579 @@ export function TranslateOverlay() {
         if (disposed) return;
         initializedRef.current = true;
         stageRef.current = "done";
-        boundsRef.current = null;
-        graceUntilRef.current = Date.now() + 400;
         setStage("done");
         setBounds(null);
+        setImageRect(null);
         setBlocks([]);
         setError(String(err).replace(/^Error:\s*/, ""));
       });
 
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") void api.closeOverlay(generationRef.current);
+      if (event.key === "Escape") {
+        if (textDraftRef.current) {
+          setTextDraft(null);
+          return;
+        }
+        if (openPopoverRef.current !== "none") {
+          setOpenPopover("none");
+          return;
+        }
+        void api.closeOverlay(generationRef.current);
+        return;
+      }
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z") {
+        if (textDraftRef.current) return;
+        event.preventDefault();
+        setAnnotations((prev) => prev.slice(0, -1));
+      }
     };
     window.addEventListener("keydown", onKey);
     const timer = window.setTimeout(() => setHint(false), 2200);
-
-    // 点到别的窗口就收起来：否则这层一直浮在最上面，Esc 又发不到它；
-    // OCR 阶段以及阶段切换后的短暂重算/调窗宽限期内忽略失焦
-    let unlistenFocus: (() => void) | undefined;
-    void getCurrentWindow()
-      .onFocusChanged(({ payload }) => {
-        if (disposed || payload) return;
-        if (stageRef.current === "ocr") return;
-        if (Date.now() < graceUntilRef.current) return;
-        void api.closeOverlay(generationRef.current);
-      })
-      .then((fn) => {
-        if (disposed) {
-          fn();
-          return;
-        }
-        unlistenFocus = fn;
-      })
-      .catch(() => {
-        /* 拿不到焦点事件就退回只靠 Esc */
-      });
 
     return () => {
       disposed = true;
       window.removeEventListener("keydown", onKey);
       window.clearTimeout(timer);
+      if (toastTimerRef.current !== undefined) {
+        window.clearTimeout(toastTimerRef.current);
+      }
       unlistenUpdate?.();
-      unlistenFocus?.();
     };
   }, []);
+
+  const viewW = bounds?.w ?? (typeof window !== "undefined" ? window.innerWidth : viewport.w);
+  const viewH = bounds?.h ?? (typeof window !== "undefined" ? window.innerHeight : viewport.h);
+  const stageRect: ImageRect = useMemo(
+    () => imageRect ?? { x: 0, y: 0, w: viewW, h: viewH },
+    [imageRect, viewW, viewH],
+  );
+
+  const stagePlans = useMemo(() => {
+    if (!blocks) return [];
+    const targetBounds = { w: stageRect.w, h: stageRect.h };
+    try {
+      return planOverlay(blocks, createCanvasMeasure(), targetBounds);
+    } catch (err) {
+      console.error("[overlay] 排版出错，整屏按简单样式显示：", err);
+      return blocks.map((block) => plainPlan(block, targetBounds));
+    }
+  }, [blocks, stageRect.w, stageRect.h]);
+
+  const handleClose = useCallback(() => {
+    void api.closeOverlay(generationRef.current);
+  }, []);
+
+  const handleSelectLang = useCallback((code: string) => {
+    setActionError(null);
+    setShowOriginal(false);
+    setRetranslating(true);
+    void api
+      .retranslateCapture(code)
+      .catch((err) => {
+        setRetranslating(false);
+        setActionError(describeFailure(err));
+      });
+  }, []);
+
+  const showToast = useCallback((msg: string) => {
+    setSaveToast(msg);
+    if (toastTimerRef.current !== undefined) {
+      window.clearTimeout(toastTimerRef.current);
+    }
+    toastTimerRef.current = window.setTimeout(() => setSaveToast(null), 2600);
+  }, []);
+
+  const handleSave = useCallback(
+    async (kind: SaveImageKind) => {
+      if (saving) return;
+      setActionError(null);
+      setSaving(true);
+      try {
+        let payload: string | null = null;
+        if (kind !== "original") {
+          payload = await renderCapturePngBase64({
+            originalImageUrl,
+            stageWidth: stageRect.w,
+            stageHeight: stageRect.h,
+            scale,
+            includeTranslation: kind === "translated",
+            blocks: blocks ?? [],
+            plans: stagePlans,
+            annotations,
+          });
+        }
+        const res = await api.saveCaptureImage(kind, payload);
+        if (res.saved) {
+          showToast(kind === "translated" ? "已保存翻译后图片" : "已保存图片");
+        }
+      } catch (err) {
+        setActionError(describeFailure(err));
+      } finally {
+        setSaving(false);
+      }
+    },
+    [annotations, blocks, originalImageUrl, saving, scale, showToast, stagePlans, stageRect.h, stageRect.w],
+  );
+
+  const stageLocalPoint = useCallback(
+    (clientX: number, clientY: number) => {
+      const rect = stageElRef.current?.getBoundingClientRect();
+      if (!rect) return clampPoint({ x: clientX, y: clientY }, stageRect.w, stageRect.h);
+      return clampPoint({ x: clientX - rect.left, y: clientY - rect.top }, stageRect.w, stageRect.h);
+    },
+    [stageRect.h, stageRect.w],
+  );
+
+  const commitTextDraft = useCallback(() => {
+    setTextDraft((current) => {
+      if (!current) return null;
+      const trimmed = current.value.trim();
+      if (trimmed) {
+        setAnnotations((prev) => [
+          ...prev,
+          {
+            id: `ann-${Date.now()}-${prev.length}`,
+            kind: "text",
+            x: current.x,
+            y: current.y,
+            text: trimmed,
+            color: activeColor,
+            fontSize: sizePreset.fontSize,
+          },
+        ]);
+      }
+      return null;
+    });
+  }, [activeColor, sizePreset.fontSize]);
+
+  const handleStagePointerDown = useCallback(
+    (event: ReactPointerEvent<SVGSVGElement>) => {
+      if (event.button !== 0 || activeTool === "none") return;
+      event.stopPropagation();
+      setOpenPopover("none");
+
+      const pt = stageLocalPoint(event.clientX, event.clientY);
+      if (activeTool === "text") {
+        if (textDraftRef.current) {
+          commitTextDraft();
+        }
+        setTextDraft({ x: pt.x, y: pt.y, value: "" });
+        return;
+      }
+
+      event.currentTarget.setPointerCapture?.(event.pointerId);
+      const id = `ann-${Date.now()}`;
+      if (activeTool === "pen") {
+        setDraftAnnotation({
+          id,
+          kind: "pen",
+          points: [pt],
+          color: activeColor,
+          strokeWidth: sizePreset.strokeWidth,
+        });
+      } else {
+        setDraftAnnotation({
+          id,
+          kind: activeTool,
+          x1: pt.x,
+          y1: pt.y,
+          x2: pt.x,
+          y2: pt.y,
+          color: activeColor,
+          strokeWidth: sizePreset.strokeWidth,
+        });
+      }
+    },
+    [activeColor, activeTool, commitTextDraft, sizePreset.strokeWidth, stageLocalPoint],
+  );
+
+  const handleStagePointerMove = useCallback(
+    (event: ReactPointerEvent<SVGSVGElement>) => {
+      if (!draftAnnotation) return;
+      const pt = stageLocalPoint(event.clientX, event.clientY);
+      setDraftAnnotation((prev) => {
+        if (!prev) return null;
+        if (prev.kind === "pen") {
+          return { ...prev, points: [...prev.points, pt] };
+        }
+        if (prev.kind === "text") return prev;
+        return { ...prev, x2: pt.x, y2: pt.y };
+      });
+    },
+    [draftAnnotation, stageLocalPoint],
+  );
+
+  const finishDraft = useCallback(() => {
+    setDraftAnnotation((current) => {
+      if (current && isMeaningfulAnnotation(current)) {
+        setAnnotations((prev) => [...prev, current]);
+      }
+      return null;
+    });
+  }, []);
+
+  const spaceBelow = Math.max(0, viewH - (stageRect.y + stageRect.h));
+  const spaceAbove = Math.max(0, stageRect.y);
+  const toolbarDock =
+    spaceBelow >= 52 ? "bottom" : spaceAbove >= 52 ? "top" : "inside-bottom";
+  const toolbarTop =
+    toolbarDock === "bottom"
+      ? stageRect.y + stageRect.h + 8
+      : toolbarDock === "top"
+        ? Math.max(4, stageRect.y - 46)
+        : Math.max(8, viewH - 52);
+  const spaceBelowBar = Math.max(0, viewH - (toolbarTop + 40));
+  const spaceAboveBar = Math.max(0, toolbarTop);
+  const popoverUp =
+    toolbarDock === "inside-bottom" ||
+    (spaceBelowBar < 190 && spaceAboveBar >= spaceBelowBar);
+  const subbarAbove =
+    toolbarDock === "inside-bottom" || (spaceBelowBar < 40 && spaceAboveBar >= 40);
+  const popoverMaxHeight = Math.max(
+    108,
+    Math.min(220, (popoverUp ? spaceAboveBar : spaceBelowBar) - 10),
+  );
+
+  const chromeMinW = Math.max(stageRect.w, 300);
+  const chromeWidth = Math.min(viewW > 0 ? viewW : chromeMinW, chromeMinW);
+  const chromeLeft = Math.min(
+    stageRect.x,
+    Math.max(0, (viewW > 0 ? viewW : chromeMinW) - chromeWidth),
+  );
+  const chromeMinHeight = Math.max(
+    stageRect.h,
+    Math.min(Math.max(0, (viewH > 0 ? viewH : 84) - stageRect.y), 84),
+  );
+
+  const showToolbar = stage === "done" || retranslating;
 
   return (
     <div
       className="relative h-full w-full overflow-hidden"
       style={{ fontFamily: OVERLAY_FONT }}
-      onClick={() => void api.closeOverlay(generationRef.current)}
+      onClick={() => {
+        if (openPopover !== "none") setOpenPopover("none");
+      }}
     >
       <OverlayBoundary blocks={blocks}>
-        <OverlayView blocks={blocks} error={error} notice={notice} stage={stage} hint={hint} bounds={bounds} />
+        {/* 选区画布：冻结原图 + 原位译文层 + 钉钉标注 SVG 层共用同一原点 */}
+        <div
+          ref={stageElRef}
+          data-testid="capture-stage"
+          className="absolute overflow-hidden"
+          style={{
+            left: stageRect.x,
+            top: stageRect.y,
+            width: stageRect.w,
+            height: stageRect.h,
+          }}
+        >
+          {originalImageUrl && (
+            <img
+              src={originalImageUrl}
+              alt=""
+              draggable={false}
+              data-testid="capture-original-image"
+              className="pointer-events-none absolute inset-0 h-full w-full select-none object-fill"
+            />
+          )}
+
+          <OverlayView
+            blocks={blocks}
+            error={actionError ?? error}
+            notice={saveToast ?? notice}
+            stage={stage}
+            hint={hint}
+            bounds={{ w: stageRect.w, h: stageRect.h }}
+            hideTranslation={showOriginal}
+            hideFloatingEsc={showToolbar}
+            hideChrome
+          />
+
+          {(annotations.length > 0 || draftAnnotation !== null || activeTool !== "none") && (
+            <svg
+              data-testid="capture-annotations-svg"
+              width={stageRect.w}
+              height={stageRect.h}
+              viewBox={`0 0 ${stageRect.w} ${stageRect.h}`}
+              onPointerDown={handleStagePointerDown}
+              onPointerMove={handleStagePointerMove}
+              onPointerUp={finishDraft}
+              onPointerCancel={finishDraft}
+              className={`absolute inset-0 z-20 h-full w-full ${
+                activeTool === "none"
+                  ? "pointer-events-none"
+                  : activeTool === "text"
+                    ? "cursor-text"
+                    : "cursor-crosshair"
+              }`}
+            >
+              {annotations.map((item) => (
+                <AnnotationShape key={item.id} item={item} />
+              ))}
+              {draftAnnotation && <AnnotationShape item={draftAnnotation} />}
+            </svg>
+          )}
+
+          {textDraft && (() => {
+            const draftLines = textDraft.value.split("\n").length;
+            const rows = Math.min(5, Math.max(1, draftLines));
+            const lineH = Math.round(sizePreset.fontSize * 1.25);
+            return (
+              <textarea
+                data-testid="annotation-text-input"
+                autoFocus
+                rows={rows}
+                value={textDraft.value}
+                placeholder="输入文字"
+                onChange={(e) =>
+                  setTextDraft((prev) => (prev ? { ...prev, value: e.target.value } : null))
+                }
+                onBlur={commitTextDraft}
+                onKeyDown={(e) => {
+                  e.stopPropagation();
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    commitTextDraft();
+                  } else if (e.key === "Escape") {
+                    e.preventDefault();
+                    setTextDraft(null);
+                  }
+                }}
+                className="absolute z-30 min-w-[96px] resize-none rounded border border-white/75 bg-black/55 px-1.5 py-0.5 font-semibold leading-tight outline-none"
+                style={{
+                  left: Math.min(textDraft.x, Math.max(0, stageRect.w - 110)),
+                  top: Math.min(textDraft.y, Math.max(0, stageRect.h - 32 - (rows - 1) * lineH)),
+                  color: activeColor,
+                  fontSize: sizePreset.fontSize,
+                }}
+              />
+            );
+          })()}
+        </div>
+
+        <div
+          data-testid="capture-chrome"
+          className="pointer-events-none absolute z-10"
+          style={{
+            left: chromeLeft,
+            top: stageRect.y,
+            width: chromeWidth,
+            minHeight: chromeMinHeight,
+          }}
+        >
+          <OverlayChrome
+            blocks={blocks}
+            error={actionError ?? error}
+            notice={saveToast ?? notice}
+            stage={stage}
+            hint={hint}
+            hideTranslation={showOriginal}
+            hideFloatingEsc={showToolbar}
+          />
+        </div>
       </OverlayBoundary>
+
+      {showToolbar && (
+        <div
+          className="pointer-events-none absolute inset-x-1 z-30 flex justify-center"
+          style={{ top: toolbarTop }}
+        >
+          <CaptureToolbar
+            targetLang={targetLang}
+            retranslating={retranslating}
+            showOriginal={showOriginal}
+            onToggleOriginal={setShowOriginal}
+            onSelectLang={handleSelectLang}
+            activeTool={activeTool}
+            onSelectTool={setActiveTool}
+            activeColor={activeColor}
+            onSelectColor={setActiveColor}
+            activeSize={activeSize}
+            onSelectSize={setActiveSize}
+            annotationsCount={annotations.length}
+            onUndo={() => setAnnotations((prev) => prev.slice(0, -1))}
+            onSave={handleSave}
+            saving={saving}
+            hasImage={hasImage || !!originalImageUrl}
+            openPopover={openPopover}
+            onTogglePopover={setOpenPopover}
+            popoverUp={popoverUp}
+            subbarAbove={subbarAbove}
+            popoverMaxHeight={popoverMaxHeight}
+            onClose={handleClose}
+          />
+        </div>
+      )}
     </div>
+  );
+}
+
+function AnnotationShape({ item }: { item: Annotation }) {
+  if (item.kind === "rect") {
+    const r = normalizeRect(item.x1, item.y1, item.x2, item.y2);
+    return (
+      <rect
+        x={r.x}
+        y={r.y}
+        width={r.w}
+        height={r.h}
+        fill="none"
+        stroke={item.color}
+        strokeWidth={item.strokeWidth}
+      />
+    );
+  }
+  if (item.kind === "ellipse") {
+    const r = normalizeRect(item.x1, item.y1, item.x2, item.y2);
+    return (
+      <ellipse
+        cx={r.x + r.w / 2}
+        cy={r.y + r.h / 2}
+        rx={r.w / 2}
+        ry={r.h / 2}
+        fill="none"
+        stroke={item.color}
+        strokeWidth={item.strokeWidth}
+      />
+    );
+  }
+  if (item.kind === "arrow") {
+    const [tip, left, right] = computeArrowHeadPoints(
+      item.x1,
+      item.y1,
+      item.x2,
+      item.y2,
+      item.strokeWidth,
+    );
+    const baseMidX = (left.x + right.x) / 2;
+    const baseMidY = (left.y + right.y) / 2;
+    return (
+      <g>
+        <line
+          x1={item.x1}
+          y1={item.y1}
+          x2={baseMidX}
+          y2={baseMidY}
+          stroke={item.color}
+          strokeWidth={item.strokeWidth}
+          strokeLinecap="round"
+        />
+        <polygon
+          points={`${tip.x},${tip.y} ${left.x},${left.y} ${right.x},${right.y}`}
+          fill={item.color}
+        />
+      </g>
+    );
+  }
+  if (item.kind === "pen") {
+    const pts = item.points.map((p) => `${p.x},${p.y}`).join(" ");
+    return (
+      <polyline
+        points={pts}
+        fill="none"
+        stroke={item.color}
+        strokeWidth={item.strokeWidth}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    );
+  }
+  if (item.kind !== "text") return null;
+  const lineH = Math.round(item.fontSize * 1.25);
+  return (
+    <text
+      x={item.x}
+      y={item.y}
+      fill={item.color}
+      fontSize={item.fontSize}
+      fontWeight={600}
+      dominantBaseline="text-before-edge"
+      style={{ textShadow: "0 1px 2px rgba(0,0,0,0.45)" }}
+    >
+      {item.text.split("\n").map((line, idx) => (
+        <tspan key={idx} x={item.x} y={item.y + idx * lineH}>
+          {line}
+        </tspan>
+      ))}
+    </text>
+  );
+}
+
+export function OverlayChrome({
+  blocks,
+  error,
+  notice,
+  stage,
+  hint,
+  hideTranslation = false,
+  hideFloatingEsc = false,
+}: {
+  blocks: OverlayBlock[] | null;
+  error: string | null;
+  notice: string | null;
+  stage: CaptureStage;
+  hint: boolean;
+  hideTranslation?: boolean;
+  hideFloatingEsc?: boolean;
+}) {
+  const nothingToReplace = stage === "done" && isNothingToReplace(blocks);
+  const statusText = stage === "ocr" ? "识别中… · Esc 取消" : stage === "translating" && !error ? "翻译中… · Esc 取消" : null;
+
+  return (
+    <>
+      {statusText && (
+        <div
+          role="status"
+          className="pointer-events-none absolute left-2 top-2 z-10 whitespace-nowrap rounded-full bg-[rgba(14,14,18,0.9)] px-3 py-1 text-[12px] text-[#f6f3ed]"
+        >
+          {statusText}
+        </div>
+      )}
+
+      {nothingToReplace && !error && !hideTranslation && (
+        <div
+          role="status"
+          className="pointer-events-auto absolute inset-x-1 top-1 z-10 rounded bg-[rgba(14,14,18,0.95)] px-2.5 py-1.5 text-[12.5px] leading-snug text-[#f6f3ed]"
+        >
+          译文和原文一样，没有要替换的内容。点击关闭按钮或 Esc 退出。
+        </div>
+      )}
+
+      {stage === "done" && blocks !== null && blocks.length === 0 && !error && (
+        <div
+          role="status"
+          className="pointer-events-auto absolute inset-x-1 top-1 z-10 rounded bg-[rgba(14,14,18,0.95)] px-2.5 py-1.5 text-[12.5px] leading-snug text-[#f6f3ed]"
+        >
+          没识别到文字，仍可在工具条里标注或保存原图 · Esc 关闭
+        </div>
+      )}
+
+      {error && (
+        <div
+          role="alert"
+          className="pointer-events-auto absolute inset-x-1 top-1 z-10 max-h-[calc(100%-8px)] overflow-y-auto rounded border border-[rgba(255,107,74,0.6)] bg-[rgba(48,14,10,0.97)] px-2.5 py-1.5 text-[12.5px] leading-snug text-[#ffd8cc]"
+        >
+          翻译失败：{error.replace(/[。.\s]+$/, "")}。
+          {blocks && blocks.length > 0 ? "下面是识别出的原文，" : ""}可在工具条切换目标语言重试，或按 Esc 关闭。
+        </div>
+      )}
+
+      {notice && !error && (
+        <div
+          role="status"
+          className="pointer-events-auto absolute inset-x-1 bottom-1 z-10 max-h-[calc(100%-8px)] overflow-y-auto rounded border border-[rgba(240,180,94,0.6)] bg-[rgba(44,32,10,0.97)] px-2.5 py-1.5 text-[12.5px] leading-snug text-[#f6e3bd]"
+        >
+          {notice}
+        </div>
+      )}
+
+      {hint && !hideFloatingEsc && stage === "done" && !error && !notice && !nothingToReplace && blocks !== null && blocks.length > 0 && (
+        <div className="pointer-events-none absolute right-2 top-2 rounded-full bg-[rgba(14,14,18,0.9)] px-3 py-1 text-[12px] text-[#b0aaa1]">
+          Esc 关闭
+        </div>
+      )}
+    </>
   );
 }
 
@@ -173,6 +809,9 @@ export function OverlayView({
   stage,
   hint,
   bounds,
+  hideTranslation = false,
+  hideFloatingEsc = false,
+  hideChrome = false,
 }: {
   blocks: OverlayBlock[] | null;
   error: string | null;
@@ -180,6 +819,9 @@ export function OverlayView({
   stage: CaptureStage;
   hint: boolean;
   bounds?: OverlayBounds | null;
+  hideTranslation?: boolean;
+  hideFloatingEsc?: boolean;
+  hideChrome?: boolean;
 }) {
   const [viewport, setViewport] = useState(() => ({
     w: typeof window !== "undefined" ? window.innerWidth : 0,
@@ -196,76 +838,33 @@ export function OverlayView({
   const viewW = bounds?.w ?? (typeof window !== "undefined" ? window.innerWidth : viewport.w);
   const viewH = bounds?.h ?? (typeof window !== "undefined" ? window.innerHeight : viewport.h);
 
-  // 优先使用随 CaptureView 原子下发的目标尺寸 bounds（与 blocks 坐标严格同代），
-  // 退化到 window.innerWidth / innerHeight + resize 监听兜底
   const plans = useMemo(() => {
     if (!blocks) return [];
     const targetBounds = { w: viewW, h: viewH };
     try {
       return planOverlay(blocks, createCanvasMeasure(), targetBounds);
     } catch (err) {
-      // planOverlay 自己已经逐块兜住了；这是最后一道，整屏退回最简排版
       console.error("[overlay] 排版出错，整屏按简单样式显示：", err);
       return blocks.map((block) => plainPlan(block, targetBounds));
     }
   }, [blocks, viewW, viewH, viewport.w, viewport.h]);
-  const nothingToReplace = stage === "done" && isNothingToReplace(blocks);
-  const statusText = stage === "ocr" ? "识别中… · Esc 取消" : stage === "translating" && !error ? "翻译中… · Esc 取消" : null;
 
   return (
     <>
-      {blocks && <OverlayLayers blocks={blocks} plans={plans} pending={stage === "translating"} />}
-
-      {statusText && (
-        <div
-          role="status"
-          className="pointer-events-none absolute left-2 top-2 z-10 whitespace-nowrap rounded-full bg-[rgba(14,14,18,0.9)] px-3 py-1 text-[12px] text-[#f6f3ed]"
-        >
-          {statusText}
-        </div>
+      {blocks && !hideTranslation && (
+        <OverlayLayers blocks={blocks} plans={plans} pending={stage === "translating"} />
       )}
 
-      {nothingToReplace && !error && (
-        <div
-          role="status"
-          className="absolute inset-x-1 top-1 z-10 rounded bg-[rgba(14,14,18,0.95)] px-2.5 py-1.5 text-[12.5px] leading-snug text-[#f6f3ed]"
-        >
-          译文和原文一样，没有要替换的内容。点击或 Esc 关闭。
-        </div>
-      )}
-
-      {stage === "done" && blocks !== null && blocks.length === 0 && !error && (
-        <div
-          role="status"
-          className="absolute inset-x-1 top-1 z-10 rounded bg-[rgba(14,14,18,0.95)] px-2.5 py-1.5 text-[12.5px] leading-snug text-[#f6f3ed]"
-        >
-          没识别到文字 · 点击或 Esc 关闭
-        </div>
-      )}
-
-      {error && (
-        <div
-          role="alert"
-          className="absolute inset-x-1 top-1 z-10 max-h-[calc(100%-8px)] overflow-y-auto rounded border border-[rgba(255,107,74,0.6)] bg-[rgba(48,14,10,0.97)] px-2.5 py-1.5 text-[12.5px] leading-snug text-[#ffd8cc]"
-        >
-          翻译失败：{error.replace(/[。.\s]+$/, "")}。
-          {blocks && blocks.length > 0 ? "下面是识别出的原文，" : ""}点击或 Esc 关闭。
-        </div>
-      )}
-
-      {notice && !error && (
-        <div
-          role="status"
-          className="absolute inset-x-1 bottom-1 z-10 max-h-[calc(100%-8px)] overflow-y-auto rounded border border-[rgba(240,180,94,0.6)] bg-[rgba(44,32,10,0.97)] px-2.5 py-1.5 text-[12.5px] leading-snug text-[#f6e3bd]"
-        >
-          {notice}
-        </div>
-      )}
-
-      {hint && stage === "done" && !error && !notice && !nothingToReplace && blocks !== null && blocks.length > 0 && (
-        <div className="pointer-events-none absolute right-2 top-2 rounded-full bg-[rgba(14,14,18,0.9)] px-3 py-1 text-[12px] text-[#b0aaa1]">
-          Esc 关闭
-        </div>
+      {!hideChrome && (
+        <OverlayChrome
+          blocks={blocks}
+          error={error}
+          notice={notice}
+          stage={stage}
+          hint={hint}
+          hideTranslation={hideTranslation}
+          hideFloatingEsc={hideFloatingEsc}
+        />
       )}
     </>
   );
@@ -290,7 +889,7 @@ export function OverlayFallback({ blocks, failure }: { blocks: OverlayBlock[] | 
       role="alert"
       className="absolute inset-x-1 top-1 z-10 max-h-[calc(100%-8px)] overflow-y-auto rounded border border-[rgba(255,107,74,0.6)] bg-[rgba(48,14,10,0.97)] px-2.5 py-1.5 text-[12.5px] leading-snug text-[#ffd8cc]"
     >
-      没能原位显示译文：{failure}。{texts.length > 0 ? "下面是译文，" : ""}点击或 Esc 关闭。
+      没能原位显示译文：{failure}。{texts.length > 0 ? "下面是译文，" : ""}点击关闭按钮或 Esc 退出。
       {texts.map((text, index) => (
         <div key={index} className="mt-1 whitespace-pre-wrap text-[#f6f3ed]">
           {text}
@@ -335,9 +934,6 @@ export function isNothingToReplace(blocks: OverlayBlock[] | null): boolean {
 /**
  * 画层：先把所有原文盖住，再画译文——相邻两块的遮盖矩形不能压在对方的译文上。
  * 译文和原文一样的块不画，原来的像素一点不动（比用另一种字体照着再画一遍更像原文，粗体标题也不会被换成常规字重）。
- *
- * 一部分译成、一部分没译成（模型漏了几条）时，没译成的块画的是原文：压暗之外再加一道虚线下划线，
- * 用户一眼看得出是哪几块，不会把夹在译文里的原文当成译文。全都没译成时（失败提示已经说明）不加，整屏的虚线只是噪声。
  */
 export function OverlayLayers({
   blocks,
@@ -385,7 +981,6 @@ function CoverView({ plan }: { plan: BlockPlan }) {
 
 /**
  * 译文：一行一个元素，行已经折好了（见 `wrapText`），浏览器不再自己折，排出来才和预估的一致。
- * 没译成（失败时画的是识别出的原文）的稍微压暗一点，和顶部的失败提示一起，不让原文冒充译文。
  */
 function TextView({ plan, translated, flagUntranslated }: { plan: BlockPlan; translated: boolean; flagUntranslated: boolean }) {
   const flagged = !translated && flagUntranslated;
@@ -400,7 +995,6 @@ function TextView({ plan, translated, flagUntranslated }: { plan: BlockPlan; tra
       style={{
         left: plan.x,
         top: plan.y,
-        // 从右往左的原文：文字框的右边缘贴着 x，各行靠右
         transform: plan.anchor === "right" ? "translateX(-100%)" : undefined,
         textAlign: plan.anchor === "right" ? "right" : undefined,
         fontSize: plan.fontSize,
@@ -411,7 +1005,6 @@ function TextView({ plan, translated, flagUntranslated }: { plan: BlockPlan; tra
         ...(flagged ? { textDecoration: "underline dotted", textUnderlineOffset: 2 } : {}),
       }}
     >
-      {/* dir 由目标语言定（见 textDirection）：阿拉伯语、希伯来语的译文从右往左，括号、句点、夹着的英文才不会跑到错的一边；其余照旧从左往右 */}
       {plan.lines.map((line, index) => (
         <div key={index} dir={plan.dir} style={{ height: plan.lineHeight }}>
           {line}

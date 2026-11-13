@@ -194,6 +194,22 @@ impl Counts {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ScriptCounts {
+    pub han: usize,
+    pub latin: usize,
+    pub other: usize,
+}
+
+pub(crate) fn script_counts(text: &str) -> ScriptCounts {
+    let counts = Counts::of(text);
+    ScriptCounts {
+        han: counts.han,
+        latin: counts.latin,
+        other: counts.letters().saturating_sub(counts.han + counts.latin),
+    }
+}
+
 /// 引号、书名号、括号括起来的部分去掉之后剩下的文字（只看开头 `SCAN_CHARS` 个字符）。
 /// 没有配上对的开括号原样保留；`"` 开合同形，按先后配对。英文里的 `’` 是撇号，不当引号。
 fn outside_quotes(text: &str) -> String {

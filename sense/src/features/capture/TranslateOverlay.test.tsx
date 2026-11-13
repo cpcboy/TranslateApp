@@ -1,6 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { OverlayBlock } from "../../lib/ipc";
+import { CaptureToolbar } from "./CaptureToolbar";
 import { OverlayBoundary, OverlayFallback, OverlayLayers, OverlayView, describeFailure, isNothingToReplace } from "./TranslateOverlay";
 import type { BlockPlan } from "./overlayLayout";
 
@@ -212,7 +213,7 @@ describe("错误边界：画的部分出错时退成一条带着译文的提示�
     expect(html).toContain("下面是译文");
     expect(html).toContain("新建任务");
     expect(html).toContain("已计划");
-    expect(html).toContain("点击或 Esc 关闭");
+    expect(html).toContain("点击关闭按钮或 Esc 退出");
   });
 
   it("退路本身不会抛：blocks 是 null / 混着 null、数字、缺 text 的元素时也只是少列几条", () => {
@@ -279,11 +280,12 @@ describe("OverlayView 两阶段状态渲染", () => {
     expect(html).not.toContain("Esc 关闭");
   });
 
-  it("done 阶段：空块显示「没识别到文字 · 点击或 Esc 关闭」，有正常译文显示「Esc 关闭」", () => {
+  it("done 阶段：空块显示「没识别到文字」，有正常译文显示「Esc 关闭」；工具条接管时可隐藏译文与右上角提示", () => {
     const emptyHtml = withMockBrowser(() =>
       renderToStaticMarkup(<OverlayView blocks={[]} error={null} notice={null} stage="done" hint />),
     );
-    expect(emptyHtml).toContain("没识别到文字 · 点击或 Esc 关闭");
+    expect(emptyHtml).toContain("没识别到文字");
+    expect(emptyHtml).toContain("Esc 关闭");
 
     const doneHtml = withMockBrowser(() =>
       renderToStaticMarkup(<OverlayView blocks={[block({ text: "新建任务" })]} error={null} notice={null} stage="done" hint />),
@@ -292,6 +294,69 @@ describe("OverlayView 两阶段状态渲染", () => {
     expect(doneHtml).toContain("Esc 关闭");
     expect(doneHtml).not.toContain("识别中");
     expect(doneHtml).not.toContain("翻译中");
+
+    const rawOnlyHtml = withMockBrowser(() =>
+      renderToStaticMarkup(
+        <OverlayView
+          blocks={[block({ text: "新建任务" })]}
+          error={null}
+          notice={null}
+          stage="done"
+          hint
+          hideTranslation
+          hideFloatingEsc
+        />,
+      ),
+    );
+    expect(rawOnlyHtml).not.toContain("新建任务");
+    expect(rawOnlyHtml).not.toContain("Esc 关闭");
+  });
+
+  it("CaptureToolbar 渲染钉钉风格工具条、语言下拉、标注二级栏与存为图片菜单", () => {
+    const html = renderToStaticMarkup(
+      <CaptureToolbar
+        targetLang="zh"
+        retranslating={false}
+        showOriginal={false}
+        onToggleOriginal={() => {}}
+        onSelectLang={() => {}}
+        activeTool="arrow"
+        onSelectTool={() => {}}
+        activeColor="#ff3b30"
+        onSelectColor={() => {}}
+        activeSize="md"
+        onSelectSize={() => {}}
+        annotationsCount={1}
+        onUndo={() => {}}
+        onSave={() => {}}
+        saving={false}
+        hasImage
+        openPopover="save"
+        onTogglePopover={() => {}}
+        popoverUp={false}
+        subbarAbove={false}
+        onClose={() => {}}
+      />,
+    );
+    for (const label of [
+      "显示原文",
+      "显示结果",
+      "中文",
+      "矩形",
+      "椭圆",
+      "箭头",
+      "画笔",
+      "文字",
+      "撤销",
+      "存为图片",
+      "关闭",
+      "保存未翻译原图",
+      "保存带标注原图",
+      "保存翻译后图片",
+    ]) {
+      expect(html).toContain(label);
+    }
+    expect(html).toContain('data-testid="capture-subbar"');
   });
 
   it("携带 bounds 时不因 window.innerWidth 滞后而把右下角平移后的遮盖块裁成 0x0", () => {
