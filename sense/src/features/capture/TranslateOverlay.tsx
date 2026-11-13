@@ -1,9 +1,25 @@
 import { Component, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { api, onCaptureUpdate, type CaptureStage, type CaptureView, type OverlayBlock } from "../../lib/ipc";
+import { api, onCaptureUpdate, type CaptureStage, type CaptureView, type OverlayBlock, type OverlayBounds } from "../../lib/ipc";
 import { OVERLAY_FONT, createCanvasMeasure, plainPlan, planOverlay, sanitizeBlocks, type BlockPlan } from "./overlayLayout";
 
 const STAGE_ORDER: Record<CaptureStage, number> = { ocr: 0, translating: 1, done: 2 };
+
+export function sanitizeBounds(raw: unknown): OverlayBounds | null {
+  if (!raw || typeof raw !== "object") return null;
+  const candidate = raw as { w?: unknown; h?: unknown };
+  if (
+    typeof candidate.w === "number" &&
+    Number.isFinite(candidate.w) &&
+    candidate.w > 0 &&
+    typeof candidate.h === "number" &&
+    Number.isFinite(candidate.h) &&
+    candidate.h > 0
+  ) {
+    return { w: candidate.w, h: candidate.h };
+  }
+  return null;
+}
 
 /**
  * 译文覆盖层：窗口正好压在选区上，按 OCR 的位置逐块画出来。
@@ -23,38 +39,45 @@ export function TranslateOverlay() {
   // 翻译成功了，但有话要说（比如没能确定选区位置，译文不一定对准原文）
   const [notice, setNotice] = useState<string | null>(null);
   const [stage, setStage] = useState<CaptureStage>("done");
+  const [bounds, setBounds] = useState<OverlayBounds | null>(null);
   const [hint, setHint] = useState(true);
 
   const generationRef = useRef<number | undefined>(undefined);
   const stageRef = useRef<CaptureStage>("ocr");
+  const boundsRef = useRef<OverlayBounds | null>(null);
   const initializedRef = useRef(false);
   const graceUntilRef = useRef<number>(Date.now() + 400);
-  const sawPushEventRef = useRef(false);
 
   useEffect(() => {
     let disposed = false;
+    let sawPushEvent = false;
 
     const applyView = (view: CaptureView, fromPush: boolean) => {
       if (disposed) return;
-      if (fromPush) sawPushEventRef.current = true;
+      if (fromPush) sawPushEvent = true;
       const incomingGen = typeof view?.generation === "number" ? view.generation : undefined;
       const incomingStage: CaptureStage = view?.stage ?? "done";
+      const cleanBounds = sanitizeBounds(view?.bounds);
 
       if (initializedRef.current && incomingGen !== undefined && generationRef.current !== undefined) {
         if (incomingGen < generationRef.current) return;
         if (incomingGen === generationRef.current) {
           if (STAGE_ORDER[incomingStage] < STAGE_ORDER[stageRef.current]) return;
-          if (!fromPush && sawPushEventRef.current && STAGE_ORDER[incomingStage] <= STAGE_ORDER[stageRef.current]) {
+          if (!fromPush && sawPushEvent && STAGE_ORDER[incomingStage] <= STAGE_ORDER[stageRef.current]) {
             return;
           }
         }
       }
 
+      const genChanged = incomingGen !== undefined && incomingGen !== generationRef.current;
       const stageChanged = !initializedRef.current || incomingStage !== stageRef.current;
+      const boundsChanged =
+        boundsRef.current?.w !== cleanBounds?.w || boundsRef.current?.h !== cleanBounds?.h;
       initializedRef.current = true;
       if (incomingGen !== undefined) generationRef.current = incomingGen;
-      if (stageChanged) {
+      if (genChanged || stageChanged || boundsChanged) {
         stageRef.current = incomingStage;
+        boundsRef.current = cleanBounds;
         graceUntilRef.current = Date.now() + 400;
       }
 
@@ -63,6 +86,7 @@ export function TranslateOverlay() {
       const { blocks: clean, problem } = sanitizeBlocks(view?.blocks);
       const malformed = !Array.isArray(view?.blocks);
       setStage(incomingStage);
+      setBounds(cleanBounds);
       setBlocks(clean);
       setError(view?.error ?? (malformed ? problem : null));
       setNotice([view?.notice, malformed ? null : problem].filter(Boolean).join("；") || null);
@@ -84,7 +108,10 @@ export function TranslateOverlay() {
         if (disposed) return;
         initializedRef.current = true;
         stageRef.current = "done";
+        boundsRef.current = null;
+        graceUntilRef.current = Date.now() + 400;
         setStage("done");
+        setBounds(null);
         setBlocks([]);
         setError(String(err).replace(/^Error:\s*/, ""));
       });
@@ -132,7 +159,7 @@ export function TranslateOverlay() {
       onClick={() => void api.closeOverlay(generationRef.current)}
     >
       <OverlayBoundary blocks={blocks}>
-        <OverlayView blocks={blocks} error={error} notice={notice} stage={stage} hint={hint} />
+        <OverlayView blocks={blocks} error={error} notice={notice} stage={stage} hint={hint} bounds={bounds} />
       </OverlayBoundary>
     </div>
   );
@@ -145,25 +172,43 @@ export function OverlayView({
   notice,
   stage,
   hint,
+  bounds,
 }: {
   blocks: OverlayBlock[] | null;
   error: string | null;
   notice: string | null;
   stage: CaptureStage;
   hint: boolean;
+  bounds?: OverlayBounds | null;
 }) {
-  // 窗口正好压在选区上，innerWidth / innerHeight 就是选区的逻辑尺寸
+  const [viewport, setViewport] = useState(() => ({
+    w: typeof window !== "undefined" ? window.innerWidth : 0,
+    h: typeof window !== "undefined" ? window.innerHeight : 0,
+  }));
+
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.addEventListener !== "function") return;
+    const onResize = () => setViewport({ w: window.innerWidth, h: window.innerHeight });
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  const viewW = bounds?.w ?? (typeof window !== "undefined" ? window.innerWidth : viewport.w);
+  const viewH = bounds?.h ?? (typeof window !== "undefined" ? window.innerHeight : viewport.h);
+
+  // 优先使用随 CaptureView 原子下发的目标尺寸 bounds（与 blocks 坐标严格同代），
+  // 退化到 window.innerWidth / innerHeight + resize 监听兜底
   const plans = useMemo(() => {
     if (!blocks) return [];
-    const bounds = { w: window.innerWidth, h: window.innerHeight };
+    const targetBounds = { w: viewW, h: viewH };
     try {
-      return planOverlay(blocks, createCanvasMeasure(), bounds);
+      return planOverlay(blocks, createCanvasMeasure(), targetBounds);
     } catch (err) {
       // planOverlay 自己已经逐块兜住了；这是最后一道，整屏退回最简排版
       console.error("[overlay] 排版出错，整屏按简单样式显示：", err);
-      return blocks.map((block) => plainPlan(block, bounds));
+      return blocks.map((block) => plainPlan(block, targetBounds));
     }
-  }, [blocks]);
+  }, [blocks, viewW, viewH, viewport.w, viewport.h]);
   const nothingToReplace = stage === "done" && isNothingToReplace(blocks);
   const statusText = stage === "ocr" ? "识别中… · Esc 取消" : stage === "translating" && !error ? "翻译中… · Esc 取消" : null;
 
@@ -174,7 +219,7 @@ export function OverlayView({
       {statusText && (
         <div
           role="status"
-          className="pointer-events-none absolute left-2 top-2 z-10 rounded-full bg-[rgba(14,14,18,0.9)] px-3 py-1 text-[12px] text-[#f6f3ed]"
+          className="pointer-events-none absolute left-2 top-2 z-10 whitespace-nowrap rounded-full bg-[rgba(14,14,18,0.9)] px-3 py-1 text-[12px] text-[#f6f3ed]"
         >
           {statusText}
         </div>
@@ -190,8 +235,11 @@ export function OverlayView({
       )}
 
       {stage === "done" && blocks !== null && blocks.length === 0 && !error && (
-        <div className="absolute left-2 top-2 rounded bg-[rgba(14,14,18,0.95)] px-3 py-2 text-[13px] text-[#f6f3ed]">
-          没识别到文字
+        <div
+          role="status"
+          className="absolute inset-x-1 top-1 z-10 rounded bg-[rgba(14,14,18,0.95)] px-2.5 py-1.5 text-[12.5px] leading-snug text-[#f6f3ed]"
+        >
+          没识别到文字 · 点击或 Esc 关闭
         </div>
       )}
 

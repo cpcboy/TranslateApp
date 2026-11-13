@@ -234,10 +234,10 @@ describe("错误边界：画的部分出错时退成一条带着译文的提示�
   });
 });
 
-function withMockBrowser<T>(fn: () => T): T {
+function withMockBrowser<T>(fn: () => T, dims: { w: number; h: number } = { w: 800, h: 600 }): T {
   const prevWindow = (globalThis as Record<string, unknown>).window;
   const prevDocument = (globalThis as Record<string, unknown>).document;
-  (globalThis as Record<string, unknown>).window = { innerWidth: 800, innerHeight: 600 };
+  (globalThis as Record<string, unknown>).window = { innerWidth: dims.w, innerHeight: dims.h };
   (globalThis as Record<string, unknown>).document = { createElement: () => ({ getContext: () => null }) };
   try {
     return fn();
@@ -279,11 +279,11 @@ describe("OverlayView 两阶段状态渲染", () => {
     expect(html).not.toContain("Esc 关闭");
   });
 
-  it("done 阶段：空块显示「没识别到文字」，有正常译文显示「Esc 关闭」", () => {
+  it("done 阶段：空块显示「没识别到文字 · 点击或 Esc 关闭」，有正常译文显示「Esc 关闭」", () => {
     const emptyHtml = withMockBrowser(() =>
       renderToStaticMarkup(<OverlayView blocks={[]} error={null} notice={null} stage="done" hint />),
     );
-    expect(emptyHtml).toContain("没识别到文字");
+    expect(emptyHtml).toContain("没识别到文字 · 点击或 Esc 关闭");
 
     const doneHtml = withMockBrowser(() =>
       renderToStaticMarkup(<OverlayView blocks={[block({ text: "新建任务" })]} error={null} notice={null} stage="done" hint />),
@@ -292,5 +292,38 @@ describe("OverlayView 两阶段状态渲染", () => {
     expect(doneHtml).toContain("Esc 关闭");
     expect(doneHtml).not.toContain("识别中");
     expect(doneHtml).not.toContain("翻译中");
+  });
+
+  it("携带 bounds 时不因 window.innerWidth 滞后而把右下角平移后的遮盖块裁成 0x0", () => {
+    const shifted = block({
+      text: "Hello",
+      x: 222,
+      y: 64,
+      w: 60,
+      h: 16,
+      cover: { x: 220, y: 62, w: 64, h: 20 },
+      ink: { x: 222, y: 64, w: 58, h: 14 },
+    });
+    const html = withMockBrowser(
+      () =>
+        renderToStaticMarkup(
+          <OverlayView
+            blocks={[shifted]}
+            error="超时"
+            notice={null}
+            stage="done"
+            hint={false}
+            bounds={{ w: 300, h: 84 }}
+          />,
+        ),
+      { w: 80, h: 22 },
+    );
+    const coverStyle =
+      html.match(/<div[^>]*data-role="cover"[^>]*>/)?.[0]?.match(/style="([^"]+)"/)?.[1] ?? "";
+    expect(coverStyle).not.toBe("");
+    const widthPx = Number(coverStyle.match(/width:([\d.]+)px/)?.[1] ?? 0);
+    const heightPx = Number(coverStyle.match(/height:([\d.]+)px/)?.[1] ?? 0);
+    expect(widthPx).toBeGreaterThan(0);
+    expect(heightPx).toBeGreaterThan(0);
   });
 });

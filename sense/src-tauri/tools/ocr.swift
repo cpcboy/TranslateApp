@@ -1756,6 +1756,10 @@ func runSelfTest() -> Never {
         }
     }
 
+    check(bannerTopY(topSafeInset: 0) == 20, "刘海安全区为 0 时顶部提示条应位于 y=20")
+    check(bannerTopY(topSafeInset: 37) == 47, "刘海安全区为 37 时顶部提示条应下移到 y=47 避开刘海")
+    check(bannerTopY(topSafeInset: 32) == 42, "刘海安全区为 32 时顶部提示条应下移到 y=42")
+
     if failures.isEmpty {
         print("selftest ok")
         exit(0)
@@ -2095,6 +2099,10 @@ func prewarmVisionInBackground() {
     }
 }
 
+func bannerTopY(topSafeInset: CGFloat) -> CGFloat {
+    max(20, topSafeInset + 10)
+}
+
 final class SelectionWindow: NSWindow {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
@@ -2104,6 +2112,7 @@ final class FrozenSelectionView: NSView {
     private var frozenImage: NSImage?
     private var cgImage: CGImage?
     private let screenTopLeft: CGRect
+    private let topSafeInset: CGFloat
     private weak var coordinator: CaptureCoordinator?
     private var dragStart: CGPoint?
     private var dragCurrent: CGPoint?
@@ -2113,10 +2122,17 @@ final class FrozenSelectionView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override var acceptsFirstResponder: Bool { true }
 
-    init(frame: NSRect, cgImage: CGImage, screenTopLeft: CGRect, coordinator: CaptureCoordinator) {
+    init(
+        frame: NSRect,
+        cgImage: CGImage,
+        screenTopLeft: CGRect,
+        topSafeInset: CGFloat = 0,
+        coordinator: CaptureCoordinator
+    ) {
         self.cgImage = cgImage
         self.frozenImage = NSImage(cgImage: cgImage, size: frame.size)
         self.screenTopLeft = screenTopLeft
+        self.topSafeInset = topSafeInset
         self.coordinator = coordinator
         super.init(frame: frame)
     }
@@ -2204,7 +2220,7 @@ final class FrozenSelectionView: NSView {
         let padY: CGFloat = 6
         let pillW = size.width + padX * 2
         let pillH = size.height + padY * 2
-        let pill = CGRect(x: (bounds.width - pillW) / 2, y: 20, width: pillW, height: pillH)
+        let pill = CGRect(x: (bounds.width - pillW) / 2, y: bannerTopY(topSafeInset: topSafeInset), width: pillW, height: pillH)
         NSColor(white: 0.08, alpha: 0.86).setFill()
         NSBezierPath(roundedRect: pill, xRadius: pillH / 2, yRadius: pillH / 2).fill()
         (text as NSString).draw(at: CGPoint(x: pill.minX + padX, y: pill.minY + padY), withAttributes: attrs)
@@ -2271,11 +2287,18 @@ final class CaptureCoordinator {
     private var windows: [SelectionWindow] = []
     private var views: [FrozenSelectionView] = []
     private var eventMonitor: Any?
+    private var becomeActiveObserver: NSObjectProtocol?
     private var resignObserver: NSObjectProtocol?
+    private var workspaceActivateObserver: NSObjectProtocol?
+    private var retryActivateWork: DispatchWorkItem?
+    private var verifyActiveWork: DispatchWorkItem?
+    private var hasBecomeActive = false
+    private var focusStolenDuringStartup = false
     private var parentWatchdog: Timer?
     private var idleWatchdog: Timer?
     private var finished = false
     private let initialParentPid = getppid()
+    private let priorFrontPid = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
     private let environment: [String: String]
 
     init(environment: [String: String]) {
@@ -2326,6 +2349,7 @@ final class CaptureCoordinator {
                 frame: CGRect(origin: .zero, size: item.screen.frame.size),
                 cgImage: item.cg,
                 screenTopLeft: item.topLeft,
+                topSafeInset: item.screen.safeAreaInsets.top,
                 coordinator: self
             )
             win.contentView = view
@@ -2347,23 +2371,67 @@ final class CaptureCoordinator {
         NSCursor.crosshair.set()
 
         let launchedAt = Date()
+        hasBecomeActive = app.isActive
+        becomeActiveObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: app,
+            queue: .main
+        ) { [weak self] _ in
+            self?.hasBecomeActive = true
+        }
         resignObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didResignActiveNotification,
             object: app,
             queue: .main
         ) { [weak self] _ in
             guard let self = self, !self.finished else { return }
-            // 前 300ms 让 WindowServer 完成上一窗口失活与焦点交接；之后（如 Cmd+Tab/Spotlight）失活即刻退出冻屏
-            if Date().timeIntervalSince(launchedAt) >= 0.3 {
+            // 前 250ms 让 WindowServer 完成上一窗口失活与焦点交接；之后失活即刻退出冻屏
+            if Date().timeIntervalSince(launchedAt) >= 0.25 {
+                self.cancel()
+            } else {
+                self.focusStolenDuringStartup = true
+            }
+        }
+        workspaceActivateObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self = self, !self.finished else { return }
+            guard let running = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            let otherPid = running.processIdentifier
+            if otherPid == getpid() { return }
+            let elapsed = Date().timeIntervalSince(launchedAt)
+            if elapsed < 0.25 {
+                // 宿主调用 main.hide() 后、在 sidecar 真正拿到前台之前的瞬间，WindowServer 会短暂激活
+                // 原先的前台应用（priorFrontPid）或宿主本身（initialParentPid），不能误判成被抢焦点。
+                // 但一旦本进程已激活过，任何外部应用激活都视为真实切换。
+                if !self.hasBecomeActive && (otherPid == self.initialParentPid || otherPid == self.priorFrontPid) {
+                    return
+                }
+                self.focusStolenDuringStartup = true
+                return
+            }
+            self.cancel()
+        }
+        let retryWork = DispatchWorkItem { [weak self, weak keyWindow] in
+            guard let self = self, !self.finished else { return }
+            if !app.isActive && !self.focusStolenDuringStartup {
+                app.activate(ignoringOtherApps: true)
+                keyWindow?.makeKeyAndOrderFront(nil)
+            }
+        }
+        retryActivateWork = retryWork
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: retryWork)
+
+        let verifyWork = DispatchWorkItem { [weak self] in
+            guard let self = self, !self.finished else { return }
+            if self.focusStolenDuringStartup && !app.isActive {
                 self.cancel()
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-            guard let self = self, !self.finished else { return }
-            if !app.isActive {
-                app.activate(ignoringOtherApps: true)
-            }
-        }
+        verifyActiveWork = verifyWork
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.50, execute: verifyWork)
 
         eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .rightMouseDown]) { [weak self] event in
             guard let self = self else { return nil }
@@ -2398,13 +2466,25 @@ final class CaptureCoordinator {
     }
 
     private func teardownWindows() {
+        retryActivateWork?.cancel()
+        retryActivateWork = nil
+        verifyActiveWork?.cancel()
+        verifyActiveWork = nil
         parentWatchdog?.invalidate()
         parentWatchdog = nil
         idleWatchdog?.invalidate()
         idleWatchdog = nil
+        if let observer = becomeActiveObserver {
+            NotificationCenter.default.removeObserver(observer)
+            becomeActiveObserver = nil
+        }
         if let observer = resignObserver {
             NotificationCenter.default.removeObserver(observer)
             resignObserver = nil
+        }
+        if let observer = workspaceActivateObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+            workspaceActivateObserver = nil
         }
         if let monitor = eventMonitor {
             NSEvent.removeMonitor(monitor)
@@ -2509,6 +2589,9 @@ func runCaptureMode(environment: [String: String]) -> Never {
             "scale": sel.scale,
             "bounds": sel.bounds,
         ])
+        if let delayMs = environment["SENSE_OCR_TEST_CAPTURE_OCR_DELAY_MS"].flatMap(Double.init), delayMs > 0 {
+            Thread.sleep(forTimeInterval: min(delayMs, 5000) / 1000.0)
+        }
         switch recognizeImage(cropped, startedAt: Date(), environment: environment) {
         case .success(let lines):
             emitJsonLine(["event": "ocr", "lines": lines])

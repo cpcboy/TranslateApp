@@ -3,7 +3,7 @@
 //! DeepSeek / Qwen / OpenRouter / Ollama 都吃这一套，差别只在 base_url 与 model。
 
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -19,10 +19,13 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// 本地模型等响应头的时限（Ollama 冷加载大模型可能超过一两分钟）。
 const HEADERS_TIMEOUT: Duration = Duration::from_secs(180);
-/// 云端请求第 1 次等响应头的时限：超过 8 秒多半撞上连接池里的半死 HTTP/2 链接，立刻换新连接重连。
-const CLOUD_FIRST_HEADERS_TIMEOUT: Duration = Duration::from_secs(8);
-/// 云端请求换新连接重试后等响应头的时限：放宽到 45 秒以兼容高峰拥堵或长文排队。
-const CLOUD_RETRY_HEADERS_TIMEOUT: Duration = Duration::from_secs(45);
+/// 云端等响应头的单一时限：覆盖正常网络波动与较长 prefill/排队；不再用 8 秒短超时重发非幂等 POST。
+const CLOUD_HEADERS_TIMEOUT: Duration = Duration::from_secs(45);
+/// 连接池空闲淘汰窗口（20s）加 5s 余量：若系统刚休眠唤醒且仍落在这个窗口内，或预热失败，直接绕过连接池改走新连接。
+const POOL_BYPASS_WINDOW: Duration = Duration::from_secs(25);
+/// `Instant`（macOS `CLOCK_UPTIME_RAW`，休眠停表）与 `SystemTime` 差值超过 5 秒即判定经历过系统休眠。
+const SLEEP_WALL_DRIFT: Duration = Duration::from_secs(5);
+const POOL_HEALTH_TTL: Duration = Duration::from_secs(60 * 60);
 /// `NO_REASONING` 缓存条目有效期：避免某次异常 400 或网关临时波动让多日不关机的进程永久丢掉关思考参数。
 const NO_REASONING_TTL: Duration = Duration::from_secs(15 * 60);
 
@@ -146,21 +149,136 @@ pub fn is_bad_request(err: &ChatError) -> bool {
     matches!(err, ChatError::BadRequest(_))
 }
 
-/// 预热连接：只做 DNS + TCP + TLS 握手，不带 Key、不花 token。
+#[derive(Debug, Clone)]
+struct OriginHealth {
+    key: String,
+    last_ok_mono: Option<Instant>,
+    last_ok_wall: Option<SystemTime>,
+    bypass_until: Option<Instant>,
+}
+
+static POOL_HEALTH: Mutex<Vec<OriginHealth>> = Mutex::new(Vec::new());
+
+fn pool_origin_key(base_url: &str) -> String {
+    if let Ok(url) = reqwest::Url::parse(base_url.trim()) {
+        if let Some(host) = url.host_str() {
+            return format!(
+                "{}://{}:{}",
+                url.scheme(),
+                host,
+                url.port_or_known_default().unwrap_or(0)
+            );
+        }
+    }
+    base_url.trim().to_ascii_lowercase()
+}
+
+fn should_bypass_pool_at(entry: &OriginHealth, now_mono: Instant, now_wall: SystemTime) -> bool {
+    if entry.bypass_until.is_some_and(|until| now_mono < until) {
+        return true;
+    }
+    if let (Some(prev_mono), Some(prev_wall)) = (entry.last_ok_mono, entry.last_ok_wall) {
+        let mono_elapsed = now_mono.saturating_duration_since(prev_mono);
+        if mono_elapsed < POOL_BYPASS_WINDOW {
+            let wall_elapsed = now_wall.duration_since(prev_wall).unwrap_or(mono_elapsed);
+            if wall_elapsed > mono_elapsed + SLEEP_WALL_DRIFT {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn prune_pool_health(entries: &mut Vec<OriginHealth>, now_mono: Instant) {
+    entries.retain(|entry| {
+        let recent_ok = entry
+            .last_ok_mono
+            .is_some_and(|ts| now_mono.saturating_duration_since(ts) < POOL_HEALTH_TTL);
+        let active_bypass = entry.bypass_until.is_some_and(|until| now_mono < until);
+        recent_ok || active_bypass
+    });
+}
+
+fn should_bypass_pool(base_url: &str) -> bool {
+    let key = pool_origin_key(base_url);
+    let now_mono = Instant::now();
+    let now_wall = SystemTime::now();
+    let mut table = POOL_HEALTH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    prune_pool_health(&mut table, now_mono);
+    table
+        .iter()
+        .find(|entry| entry.key == key)
+        .is_some_and(|entry| should_bypass_pool_at(entry, now_mono, now_wall))
+}
+
+fn record_pool_probe(base_url: &str, ok: bool, now_mono: Instant, now_wall: SystemTime) {
+    let key = pool_origin_key(base_url);
+    let mut table = POOL_HEALTH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    prune_pool_health(&mut table, now_mono);
+    if let Some(entry) = table.iter_mut().find(|entry| entry.key == key) {
+        if ok {
+            entry.last_ok_mono = Some(now_mono);
+            entry.last_ok_wall = Some(now_wall);
+            entry.bypass_until = None;
+        } else {
+            entry.bypass_until = Some(now_mono + POOL_BYPASS_WINDOW);
+        }
+    } else {
+        table.push(if ok {
+            OriginHealth {
+                key,
+                last_ok_mono: Some(now_mono),
+                last_ok_wall: Some(now_wall),
+                bypass_until: None,
+            }
+        } else {
+            OriginHealth {
+                key,
+                last_ok_mono: None,
+                last_ok_wall: None,
+                bypass_until: Some(now_mono + POOL_BYPASS_WINDOW),
+            }
+        });
+    }
+}
+
+fn mark_pool_healthy(base_url: &str) {
+    record_pool_probe(base_url, true, Instant::now(), SystemTime::now());
+}
+
+fn mark_pool_suspect(base_url: &str) {
+    record_pool_probe(base_url, false, Instant::now(), SystemTime::now());
+}
+
+/// 预热连接：只做幂等的 `GET /models`（DNS + TCP + TLS 握手），不带 Key、不花 token。
 ///
 /// 不带 Key 时 `/models` 会回 401，但握手已经完成；后续 POST 直接复用连接池，
-/// 省掉首次查词 100–300ms 的建连时间。
+/// 省掉首次查词 100–300ms 的建连时间。若云端探活失败或超时，则标记该源站连接池可疑，
+/// 让即将到来的 POST 直接走无池新连接，避免撞上半死 socket。
 pub async fn warmup(client: &reqwest::Client, provider: &Provider) {
     let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
+    let is_cloud = !crate::is_loopback(&provider.base_url);
     // 必须把 body 读完：HTTP/1.1 下没读完的响应不能回池，连接会被关掉，
     // 那就只剩 DNS 预热，等于没做。
-    if let Ok(response) = client
+    let ok = match client
         .get(&url)
-        .timeout(Duration::from_secs(4))
+        .timeout(Duration::from_secs(3))
         .send()
         .await
     {
-        let _ = response.text().await;
+        Ok(response) => response.text().await.is_ok(),
+        Err(_) => false,
+    };
+    if is_cloud {
+        if ok {
+            mark_pool_healthy(&provider.base_url);
+        } else {
+            mark_pool_suspect(&provider.base_url);
+        }
     }
 }
 
@@ -168,11 +286,11 @@ pub async fn warmup(client: &reqwest::Client, provider: &Provider) {
 ///
 /// `on_delta` 收到的永远是「文本增量」，不是整包；解析失败的分片会被跳过
 /// 而不是中断整条流——模型偶尔会吐一个坏 JSON，没必要为此丢掉全部内容。
-fn header_policy(base_url: &str) -> (Duration, Duration, bool) {
+fn headers_timeout_for(base_url: &str) -> Duration {
     if !crate::is_loopback(base_url) {
-        (CLOUD_FIRST_HEADERS_TIMEOUT, CLOUD_RETRY_HEADERS_TIMEOUT, true)
+        CLOUD_HEADERS_TIMEOUT
     } else {
-        (HEADERS_TIMEOUT, HEADERS_TIMEOUT, false)
+        HEADERS_TIMEOUT
     }
 }
 
@@ -184,17 +302,15 @@ pub async fn stream_chat(
     on_delta: &mut (dyn FnMut(&str) + Send),
     cancel: Option<CancelCheck<'_>>,
 ) -> Result<ChatOutcome, ChatError> {
-    let (first_timeout, retry_timeout, retry_stale) = header_policy(&provider.base_url);
-    stream_chat_with_header_timeouts(
+    let timeout = headers_timeout_for(&provider.base_url);
+    stream_chat_with_headers_timeout(
         client,
         provider,
         api_key,
         body,
         on_delta,
         cancel,
-        first_timeout,
-        retry_timeout,
-        retry_stale,
+        timeout,
     )
     .await
 }
@@ -206,7 +322,7 @@ async fn send_headers_once(
     body: &Value,
     deadline: Duration,
     headers_timeout: Duration,
-) -> Result<reqwest::Response, ChatError> {
+) -> Result<reqwest::Response, (ChatError, bool)> {
     let mut request = client.post(url).json(body).timeout(deadline);
     if let Some(key) = api_key {
         request = request.bearer_auth(key);
@@ -214,28 +330,56 @@ async fn send_headers_once(
     tokio::time::timeout(headers_timeout, request.send())
         .await
         .map_err(|_| {
-            ChatError::Timeout(format!("{} 秒内服务端没有开始响应", headers_timeout.as_secs()))
+            (
+                ChatError::Timeout(format!("{} 秒内服务端没有开始响应", headers_timeout.as_secs())),
+                false,
+            )
         })?
         .map_err(|err| {
+            let is_connect = err.is_connect();
             if err.is_timeout() {
-                ChatError::Timeout("建立连接或等待服务端响应超时".to_string())
+                (
+                    ChatError::Timeout("建立连接或等待服务端响应超时".to_string()),
+                    false,
+                )
             } else {
-                ChatError::Network(err.to_string())
+                (ChatError::Network(err.to_string()), is_connect)
             }
         })
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn stream_chat_with_header_timeouts(
+async fn stream_chat_with_headers_timeout(
     client: &reqwest::Client,
     provider: &Provider,
     api_key: Option<&str>,
     body: &Value,
     on_delta: &mut (dyn FnMut(&str) + Send),
     cancel: Option<CancelCheck<'_>>,
-    first_headers_timeout: Duration,
-    retry_headers_timeout: Duration,
-    retry_stale_connection: bool,
+    headers_timeout: Duration,
+) -> Result<ChatOutcome, ChatError> {
+    let is_cloud = !crate::is_loopback(&provider.base_url);
+    stream_chat_with_options(
+        client,
+        provider,
+        api_key,
+        body,
+        on_delta,
+        cancel,
+        is_cloud,
+        headers_timeout,
+    )
+    .await
+}
+
+async fn stream_chat_with_options(
+    client: &reqwest::Client,
+    provider: &Provider,
+    api_key: Option<&str>,
+    body: &Value,
+    on_delta: &mut (dyn FnMut(&str) + Send),
+    cancel: Option<CancelCheck<'_>>,
+    is_cloud: bool,
+    headers_timeout: Duration,
 ) -> Result<ChatOutcome, ChatError> {
     let url = format!(
         "{}/chat/completions",
@@ -250,37 +394,42 @@ async fn stream_chat_with_header_timeouts(
     let deadline = stream_deadline(max_tokens);
 
     let started = Instant::now();
-    // 云端连接池如果拿到休眠前留下的半死 HTTP/2 socket，connect 不会报错、只会在等响应头时白等；
-    // 第 1 次短超时或断连（此时尚未收到任何响应头，完全幂等）立即换无池新连接重连一次。
+    let bypass_pool = is_cloud && should_bypass_pool(&provider.base_url);
+    let initial_client = if bypass_pool {
+        crate::fresh_client_for(&provider.base_url)
+    } else {
+        client
+    };
+
+    // 非幂等的 POST /chat/completions 只在「确认尚未发出请求体字节」的连接阶段失败（is_connect）时
+    // 切换无池新连接重试一次；绝不在等响应头超时时重发，避免慢 prefill / 高峰排队下双倍计费。
     let response = match send_headers_once(
-        client,
+        initial_client,
         &url,
         api_key,
         body,
         deadline,
-        first_headers_timeout,
+        headers_timeout,
     )
     .await
     {
-        Ok(resp) => resp,
-        Err(first_err)
-            if retry_stale_connection
-                && !cancel.is_some_and(|stopped| stopped())
-                && matches!(first_err, ChatError::Timeout(_) | ChatError::Network(_)) =>
-        {
-            eprintln!("[sense] 等待响应头超时或连接失效，换新连接重试一次");
-            let fresh = crate::fresh_client_for(&provider.base_url);
-            send_headers_once(
-                fresh,
-                &url,
-                api_key,
-                body,
-                deadline,
-                retry_headers_timeout,
-            )
-            .await?
+        Ok(resp) => {
+            if is_cloud && !bypass_pool {
+                mark_pool_healthy(&provider.base_url);
+            }
+            resp
         }
-        Err(err) => return Err(err),
+        Err((_first_err, true))
+            if is_cloud && !bypass_pool && !cancel.is_some_and(|stopped| stopped()) =>
+        {
+            mark_pool_suspect(&provider.base_url);
+            eprintln!("[sense] 连接建立失败（未发送请求体），换新连接重试一次");
+            let fresh = crate::fresh_client_for(&provider.base_url);
+            send_headers_once(fresh, &url, api_key, body, deadline, headers_timeout)
+                .await
+                .map_err(|(err, _)| err)?
+        }
+        Err((err, _)) => return Err(err),
     };
 
     let status = response.status();
@@ -470,7 +619,7 @@ fn remember_reasoning_rejected(provider: &Provider) {
     known.push((key, now));
 }
 
-/// 判断 400 错误体是否像「不认关思考字段」；瞬时 HTML 400 / 上下文限流之类偶发 400 不应永久记住。
+/// 判断 400 错误体是否像「不认关思考字段」；不能用 `"invalid"` 这类泛词，否则常见 JSON 报错（如 `invalid_request_error`）也会被误记成拒收思考字段。
 fn looks_like_reasoning_rejection(err: &ChatError, extra: &Value) -> bool {
     let ChatError::BadRequest(detail) = err else {
         return false;
@@ -482,15 +631,23 @@ fn looks_like_reasoning_rejection(err: &ChatError, extra: &Value) -> bool {
         }
     }
     [
-        "unknown",
-        "unrecognized",
-        "extra",
-        "unsupported",
-        "unexpected",
-        "invalid",
+        "reasoning",
+        "unknown field",
+        "unknown parameter",
+        "unknown argument",
+        "unrecognized field",
+        "unrecognized parameter",
+        "unrecognized request argument",
+        "unrecognized key",
+        "extra_forbidden",
+        "extra inputs",
+        "extra fields",
         "additional properties",
-        "not permitted",
-        "not allowed",
+        "unexpected field",
+        "unexpected parameter",
+        "unexpected property",
+        "unsupported field",
+        "unsupported parameter",
         "unpermitted",
     ]
     .iter()
@@ -939,7 +1096,7 @@ mod tests {
         let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
         let recorded = seen.clone();
         std::thread::spawn(move || {
-            for index in 0..3 {
+            for index in 0..5 {
                 let Ok((mut socket, _)) = listener.accept() else { return };
                 let request = read_request_text(&mut socket);
                 recorded.lock().unwrap().push(request);
@@ -949,6 +1106,16 @@ mod tests {
                     let _ = socket.write_all(
                         format!(
                             "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    );
+                } else if index == 3 {
+                    // 标准 OpenAI-compatible 泛错误：含 "invalid_request_error"，绝不能误判成「不认 thinking 字段」
+                    let body = r#"{"error":{"message":"upstream gateway glitch","type":"invalid_request_error"}}"#;
+                    let _ = socket.write_all(
+                        format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
                             body.len()
                         )
                         .as_bytes(),
@@ -968,49 +1135,118 @@ mod tests {
         });
         let base_url = format!("http://127.0.0.1:{port}/v1");
 
-        // 第一次请求虽靠重试成功，但错误体不是字段拒绝，不能毒化 NO_REASONING
+        // 第 1 次：HTML 400 虽靠重试成功，但不毒化 NO_REASONING
         let outcome = ask_adaptive(&base_url).await.expect("去掉字段重试当次仍应成功");
         assert_eq!(outcome.text, "ok");
-        // 第二次请求应当照旧带回 thinking:disabled
+        // 第 2 次应照旧带回 thinking
         ask_adaptive(&base_url).await.expect("第二次请求仍应成功");
+        // 第 3 次：JSON `invalid_request_error` 400 后重试成功，同样不能毒化 NO_REASONING
+        let outcome3 = ask_adaptive(&base_url).await.expect("去掉字段重试第三次也应成功");
+        assert_eq!(outcome3.text, "ok");
+        // 第 4 次（requests[5] 未发生因为第 3 次是 index 3 + index 4）——再验证纯判据与无毒化：
         let requests = seen.lock().unwrap();
-        assert_eq!(requests.len(), 3);
-        assert!(requests[2].contains("thinking"), "瞬时非字段 400 不能把 thinking 字段永久关掉");
+        assert_eq!(requests.len(), 5);
+        assert!(requests[2].contains("thinking"), "瞬时 HTML 400 不能把 thinking 字段永久关掉");
+        assert!(requests[3].contains("thinking"), "invalid_request_error 之前应带 thinking");
+
+        let extra = thinking_off();
+        assert!(looks_like_reasoning_rejection(&ChatError::BadRequest(r#"{"error":{"message":"unknown field 'thinking'"}}"#.into()), &extra));
+        assert!(looks_like_reasoning_rejection(&ChatError::BadRequest(r#"{"error":{"type":"extra_forbidden"}}"#.into()), &extra));
+        assert!(looks_like_reasoning_rejection(&ChatError::BadRequest(r#"{"error":{"message":"unrecognized request argument"}}"#.into()), &extra));
+        assert!(looks_like_reasoning_rejection(&ChatError::BadRequest(r#"{"error":{"message":"thinking is not supported for this model","type":"invalid_request_error"}}"#.into()), &extra));
+        assert!(!looks_like_reasoning_rejection(&ChatError::BadRequest(r#"{"error":{"message":"upstream gateway glitch","type":"invalid_request_error"}}"#.into()), &extra));
+        assert!(!looks_like_reasoning_rejection(&ChatError::BadRequest(r#"{"error":{"message":"context_length_exceeded","type":"invalid_request_error"}}"#.into()), &extra));
+        assert!(!looks_like_reasoning_rejection(&ChatError::BadRequest(r#"{"error":{"message":"extra quota needed"}}"#.into()), &extra));
     }
 
     #[tokio::test]
-    async fn stale_cloud_connection_switches_to_fresh_client_when_headers_stall() {
+    async fn openai_json_invalid_request_error_does_not_poison_no_reasoning_on_subsequent_call() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定端口");
+        let port = listener.local_addr().expect("取端口").port();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        std::thread::spawn(move || {
+            for index in 0..3 {
+                let Ok((mut socket, _)) = listener.accept() else { return };
+                let request = read_request_text(&mut socket);
+                recorded.lock().unwrap().push(request);
+                if index == 0 {
+                    let body = r#"{"error":{"message":"upstream gateway glitch","type":"invalid_request_error"}}"#;
+                    let _ = socket.write_all(
+                        format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    );
+                } else {
+                    let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+                    let _ = socket.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{payload}",
+                            payload.len()
+                        )
+                        .as_bytes(),
+                    );
+                }
+                let _ = socket.flush();
+            }
+        });
+        let base_url = format!("http://127.0.0.1:{port}/v1");
+
+        ask_adaptive(&base_url).await.expect("第一次 400 后重试应成功");
+        ask_adaptive(&base_url).await.expect("第二次应成功");
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].contains("thinking"), "通用 invalid_request_error 不能毒化 NO_REASONING 缓存");
+    }
+
+    #[tokio::test]
+    async fn slow_response_headers_do_not_resend_non_idempotent_post() {
         use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定端口");
         let port = listener.local_addr().expect("取端口").port();
         let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let accepted_ref = accepted.clone();
         std::thread::spawn(move || {
-            // 第一个连接假装半死 socket：读完请求后迟迟不发响应头
-            if let Ok((mut dead, _)) = listener.accept() {
+            // 连接 1：模拟模型长文 prefill / 排队，延迟 220ms 才开始吐响应头
+            if let Ok((mut slow, _)) = listener.accept() {
                 accepted_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                read_request(&mut dead);
-                std::thread::sleep(Duration::from_millis(450));
-            }
-            // 重试连接立刻正常回流
-            if let Ok((mut live, _)) = listener.accept() {
-                accepted_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                read_request(&mut live);
-                let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\ndata: [DONE]\n\n";
-                let _ = live.write_all(
+                read_request(&mut slow);
+                std::thread::sleep(Duration::from_millis(220));
+                let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+                let _ = slow.write_all(
                     format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{payload}",
                         payload.len()
                     )
                     .as_bytes(),
                 );
-                let _ = live.flush();
+                let _ = slow.flush();
+            }
+            // 连接 2：在宽限期内同样延迟 220ms 正常完成
+            if let Ok((mut slow2, _)) = listener.accept() {
+                accepted_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                read_request(&mut slow2);
+                std::thread::sleep(Duration::from_millis(220));
+                let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+                let _ = slow2.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{payload}",
+                        payload.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = slow2.flush();
             }
         });
         let base_url = format!("http://127.0.0.1:{port}/v1");
         let client = reqwest::Client::builder().no_proxy().build().expect("构建客户端");
         let body = build_body("m", "sys", "user", 0.3, None, 100);
-        let outcome = stream_chat_with_header_timeouts(
+
+        // 超过 headers_timeout(80ms) 时必须直接报超时，绝不重发第二个非幂等 POST
+        let err = stream_chat_with_headers_timeout(
             &client,
             &test_provider(&base_url),
             Some("test-key"),
@@ -1018,28 +1254,78 @@ mod tests {
             &mut |_| {},
             None,
             Duration::from_millis(80),
-            Duration::from_secs(2),
-            true,
         )
         .await
-        .expect("首条连接等待响应头超时后，应切新连接重试成功");
-        assert_eq!(outcome.text, "recovered");
+        .expect_err("等响应头超时后绝不能自动重发 POST");
+        assert!(matches!(err, ChatError::Timeout(_)), "应返回 Timeout，实际 {err:?}");
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1, "只能发出 1 次 POST，不能双倍计费");
+
+        // 宽限足够的 headers_timeout(600ms) 内 1 次 POST 完成
+        let ok = stream_chat_with_headers_timeout(
+            &client,
+            &test_provider(&base_url),
+            Some("test-key"),
+            &body,
+            &mut |_| {},
+            None,
+            Duration::from_millis(600),
+        )
+        .await
+        .expect("慢响应头在单一时限内应一次成功");
+        assert_eq!(ok.text, "ok");
         assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
-    fn header_policy_distinguishes_remote_gateways_from_loopback_regardless_of_api_key() {
+    fn pool_health_bypasses_pool_after_sleep_clock_jump_or_failed_probe() {
+        let mono0 = Instant::now();
+        let wall0 = SystemTime::now();
+        let healthy = OriginHealth {
+            key: "https://api.deepseek.com:443".to_string(),
+            last_ok_mono: Some(mono0),
+            last_ok_wall: Some(wall0),
+            bypass_until: None,
+        };
+        // 正常经过 2s：不绕过连接池
+        assert!(!should_bypass_pool_at(
+            &healthy,
+            mono0 + Duration::from_secs(2),
+            wall0 + Duration::from_secs(2)
+        ));
+        // 系统休眠：monotonic 只过 1s，wall clock 跳了 30s，且仍在 25s 池窗口内 -> 必须绕过
+        assert!(should_bypass_pool_at(
+            &healthy,
+            mono0 + Duration::from_secs(1),
+            wall0 + Duration::from_secs(30)
+        ));
+        // 若唤醒后连接池窗口已过（26s > 25s），HTTP 客户端自己会淘汰空闲连接 -> 无需绕过
+        assert!(!should_bypass_pool_at(
+            &healthy,
+            mono0 + Duration::from_secs(26),
+            wall0 + Duration::from_secs(55)
+        ));
+
+        // 探活失败标记 suspect，在窗口内绕过，窗口过后恢复
+        let url = "https://sleep-probe.example.com/v1";
+        record_pool_probe(url, false, mono0, wall0);
+        assert!(should_bypass_pool(url));
+        record_pool_probe(url, true, mono0, wall0);
+        assert!(!should_bypass_pool(url));
+    }
+
+    #[test]
+    fn headers_timeout_distinguishes_remote_gateways_from_loopback() {
         assert_eq!(
-            header_policy("https://api.deepseek.com/v1"),
-            (CLOUD_FIRST_HEADERS_TIMEOUT, CLOUD_RETRY_HEADERS_TIMEOUT, true)
+            headers_timeout_for("https://api.deepseek.com/v1"),
+            CLOUD_HEADERS_TIMEOUT
         );
         assert_eq!(
-            header_policy("http://127.0.0.1:11434/v1"),
-            (HEADERS_TIMEOUT, HEADERS_TIMEOUT, false)
+            headers_timeout_for("http://127.0.0.1:11434/v1"),
+            HEADERS_TIMEOUT
         );
         assert_eq!(
-            header_policy("http://localhost:11434/v1"),
-            (HEADERS_TIMEOUT, HEADERS_TIMEOUT, false)
+            headers_timeout_for("http://localhost:11434/v1"),
+            HEADERS_TIMEOUT
         );
     }
 
@@ -1083,5 +1369,74 @@ mod tests {
         assert_eq!(outcome.text, "ok");
         // 默认会吐思考链但又拒收 thinking 字段的中转站，在 TTL 内不应清缓存，否则下次会隔次再吃 400
         assert!(reasoning_rejected_before(&provider));
+    }
+
+    #[tokio::test]
+    async fn cloud_slow_response_headers_do_not_resend_non_idempotent_post() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定端口");
+        let port = listener.local_addr().expect("取端口").port();
+        let connections = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen_conn = connections.clone();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut socket, _)) = listener.accept() else { return };
+                seen_conn.fetch_add(1, Ordering::SeqCst);
+                let _ = read_request_text(&mut socket);
+                std::thread::sleep(Duration::from_millis(400));
+                let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\ndata: [DONE]\n\n";
+                let _ = socket.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{payload}",
+                        payload.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = socket.flush();
+            }
+        });
+
+        let provider = test_provider(&format!("http://127.0.0.1:{port}/v1"));
+        let client = reqwest::Client::builder().no_proxy().build().expect("构建客户端");
+        let body = build_body("m", "sys", "user", 0.3, None, 100);
+        let result = stream_chat_with_options(
+            &client,
+            &provider,
+            None,
+            &body,
+            &mut |_| {},
+            None,
+            true,
+            Duration::from_millis(120),
+        )
+        .await;
+        assert!(matches!(result, Err(ChatError::Timeout(_))), "云端等待响应头超时应直接报错：{result:?}");
+        assert_eq!(connections.load(Ordering::SeqCst), 1, "even with is_cloud=true, header timeout must never resend non-idempotent POST");
+    }
+
+    #[tokio::test]
+    async fn cloud_connect_failure_retries_once_and_marks_pool_suspect() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定端口");
+        let port = listener.local_addr().expect("取端口").port();
+        drop(listener);
+
+        let provider = test_provider(&format!("http://127.0.0.1:{port}/v1"));
+        assert!(!should_bypass_pool(&provider.base_url));
+        let client = reqwest::Client::builder().no_proxy().build().expect("构建客户端");
+        let body = build_body("m", "sys", "user", 0.3, None, 100);
+        let result = stream_chat_with_options(
+            &client,
+            &provider,
+            None,
+            &body,
+            &mut |_| {},
+            None,
+            true,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(matches!(result, Err(ChatError::Network(_))), "连接失败应返回 Network：{result:?}");
+        assert!(should_bypass_pool(&provider.base_url), "is_connect 失败重试后应标记连接池 suspect");
     }
 }

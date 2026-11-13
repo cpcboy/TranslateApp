@@ -108,6 +108,8 @@ export type OverlayBlock = {
 
 export type CaptureStage = "ocr" | "translating" | "done";
 
+export type OverlayBounds = { w: number; h: number };
+
 /**
  * 覆盖层的全部内容：翻译失败时 error 给出原因，blocks 里是识别出的原文；
  * notice 是翻译成功时要补充的一句话（比如译文没能对准原文的位置）。
@@ -118,6 +120,7 @@ export type CaptureView = {
   notice: string | null;
   stage?: CaptureStage;
   generation?: number;
+  bounds?: OverlayBounds | null;
 };
 
 export type LookupArgs = {
