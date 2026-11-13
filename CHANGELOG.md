@@ -20,9 +20,10 @@
 - **静态冻结选区、刘海屏避让与焦点接管守卫（`sense/src-tauri/tools/ocr.swift`、`sense/src-tauri/src/capture.rs`）**
   - `sense-ocr` 新增 `--capture` 模式：按下快捷键时立即调用 `CGDisplayCreateImage` 截取按下瞬间的静态全屏图像（仅单屏 API 失败时在内部走非交互静态 `screencapture -x -R` 整屏快照兜底），盖上全屏无边框窗口 `SelectionWindow` + `FrozenSelectionView`，在冻结画面上直接按 `NSEvent` 逻辑坐标拖框与裁剪；宽高 `< 12pt` 的误触留在冻屏重选；`loadCGImage` 改用 `ImageIO` 避免大图 TIFF 内存膨胀。若 `--capture` 无法启动，直接返回错误文案并重置状态（不再保留 `screencapture -i` 交互选区回退与「不一定对准原文」路径）。
   - sidecar 直接输出两阶段 JSON 行事件：`{"event":"selected","x","y","w","h","scale","bounds"}` 与 `{"event":"ocr","lines":[...]}`，拖框期间后台并发预热 Vision，OCR 内部按 `DispatchQueue.concurrentPerform` 并发识图。
-  - `bannerTopY(topSafeInset:)` 按 `max(20, safeAreaInsets.top + 10)` 避让 MacBook 刘海区；`CaptureCoordinator` 结合 `didBecomeActiveNotification`、`didResignActiveNotification` 与 `NSWorkspace.didActivateApplicationNotification`（前 250ms 忽略未激活前 `initialParentPid` / `priorFrontPid` 的常规交接）+ `+0.25s` 重试激活 + `+0.50s` `verifyActiveWork` 复查，焦点被抢时自动退出并清理全部观察者，不留死锁全屏遮罩。
+  - `bannerTopY(topSafeInset:)` 按 `max(20, safeAreaInsets.top + 10)` 避让 MacBook 刘海区；`CaptureCoordinator` 结合 `didBecomeActiveNotification`、`didResignActiveNotification` 与 `NSWorkspace.didActivateApplicationNotification`（前 250ms 忽略未激活前 `initialParentPid` / `priorFrontPid` 的常规交接）+ `+0.25s` 重试激活 + `+0.50s` `verifyActiveWork` 收紧为无条件 `if !app.isActive { self.cancel() }`，被抢焦点或首次激活被系统静默拒绝时均主动退屏并清理观察者，不留死锁遮罩。
 - **两阶段多尺寸覆盖层、原位空识别与流式上屏（`sense/src-tauri/src/capture.rs`、`capture/protocol.rs`、`sense/src/features/capture/TranslateOverlay.tsx`、`sense/src/lib/ipc.ts`）**
   - `CaptureView` 新增精确窗口逻辑尺寸字段 `bounds: { w, h }`，前端以 `bounds` 为主数据源并辅以 `window` `resize` 监听与尺寸变化宽度/高度同步更新失焦宽限期，彻底消除同一 WebView 多阶段 `set_size`/`set_position` 时的 `innerWidth`/`innerHeight` 读旧错位与覆盖块被夹成 `0×0` 问题。
+  - 参照 `window::apply_frame` 抽离 `apply_overlay_frame` / `plan_overlay_geometry_ops`：覆盖层二次调整（空白选区扩窗与 `Done` 阶段缩窗/扩窗）严格**先 `set_size`、后 `set_position`**，避开 macOS AppKit `[NSWindow setContentSize:]` 锚定左下角导致的顶左 `y` 垂直漂移；另设 `read_overlay_logical_frame` 在 `25ms` 主队列落定后回读 `outer_position`/`outer_size` 写入 `capture.log`。
   - `Ocr` 与 `Translating` 共用最小保底尺寸 `STATUS_MIN_WIDTH × STATUS_MIN_HEIGHT`（`164×40`，状态胶囊加 `whitespace-nowrap`），`Done` 阶段再按 `shifted_blocks` 缩回精确选区或右下角贴边告警扩窗至 `300×84`。
   - `CaptureState` 合并为单一 `Mutex<CaptureSnapshot>` 并在异常/空识别路径统一调用 `reset_capture_snapshot`；当 `lines.is_empty()` 且覆盖层已打开时，直接在覆盖层原位扩窗至 `300×84` 展示「没识别到文字 · 点击或 Esc 关闭」（`stage: Done`），不再突然弹回 960×900 主窗口。
   - `capture/protocol.rs` 在流式 SSE 中用逃逸感知的 `strict_closing_quote` 增量解析已完成译文条目（60ms 节流推送预览）；`PendingOcr::wait_ocr` 以 120ms/15ms 切片检查代数取消并 `kill_and_reap`。
@@ -32,10 +33,13 @@
 
 **验证与独立对抗 Review**
 
-- 外部 QC 复核后补齐全部 6 条 P1/P2 问题与 `TranslateOverlay.runtime.test.tsx` 状态层单测，并再经一轮独立对抗 Review（`P0 = 0, P1 = 0`，5 条 P2 巩固项全部清零）：`CaptureState` 单一互斥锁、状态胶囊不换行、`.catch` 复位 `bounds`、宿主隐藏前置窗口误判过滤、`is_cloud = true` 单发/断连回归单测。
-- `swiftc` 双架构编译（`arm64` + `x86_64`，`macos13.0`）与 `sense-ocr --selftest` 通过（`selftest ok`）；`npm run typecheck`、`npm test`（**30 文件 / 635 用例全绿**）、`npm run build` 通过；`cargo test`（**427/427 通过**）与 `cargo build` 零警告通过。
-- 真实调试窗口 + `mock-provider.mjs` 隔离端到端验证通过：小选区（`8,8,120,28`, `scale=2`）实测 `stage=Ocr bounds={w:164,h:40}` → 仅 1 次 `POST` → `done blocks=2 translated=2`；空白图选区（`20,20,80,24`）实测 `ocr lines=0` → `done blocks=0 translated=0 empty=true` 原位留窗不弹主窗。
-- 本机通过 `./tools/install-app.sh` 重建并签名安装至 `/Applications/SENSE.app`（`codesign --verify --deep --strict` 通过，`vtool` 确认 `minos 13.0`，`otool -L` 无 `SystemConfiguration.framework`，`sense-ocr --selftest ok`，进程运行中）。
+- 外部 QC 复核后补齐全部 6 条 P1/P2 问题与 `TranslateOverlay.runtime.test.tsx` 状态层单测，并经独立对抗 Review 复核（二轮与三轮结论均为 **`P0 = 0, P1 = 0`**），已修完 `CaptureState` 单锁、状态胶囊不换行、`.catch` 复位、宿主要求退让过滤、`apply_overlay_frame` `set_size → set_position` 调序、主队列 25ms 回读与 AppKit 左下角锚点模拟单测。
+- `swiftc` 双架构编译（`arm64` + `x86_64`，`macos13.0`）与 `sense-ocr --selftest` 通过（`selftest ok`）；`npm run typecheck`、`npm test`（**30 文件 / 635 用例全绿**）、`npm run build` 通过；`cargo test`（**428/428 通过**）与 `cargo build` 零警告通过。
+- 真实调试窗口 + `mock-provider.mjs` 隔离端到端回读（`target_win` 对比 `outer_position`/`outer_size` `actual_win`，`≤ 1pt`）：
+  - 小选区缩窗（`ocr-en-readme.png`，`rect=40,80,140,28`, `164×40 → 140×28`）：`target_win=(40.0,80.0,140.0x28.0)`、`actual_win=Some((40.0, 80.0, 140.0, 28.0))`（`0.0pt` 误差），仅 1 次 `POST` 完成 `3/3` 块翻译；
+  - 空白选区扩窗（`blank.png`，`rect=60,80,80,24`, `164×40 → 300×84`）：`empty=true`，`target_win=(60.0,80.0,300.0x84.0)`、`actual_win=Some((60.0, 80.0, 300.0, 84.0))`（`0.0pt` 误差）；
+  - 右下角贴边空选区扩窗（`ocr-en-readme.png`，`rect=500,420,140,28`, `164×40 → 300×84`）：`empty=true`，`target_win=(360.0,386.0,300.0x84.0)`、`actual_win=Some((360.0, 386.0, 300.0, 84.0))`（`0.0pt` 误差）。
+- 提交后将快进合并至主仓库 `main`，备份后由 `./tools/install-app.sh` 重装 `/Applications/SENSE.app`。
 - **未验证（已知边界）**：物理按键 `⌃⌥⌘X` 真人手拖框、物理刘海屏真机与线上 DeepSeek API 实测延迟仍待用户本机体验确认。
 
 ### D1 · 2026-10-22 — 工程骨架与窗口
