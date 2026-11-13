@@ -2426,7 +2426,9 @@ final class CaptureCoordinator {
 
         let verifyWork = DispatchWorkItem { [weak self] in
             guard let self = self, !self.finished else { return }
-            if self.focusStolenDuringStartup && !app.isActive {
+            // 两次 activate 共 500ms 后仍未拿到前台焦点（包括被抢焦点或系统静默拒绝激活，如安全键盘输入），
+            // 主动退出冻屏，防止全屏遮罩收不到 Esc
+            if !app.isActive {
                 self.cancel()
             }
         }

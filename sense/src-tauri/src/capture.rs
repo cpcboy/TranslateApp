@@ -744,6 +744,53 @@ fn same_overlay_frame(a: OverlayFrame, b: OverlayFrame) -> bool {
         && (a.win_h - b.win_h).abs() <= 0.5
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum OverlayGeometryOp {
+    SetSize(f64, f64),
+    SetPosition(f64, f64),
+}
+
+fn plan_overlay_geometry_ops(cur: OverlayFrame, next: OverlayFrame) -> Vec<OverlayGeometryOp> {
+    if same_overlay_frame(next, cur) {
+        return Vec::new();
+    }
+    // 顺序不可颠倒，见 apply_overlay_frame
+    vec![
+        OverlayGeometryOp::SetSize(next.win_w, next.win_h),
+        OverlayGeometryOp::SetPosition(next.win_x, next.win_y),
+    ]
+}
+
+fn apply_overlay_frame(overlay: &tauri::WebviewWindow, cur: OverlayFrame, next: OverlayFrame) {
+    // 参照 window::apply_frame：macOS AppKit 的 [NSWindow setContentSize:] 锚定左下角 frame.origin 不变、
+    // 向上增减高度；而 tao 将 set_size 与 set_position 顺序异步派发到主队列 FIFO，因此必须先 set_size
+    // 再 set_position，才能让顶左坐标精确落在 (next.win_x, next.win_y)。
+    for op in plan_overlay_geometry_ops(cur, next) {
+        match op {
+            OverlayGeometryOp::SetSize(w, h) => {
+                let _ = overlay.set_size(tauri::LogicalSize::new(w, h));
+            }
+            OverlayGeometryOp::SetPosition(x, y) => {
+                let _ = overlay.set_position(tauri::LogicalPosition::new(x, y));
+            }
+        }
+    }
+}
+
+async fn read_overlay_logical_frame(overlay: &tauri::WebviewWindow) -> Option<(f64, f64, f64, f64)> {
+    // tao 0.37 的 set_size / set_position 在主线程通过 DispatchQueue::main().exec_async 排队修改 NSWindow.frame，
+    // 而紧随其后的 set_focus() 在主线程内联执行并不会排空 exec_async 队列；
+    // 这里让出约一个渲染周期，等主队列把 setContentSize 与 setFrameTopLeftPoint 实际落到 NSWindow 后再回读。
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    let scale = overlay
+        .scale_factor()
+        .ok()
+        .filter(|s| s.is_finite() && *s > 0.0)?;
+    let pos = overlay.outer_position().ok()?.to_logical::<f64>(scale);
+    let size = overlay.outer_size().ok()?.to_logical::<f64>(scale);
+    Some((pos.x, pos.y, size.width, size.height))
+}
+
 /// 开始一次截屏翻译：冻结整屏选区 → 并发 Vision OCR → 流式翻译 → 原位覆盖。
 #[tauri::command]
 pub async fn start_capture(app: AppHandle, state: State<'_, CaptureState>) -> Result<(), String> {
@@ -988,10 +1035,7 @@ async fn finish_capture_blocks(
                     ALERT_MIN_HEIGHT,
                     screen.bounds,
                 );
-                if !same_overlay_frame(empty_frame, cur) {
-                    let _ = overlay.set_position(tauri::LogicalPosition::new(empty_frame.win_x, empty_frame.win_y));
-                    let _ = overlay.set_size(tauri::LogicalSize::new(empty_frame.win_w, empty_frame.win_h));
-                }
+                apply_overlay_frame(&overlay, cur, empty_frame);
                 publish_view(
                     app,
                     state,
@@ -1005,9 +1049,16 @@ async fn finish_capture_blocks(
                     },
                 );
                 let _ = overlay.set_focus();
+                let actual = read_overlay_logical_frame(&overlay).await;
                 trace(
                     app,
-                    format!("done gen={view_gen} select_ms={select_ms} ocr_ms={ocr_ms} blocks=0 translated=0 empty=true"),
+                    format!(
+                        "done gen={view_gen} select_ms={select_ms} ocr_ms={ocr_ms} blocks=0 translated=0 empty=true target_win=({:.1},{:.1},{:.1}x{:.1}) actual_win={actual:?}",
+                        empty_frame.win_x,
+                        empty_frame.win_y,
+                        empty_frame.win_w,
+                        empty_frame.win_h,
+                    ),
                 );
                 return Ok(0);
             }
@@ -1091,15 +1142,16 @@ async fn finish_capture_blocks(
         block.shift(final_frame.shift_x, final_frame.shift_y);
     }
 
-    trace(
-        app,
-        format!(
-            "done gen={view_gen} select_ms={select_ms} ocr_ms={ocr_ms} {telemetry_line} blocks={} translated={} error={:?} notice={:?}",
-            blocks.len(),
-            blocks.iter().filter(|block| block.translated).count(),
-            failure,
-            notice
-        ),
+    let done_summary = format!(
+        "done gen={view_gen} select_ms={select_ms} ocr_ms={ocr_ms} {telemetry_line} blocks={} translated={} error={:?} notice={:?} target_win=({:.1},{:.1},{:.1}x{:.1})",
+        blocks.len(),
+        blocks.iter().filter(|block| block.translated).count(),
+        failure,
+        notice,
+        final_frame.win_x,
+        final_frame.win_y,
+        final_frame.win_w,
+        final_frame.win_h,
     );
 
     let final_view = CaptureView {
@@ -1113,12 +1165,11 @@ async fn finish_capture_blocks(
 
     if let Some(cur) = open_frame {
         if let Some(overlay) = app.get_webview_window(OVERLAY_WINDOW) {
-            if !same_overlay_frame(final_frame, cur) {
-                let _ = overlay.set_position(tauri::LogicalPosition::new(final_frame.win_x, final_frame.win_y));
-                let _ = overlay.set_size(tauri::LogicalSize::new(final_frame.win_w, final_frame.win_h));
-            }
+            apply_overlay_frame(&overlay, cur, final_frame);
             publish_view(app, state, final_view);
             let _ = overlay.set_focus();
+            let actual = read_overlay_logical_frame(&overlay).await;
+            trace(app, format!("{done_summary} actual_win={actual:?}"));
             return Ok(blocks.len());
         }
     }
@@ -1131,7 +1182,9 @@ async fn finish_capture_blocks(
     }
 
     publish_view(app, state, final_view);
-    open_overlay_window(app, final_frame.win_x, final_frame.win_y, final_frame.win_w, final_frame.win_h)?;
+    let overlay = open_overlay_window(app, final_frame.win_x, final_frame.win_y, final_frame.win_w, final_frame.win_h)?;
+    let actual = read_overlay_logical_frame(&overlay).await;
+    trace(app, format!("{done_summary} actual_win={actual:?}"));
 
     Ok(blocks.len())
 }
@@ -3992,5 +4045,66 @@ mod tests {
         assert_eq!(snap.notice, None);
         assert_eq!(snap.stage, CaptureStage::Done);
         assert_eq!(snap.bounds, None);
+    }
+
+    #[test]
+    fn overlay_geometry_ops_set_size_before_position_preserving_appkit_top_left_y() {
+        // 模拟 macOS AppKit NSWindow 左下角锚点行为：
+        // - setContentSize(w, h) 保持左下角 (origin_x, origin_y) 不变，向上增减高度
+        // - setFrameTopLeftPoint(x, top_left_y) 以当前高度算 origin_y = primary_h - top_left_y - cur_h
+        fn simulate_appkit(initial: OverlayFrame, ops: &[OverlayGeometryOp]) -> (f64, f64, f64, f64) {
+            let primary_h = 900.0;
+            let mut origin_x = initial.win_x;
+            let mut w = initial.win_w;
+            let mut h = initial.win_h;
+            let mut origin_y = primary_h - initial.win_y - h;
+            for &op in ops {
+                match op {
+                    OverlayGeometryOp::SetSize(nw, nh) => {
+                        w = nw;
+                        h = nh;
+                    }
+                    OverlayGeometryOp::SetPosition(nx, ny) => {
+                        origin_x = nx;
+                        origin_y = primary_h - ny - h;
+                    }
+                }
+            }
+            let top_left_y = primary_h - (origin_y + h);
+            (origin_x, top_left_y, w, h)
+        }
+
+        let bounds = Some((0.0, 0.0, 1440.0, 900.0));
+
+        // 1) 同尺寸同位置：无需操作
+        let status_br = fitted_overlay_frame(1350.0, 870.0, 80.0, 22.0, STATUS_MIN_WIDTH, STATUS_MIN_HEIGHT, bounds);
+        assert!(plan_overlay_geometry_ops(status_br, status_br).is_empty());
+
+        // 2) 小选区从 164x40 缩回 80x22@(1350,870)：先 SetSize 再 SetPosition 必须精确落位；反序会掉到 y=888
+        let shrink_done = fitted_overlay_frame(1350.0, 870.0, 80.0, 22.0, 0.0, 0.0, bounds);
+        let ops_shrink = plan_overlay_geometry_ops(status_br, shrink_done);
+        assert_eq!(
+            ops_shrink,
+            vec![
+                OverlayGeometryOp::SetSize(80.0, 22.0),
+                OverlayGeometryOp::SetPosition(1350.0, 870.0),
+            ]
+        );
+        assert_eq!(simulate_appkit(status_br, &ops_shrink), (1350.0, 870.0, 80.0, 22.0));
+        let wrong_order_shrink = vec![ops_shrink[1], ops_shrink[0]];
+        assert_eq!(simulate_appkit(status_br, &wrong_order_shrink).1, 888.0);
+
+        // 3) 屏幕顶部附近选区从 164x40 扩至 300x84@(20,20)：正序精确落 (20,20)；反序会窜到屏幕外 y=-24
+        let status_top = fitted_overlay_frame(20.0, 20.0, 80.0, 24.0, STATUS_MIN_WIDTH, STATUS_MIN_HEIGHT, bounds);
+        let expand_top = fitted_overlay_frame(20.0, 20.0, 80.0, 24.0, ALERT_MIN_WIDTH, ALERT_MIN_HEIGHT, bounds);
+        let ops_top = plan_overlay_geometry_ops(status_top, expand_top);
+        assert_eq!(simulate_appkit(status_top, &ops_top), (20.0, 20.0, 300.0, 84.0));
+        assert_eq!(simulate_appkit(status_top, &[ops_top[1], ops_top[0]]).1, -24.0);
+
+        // 4) 右下角告警从 164x40@(1276,860) 扩至 300x84@(1140,816)：正序精确落 (1140,816)；反序会漂到 y=772
+        let alert_br = fitted_overlay_frame(1350.0, 870.0, 80.0, 22.0, ALERT_MIN_WIDTH, ALERT_MIN_HEIGHT, bounds);
+        let ops_br = plan_overlay_geometry_ops(status_br, alert_br);
+        assert_eq!(simulate_appkit(status_br, &ops_br), (1140.0, 816.0, 300.0, 84.0));
+        assert_eq!(simulate_appkit(status_br, &[ops_br[1], ops_br[0]]).1, 772.0);
     }
 }
