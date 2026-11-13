@@ -4,6 +4,39 @@
 
 ## [Unreleased]
 
+### 修复 · 2026-11-13 — 截屏选区漂移、实时冻结屏与 DeepSeek Flash 翻译延迟
+
+**根因定位**
+
+1. **选区漂移 / 小框变大框**：原截屏链路依赖外部 `screencapture -i` 落盘 PNG，再由 Rust 按鼠标松手点（`anchor_point`）与图片像素尺寸反推选区位置和缩放；跨 Retina 屏幕、修饰键或窗口焦点切换时容易导致位置与尺寸估算失准。
+2. **截图未锁屏**：调用 `screencapture -i` 时桌面背景与网页视频/动画仍在实时刷新，拖框期间画面变化会导致最终截出的内容与按下快捷键时刻不一致。
+3. **DeepSeek Flash 翻译明显变慢**：
+   - `screencapture -i` 先落盘 PNG 再冷启 `sense-ocr` 读取识别，且选区完成后串行等待完整 OCR、覆盖层建窗与整批翻译 JSON 全部结束才一次上屏；
+   - `openai_compat::stream_chat` 复用可能已半开的 HTTP keep-alive 连接，没有首响头超时切换新连接的保护；
+   - `stream_chat_adaptive` 在收到 `reasoning_chunks > 0` 时调用 `forget_reasoning_rejected` 清空跳过缓存，使「不接受 `thinking` 参数却仍返回 `reasoning_content`」的服务端每两次请求就必吃一次 HTTP 400 再重试，拖慢一半请求；此外 `retry_stale` 仅按 `api_key.is_some()` 判定，遗漏未设 Key 的远程网关。
+
+**改动**
+
+- **静态冻结选区与精准坐标（`sense/src-tauri/tools/ocr.swift`、`sense/src-tauri/src/capture.rs`）**
+  - `sense-ocr` 新增 `--capture` 模式：按下快捷键时立即调用 `CGDisplayCreateImage` 截取按下瞬间的静态全屏图像并盖上全屏无边框窗口 `CaptureOverlayWindow`，在冻结画面上直接按 `NSEvent` 逻辑坐标拖框与裁剪；`loadCGImage` 改用 `ImageIO`（`CGImageSourceCreateWithURL` / `CGImageSourceCreateImageAtIndex`）避免大图 TIFF 内存膨胀。
+  - sidecar 直接输出两阶段 JSON 行事件：`{"event":"selected","x","y","w","h","scale","bounds"}` 与 `{"event":"ocr","lines":[...]}`；保留 `screencapture -i` 仅作不可用时的兜底。
+  - `CaptureCoordinator` 监听 `NSApplication.didResignActiveNotification`（跳过 300ms 窗口交接期，失活自动取消并清理通知观察者，避免卡死全屏遮罩）；`complete()` 将事件输出与退出派回 `DispatchQueue.main.async`。
+- **两阶段流式上屏与快速取消（`sense/src-tauri/src/capture.rs`、`capture/protocol.rs`、`sense/src/features/capture/TranslateOverlay.tsx`、`sense/src/lib/ipc.ts`）**
+  - 选区完成收到 `selected` 后立即打开带代数守卫（`generation: Arc<AtomicU64>`）与阶段状态（`ocr` → `translating` → `done`）的覆盖层；`ocr` 阶段窗口最小保底 `148×32` 以显示「识别中… · Esc 取消」，OCR 完成后恢复精确选区几何再进入翻译。
+  - `capture/protocol.rs` 在流式 SSE 中用逃逸感知的前向扫描 `strict_closing_quote` 增量解析已完成译文条目（跳过 `\"` 等转义，不误吞截断字符串），译出一条即增量推送覆盖层渲染并支持在同块冲突时撤回预览。
+  - `PendingOcr::wait_ocr` 以 120ms/15ms 切片检查代数取消，`kill_and_reap` 直接杀掉子进程并丢弃 pipe reader 句柄，避免被子进程继承描述符阻塞。
+  - 前端 `TranslateOverlay` 用 `disposed` 与 `initializedRef` 守卫 StrictMode 双挂载监听器与初始 `onFocusChanged` 宽限期，防止冷启动或 `ocr` 阶段失焦误关窗。
+- **网络首响与防 400 振荡（`sense/src-tauri/src/providers/openai_compat.rs`）**
+  - 抽离 `header_policy(&provider.base_url)`，按 `!crate::is_loopback(base_url)` 识别云端网关：首条连接等待响应头超过 8s 即切换无连接池的 `FRESH_HTTP_CLIENT` 重试（上限 45s），且移除违背 RFC 9113 的 `Connection: close` 头。
+  - 移除 `stream_chat_adaptive` 中的 `forget_reasoning_rejected` 清除逻辑，保留 15 分钟 `NO_REASONING_TTL`，消除隔次 HTTP 400 往返。
+
+**验证与独立对抗 Review**
+
+- 独立对抗 Review 两轮复核闭环：**`P0 = 0, P1 = 0`**（已修复初审指出的 6 条 P1：`TranslateOverlay` StrictMode 监听器泄漏、`strict_closing_quote` `\"}` 误闭合、`forget_reasoning_rejected` 400 振荡、`header_policy` loopback 判定与 HTTP/2 头合规、`ocr.swift` 切窗口取消、`PendingOcr` 代数轮询取消，以及 4 条 P2）。
+- `swiftc` 编译 arm64/x86_64（`-target ...-macos13.0`）与 `./binaries/sense-ocr-aarch64-apple-darwin --selftest` 通过（`selftest ok`）；独立 CLI 对 `ocr-zh-paragraph.png` 耗时 734.2ms → 549.4ms，且交互拖框期间提前预热 Vision。
+- `npm run typecheck`、`npm test`（29 文件 / 630 用例全绿）、`npm run build` 通过；`cargo test`（421/421 通过）与 `cargo build` 零警告通过。
+- **未验证（已知边界）**：桌面 GUI 交互注入在沙盒外运行，真实手按 `⌃⌥⌘X` 拖框体验与线上 DeepSeek Flash 实测延迟待安装后由人工确认；`screencapture -i` 兜底路径仅在 `--capture` 无法启动/失败时触发。
+
 ### D1 · 2026-10-22 — 工程骨架与窗口
 
 **新增**
