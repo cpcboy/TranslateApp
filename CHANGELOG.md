@@ -4,6 +4,35 @@
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-14
+
+### 版本升级 · 2026-11-14 — 升级版本号至 `0.1.2`
+
+- 鉴于 `v0.1.1` 已发布且应用内自动更新器遵循严格递增版本号比较，统一将 `sense/src-tauri/tauri.conf.json`、`sense/package.json`、`sense/package-lock.json`、`sense/src-tauri/Cargo.toml`、`sense/src-tauri/Cargo.lock` 五处版本号由 `0.1.1` 升级至 `0.1.2`（`f449661`；尚未推送远端或发布 GitHub Release，留待负责人授权）。
+
+### 修复 · 2026-11-14 — 外部真机 QC 复核闭环：四字语种与窄屏工具条自适应防裁切、画布右侧超长文字标注自动折行
+
+**问题解决**
+
+1. **`[P1]` 四字目标语种（如「译为 繁体中文 ▾」「译为 西班牙语 ▾」）及窄视口（`< 616px`，如 `580px` / `400px`）下工具条右侧被裁切**：此前 `TOOLBAR_MIN_WIDTH = 580.0`，而单行四字语种自然宽度约 `589.25px`（含「保存中…」约 `601px`），导致 `580px` 覆盖窗右侧「关闭」按钮右圆角被裁切；当视口窄于 `570px`（如 `400px` 窄屏）时，`capture-toolbar-main` 的 `flex-nowrap` 会把「存为图片 ▾」与「关闭」整颗推出窗口右边界完全不可见。
+2. **`[P2]` 画布右侧边缘输入超长单行文字时被水平硬裁剪**：在 `360px` 画布右侧边缘（如 `x = 245`）点击输入超长单行文字（如 `右侧边缘超长中文批注测试会不会被裁剪`）时，原 `<textarea wrap="off">` 只在窄框内水平暗滚，回车提交后 SVG `<text>` 与 Canvas Retina PNG 导出均按单行绘制并在 `360px` 舞台右缘被硬截断丢失后半句。
+
+**改动**
+
+- **标准窗宽上调与窄视口双行自适应（`sense/src-tauri/src/capture.rs`、`sense/src/features/capture/CaptureToolbar.tsx`、`sense/src/features/capture/TranslateOverlay.tsx`）**
+  - Rust `TOOLBAR_MIN_WIDTH` 由 `580.0` 提升至 `640.0`（四字语种 +「保存中…」单行完整放下且左右各留约 `19px` 呼吸边距）；当窄屏幕迫使 `win_w < 616.0` 时，`compute_capture_window_frame` 纵向预留自动升至 `88.0pt` 容纳双行工具条。
+  - `CaptureToolbar` 新增 `maxWidth`（`effectiveViewW - 8`）与两级窄屏自适应且**保持 `overflow: visible`**（严禁 `overflow-x: auto/hidden`，避免按 CSS 规范连带裁剪绝对定位的语种/保存下拉菜单）：`maxWidth >= 608` 单行展开；`348 <= maxWidth < 608`（`viewW = 356..615px`）以 `flex-col gap-y-1` 将「视图切换 + 语言」与「标注工具 + 存为图片 + 关闭」排成均衡双行居中、隐藏簇间分隔线，并将语言下拉统一设为 `right-0`（在约 `345px` 宽双行主条内无论居中、贴左或贴右均保持左右不溢屏）；`maxWidth < 348` 极窄屏进一步隐藏第二簇内部分隔线防悬空并使语言下拉相对主条水平居中。
+  - `TranslateOverlay` 通过 `ResizeObserver` 同步实测 `capture-toolbar-main` 的宽高（`toolbarWidth` 与 `toolbarMainHeight`），动态驱动 `toolbarDock`（`bottom` / `top` / `inside-bottom`）、`toolbarTop`、`popoverMaxHeight` 与 `setCaptureHitRects` 鼠标穿透热区高度。
+- **右侧边缘超长文字四端一致自动折行（`sense/src/features/capture/captureAnnotations.ts`、`TranslateOverlay.tsx`、`captureExport.ts`）**
+  - `captureAnnotations.ts` 新增 `wrapAnnotationText`（支持显式 `\n`、保留行内连续空格、CJK 逐字折行与超长无空格英文/符号按词+字符兜底切分，兼容代理对字符与极窄画布），并在 `computeTextBoxLayout` 中按 `maxLineWidth = Math.max(1, maxWidth - TEXT_DRAFT_PAD_X * 2)` 同步产出 `wrappedLines` 与自增高 `rows`（`1..5` 行）。
+  - `TranslateOverlay.tsx` 新增复用离屏 2D Canvas 的 `measureOverlayAnnotationText`（与导出画布统一使用 `` `600 ${fontSize}px ${OVERLAY_FONT}` ``）；移除 `<textarea wrap="off">`，改为 `whiteSpace: "pre-wrap"` + `overflow-x-hidden overflow-y-auto`；`flushTextDraft` 提交 `layout.wrappedLines.join("\n")` 并在超 5 行时向上钳位 `committedY` 防越底；`AnnotationShape` 与 `captureExport.ts`（优先调用 `ctx.measureText`）共享同一 `stageWidth - item.x - TEXT_DRAFT_PAD_X` 折行宽度，确保编辑框、终态 SVG 与 2x Retina 导出 PNG 所见即所得、0 字符被裁。
+- **测试桩修正**：同步更新 `scratch/qc_server.mjs` 中 `retranslate_capture` 事件名为 `sense://capture-update`（对齐生产 `capture.rs` 与 `ipc.ts`）。
+
+**验证与 QC 审查**
+
+- 独立软件产品 QC 代码审查员（`01300a53`）两轮对抗审查：首轮指出 **`P0 = 0, P1 = 1, P2 = 2, P3 = 2`**（`488..607px` 两行过渡区语言菜单仍走 `left-0` 致右溢、`<=355px` 极窄屏第二簇内部分隔线悬空、`ResizeObserver` 双行高度/`480..599` 区间/`ctx.measureText` 单测覆盖盲区、以及 Rust `win_w < 608` 与前端阈值微小缝隙）；逐条修复并补齐单测后二轮复核确认 **`P0 = 0, P1 = 0`**（前轮问题全部闭合，无新引入缺陷）。
+- 全量自动化套件通过：`npm run typecheck`、Vitest **32 文件 / 660 用例**、`npm run build`、`cargo test --locked` **434 用例**；真机 `WKWebView`（`640px` 四字语种单行、`580px` 与 `400px` 双行工具条 + 弹层展开、`360px` 画布 `x=245` 右缘超长中文输入/提交/Retina PNG 导出）画面验收全通过。
+
 ### 修复 · 2026-11-14 — 截屏「文字」标注点击指定位置无法输入：兼容 `mousedown` 抢焦、覆盖窗焦点与中文 IME 防护
 
 **问题解决**
