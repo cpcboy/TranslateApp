@@ -4,6 +4,33 @@
 
 ## [Unreleased]
 
+### 修复 · 2026-11-14 — 四轮与五轮 QC 复审闭环：多显示器坐标解构、未回车文字保存菜单/两步撤销与贴顶窗口原点同步
+
+**问题解决**
+
+1. **`[R4-P1-1]` 外接副屏坐标契约解构回归**：`compute_capture_window_frame` 此前将 `screen_bounds: Option<(f64, f64, f64, f64)>` 误解构为 `(sx, sy, sw, sh)`，违背上游 `ocr.swift` / `monitor_under_cursor` / `shift_into` 的 **`(left, top, right, bottom)`** 四边界契约。在左侧负坐标副屏（`right = 0`）或上方负坐标副屏（`bottom = 0`）下会把屏幕宽高夹成 `1px`，导致选区覆盖层塌缩；在右侧/下方正偏移副屏下会把 `right`/`bottom` 当作宽高累加使工具条溢屏或贴底不向上翻转。
+2. **`[R4-P2-1]` 与 `[R5-P2-1]` 未回车文字标注状态与撤销一致**：工具条按钮统一 `onMouseDown={(e) => e.preventDefault()}` 保焦后，在 `<textarea>` 输入文字未按 `Enter` 直接点「存为图片」不会触发 `blur`：此前导致弹出保存菜单缺「保存带标注原图」、「撤销」仍置灰、且「保存未翻译原图 / 翻译后图片」结果不一致；五轮自审同时指出已有标注时点击工具条打开空白文字框再点「撤销」会同时删掉前一条历史标注（`[R5-P2-1]`）。
+3. **`[R4-P2-2]` 紧贴顶部菜单栏框选时覆盖层鼠标穿透坐标偏移**：`open_overlay_window_tracked` 仅记录建窗请求 `(x, y)`，当 `y < 菜单栏高度` 被 macOS AppKit 下推夹紧至菜单栏底边后（如请求 `y=8` 实际落位 `y=30`），`slot.win_origin.y` 偏小导致工具条下半部被误判穿透。
+
+**改动**
+
+- **多显示器四边界统一（`sense/src-tauri/src/capture.rs`）**
+  - 修复 `compute_capture_window_frame` 按 `(left, top, right, bottom)` 解构 `screen_bounds`，推导 `sw = (right - left).max(1.0)`、`sh = (bottom - top).max(1.0)`，并修正 `None` 兜底右/下边界为 `(x + w.max(1.0) + 500.0, y + h.max(1.0) + 500.0)`；全仓核查 `ocr.swift` 与 `capture.rs`/`window.rs` 其余 `bounds` 均遵循四边界契约；新增左负屏、上负屏、右正偏移屏、下正偏移屏与 `None` 大坐标 5 组边界单元测试。
+- **未回车文字草稿同步与两步撤销（`sense/src/features/capture/TranslateOverlay.tsx`、`TranslateOverlay.runtime.test.tsx`）**
+  - 新增 `handleTogglePopover` 并将 `handleSelectLang` 调至 `flushTextDraft` 之后，点「存为图片」、语言下拉或切换目标语言前自动提交活跃文字草稿；计算 `effectiveAnnotationsCount` 将非空输入草稿实时计入工具条 `annotationsCount`，保证「撤销」实时可用与保存菜单三项语义一致；`handleUndo` 只要存在活跃 `textDraftRef.current`（含空白草稿 `[R5-P2-1]`）优先关闭当前输入框并 `return`，不再连带误删历史已提交标注；补齐 `[R4-P2-1]` / `[R5-P2-1]` 运行时全链路回归测试。
+- **贴顶窗口实际原点异步校准（`sense/src-tauri/src/capture.rs`）**
+  - 新增 `apply_actual_win_origin`、`sync_actual_win_origin_value` 与 `read_and_sync_overlay_frame`，改造 `start_passthrough_watcher -> u64` 与 `open_overlay_window_tracked`，在开窗后及 `finish_capture_blocks` 3 处阶段落定后通过 `watcher_seq` + `generation` 双重代次守卫异步回读 AppKit 真实窗口左上角写回 `slot.win_origin` 并即时刷新 `sync_overlay_passthrough`；新增菜单栏贴顶夹紧对齐及过期序号 / `NaN` 拒写单测。
+
+**已知限制与系统约束**
+
+- **`[R5-P2-2]` 贴菜单栏框选物理画面下移**：由于 macOS AppKit 限制 `NSFloatingWindowLevel`（`always_on_top(true)`）窗口覆盖系统菜单栏，框选顶边伸入菜单栏时窗口会被下推至菜单栏底边（约下移 22pt），此时覆盖层内容随窗口下移、鼠标穿透判定已按真实原点精确同步；此属系统保护边界。
+
+**验证与 QC 审查**
+
+- 软件产品 QC 角色五轮独立对抗审查及复核（`8cf9740c`）：初审 **`P0 = 0, P1 = 0, P2 = 2`**，修复 `[R5-P2-1]` 并确认 `[R5-P2-2]` 为系统边界后复核 **`P0 = 0, P1 = 0, P2 = 0`（代码零遗留）**。
+- 隔离 `HOME` + `mock-provider.mjs` + `SENSE_DEV_CAPTURE_PNG` 端到端实测：`ocr-zh-en.png` 得 `mixed=true target=Some("zh") blocks=4 translated=4 target_win=(10.0,120.0,580.0x458.0) actual_win=Some((10.0, 120.0, 580.0, 458.0))`、`ocr-zh-paragraph.png` 得 `mixed=false target=Some("en") blocks=5 translated=5 actual_win=Some((40.0, 120.0, 580.0, 440.0))`、`sense-ocr --selftest ok`。
+- `[R5-P2-1]` 终版代码全量通过：`npm run typecheck`、Vitest **32 文件 / 651 用例**、`npm run build`、`cargo test --locked` **434 用例**、`cargo build --locked`。
+
 ### 修复 · 2026-11-13 — 三轮与四轮 QC 复审闭环：中文界面混排防误判、窄选区居中与鼠标穿透、文字标注所见即所得及原图导出保护
 
 **问题解决**
