@@ -4,6 +4,33 @@
 
 ## [Unreleased]
 
+### 修复 · 2026-11-13 — 三轮与四轮 QC 复审闭环：中文界面混排防误判、窄选区居中与鼠标穿透、文字标注所见即所得及原图导出保护
+
+**问题解决**
+
+1. **`[R3-P1-1]` 中文界面含少量产品英文缩写/快捷键/路径时误判为混合语种并发生无翻译空转**：中文为主的 UI/文档截屏若包含独立缩写或品牌词（如 `SENSE`、`macOS`、`GitHub`）、快捷键（`Ctrl+C`、`⌘⇧Space`）、URL/路径/版本号或命令行片段，此前可能被误判 `has_mixed_languages = true` 甚至拉偏语种判定为 `Source=en -> zh`，导致全中文段落 100% `unchanged` 空转。
+2. **`[R3-P1-2]` 窄选区覆盖层与工具条错位且周围透明留白拦截鼠标点击**：`image_w < 580` 时选区偏左上角与工具条偏移；工具条外透明区域拦截底层窗口点击、窗口失焦未收起下拉弹层。
+3. **`[R3-P1-3]` 文字标注位置/边距跳变、点工具条失焦丢草稿及保存漏提交**：草稿 `<textarea>` 的边距与贴边钳位未按终态 SVG/Canvas 一致计算导致提交瞬间跳位；点击工具条/二级属性条按钮触发 `<textarea>` `blur` 清空未提交文字；点「存为图片」未先自动提交草稿。
+4. **`[R3-P2-1]` 原图拉取失败无重试且导出退化为 `#16161b` 深灰底图**：首次 `captureOriginalImage()` 返回空或报错后被代数 ref 锁死无法重试；原图未就绪时保存菜单仍可点，且 `captureExport` 会兜底画 `#16161b` 深灰空图。
+
+**改动**
+
+- **中文界面混排防误判（`sense/src-tauri/src/capture.rs`）**
+  - 新增 `analyze_mixed_and_sample`、`split_cjk_boundary_tokens`、`is_shortcut_line`、`is_non_prose_whole_line`、`is_technical_token`、`is_brand_or_acronym_word` 等过滤逻辑：跳过独立品牌缩写词（`SENSE`/`macOS`/`GitHub` 等）、技术 token（URL/路径/版本号）、快捷键行与命令行，同时保留真实行内中英混排或中外双语文块的 `mixed=true` 判定（`auto` 仍默认译 `zh`），并在 `capture_plan_with_mode` 与 `retranslate_capture` 中统一改用去噪后的自然文本样本送入 `lang::plan`。
+- **窄选区水平居中与透明区域鼠标穿透（`sense/src-tauri/src/capture.rs`、`lib.rs`、`sense/src/lib/ipc.ts`、`TranslateOverlay.tsx`、`CaptureToolbar.tsx`）**
+  - `compute_capture_window_frame` 在 `image_w < 580` 时按选区中心水平居中建窗并做屏幕边界钳位；`TranslateOverlay` 通过 `ResizeObserver` 将 `capture-toolbar-anchor` 水平居中对齐 `stageRect`，并在 `window` `blur` 时自动关闭打开的语言/保存弹层。
+  - 新增 `set_capture_hit_rects` Tauri 命令与 25ms 轮询 watcher（`open_overlay_window_tracked` 在 `run_capture` 与 `finish_capture_blocks` 同步启停、`AtomicU8` 状态去重且在锁外调用 AppKit），结合 `[data-hit-rect="true"]` 仅对实心选区、工具条、弹层、横幅与拖拽/文字编辑期关闭穿透（`set_ignore_cursor_events(false)`），透明留白区域自动透传底层鼠标点击；已按四轮 QC 建议（`[R4-P2-1]`）将效应依赖收敛为布尔态 `isDraggingAnnotation` 与 `isEditingText`，避免拖画移动每帧重复同步 hit rect。
+- **文字标注所见即所得（`sense/src/features/capture/captureAnnotations.ts`、`CaptureToolbar.tsx`、`TranslateOverlay.tsx`）**
+  - 新增 `computeTextBoxLayout`（常量 `TEXT_DRAFT_PAD_X = 6`、`TEXT_DRAFT_PAD_Y = 3`），统一 `<textarea>` 贴边钳位、边框/内边距偏移与 SVG/Canvas 绘制坐标；工具条与属性条按钮统一 `onMouseDown={(e) => e.preventDefault()}` 保住焦点；`flushTextDraft` 改写为幂等提交，`handleSave` 保存前自动提交未落盘文字草稿。
+- **原图就绪保护与防空图兜底（`sense/src/features/capture/captureExport.ts`、`CaptureToolbar.tsx`、`TranslateOverlay.tsx`、`captureExport.test.ts`）**
+  - `fetchOriginalForGen` 在返回 `null` 或异常时重置代数允许重试；`handleSave` 保存前按需异步拉取原图；`!hasImage` 时禁用保存菜单全部 3 项（含「保存带标注原图」与「保存翻译后图片」）；移除 `captureExport.ts` 的 `#16161b` 深灰空图兜底，原图缺失或尺寸 `0×0` 时明确抛出异常，并新增 `captureExport.test.ts`（Retina 缩放、`unchanged`/未译块过滤、LTR/RTL、5 类标注与缺图抛错）。
+
+**验证与 QC 审查**
+
+- 软件产品 QC 角色四轮独立对抗审查完成（`5fcd7ee1`，判定：**`P0 = 0, P1 = 0, P2 = 1`**），并已当场修复 `[R4-P2-1]` 与补齐不刷屏回归断言。
+- 隔离 `HOME` + `mock-provider.mjs` + `SENSE_DEV_CAPTURE_PNG` 端到端实测：`ocr-zh-en.png` 实测 `mixed=true target=Some("zh") blocks=4 translated=4`、`target_win=(10.0,120.0,580.0x458.0) image_rect=(110.0,0.0,360.0x190.0)`；`ocr-zh-paragraph.png` 实测 `mixed=false target=Some("en") blocks=5 translated=5`；`ocr-zh-sidebar.png` 实测 `mixed=false target=Some("en") blocks=19 translated=19`。
+- `npm run typecheck`、Vitest **32 文件 / 650 用例**、`cargo test --locked` **432 用例**、`npm run build` 全绿零失败。
+
 ### 新增与修复 · 2026-11-13 — 混合语种截屏识别默认译中文 + 钉钉风格截屏后工具条
 
 **问题解决**
