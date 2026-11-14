@@ -1,7 +1,7 @@
 {
   "name": "sense",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "SENSE — macOS AI 翻译器",
   "type": "module",
   "scripts": {
