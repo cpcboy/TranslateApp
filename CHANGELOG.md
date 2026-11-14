@@ -23,11 +23,14 @@
   - 增加 `!document.hasFocus()` 失焦保活守卫、IME `isComposing || keyCode === 229` 键盘防护、自绘不拦截指针的中文占位符 `annotation-text-placeholder`（组合态自动隐身、极窄画布不换行不溢出）；将背景 `overflow-hidden` 下沉至背景封装层，SVG `<text>` 增加 `whiteSpace: "pre"`；在 `CaptureToolbar` 根容器补 `onMouseDown={(e) => e.preventDefault()}`，防止点偏到分隔线或边距缝隙抢走输入焦点。
 - **动态排版与回归单测（`sense/src/features/capture/captureAnnotations.ts`、`captureAnnotations.test.ts`、`TranslateOverlay.runtime.test.tsx`）**
   - 扩展 `TextBoxLayout`（`width`、`minWidth` 与中英文宽字符估算 `estimateTextLineWidth`），放宽 `maxWidth` 至画布右缘，修复 `stageWidth = 0` 边界跳变并去掉 `<textarea>` 硬编码 `min-w-[96px]`；新增 10+ 项单测与运行时边缘测试（含动态扩宽、极窄/零宽/极扁/6 行截顶、重名导出留白、迟到 `blur`/IME 串扰、批处理即时失焦、切代复位、`Shift+Enter` 与连点 6 次）。
+- **工具条下拉菜单层叠、属性条悬浮与防折行修复（`sense/src/features/capture/CaptureToolbar.tsx`、`TranslateOverlay.runtime.test.tsx`）**
+  - 真机可视化 QC 实测（`qc-15-overlay-save-menu.png`）发现：`capture-toolbar-main` 与 `capture-subbar` 同用 `backdrop-blur-md` 各自生成层叠上下文且未设显式 `z-index`，当选中标注工具使属性条展开时，后渲染的 `capture-subbar` 会反压在「存为图片 ▾」/「译为 … ▾」下拉菜单文字上方，且窄屏下「撤销」竖向折行；第 3 轮对抗审查同时定位 `subbarAbove = true`（全屏 `inside-bottom` 与贴底 56–78px 选区）使用 `flex-col-reverse` 会把主工具条往下顶出窗口底边并被 `overflow-hidden` 裁切。
+  - 修复：为 `capture-toolbar-main` 显式设置 `relative z-20`、`capture-subbar` 设置 `z-10`（使 `role="menu"` `z-30` 在 4 种展开组合下均稳定压在属性条之上）；去掉 `flex-col-reverse`，改为 `subbarAbove = true` 时由 `capture-subbar` 以 `absolute bottom-full left-1/2 z-10 mb-1.5 -translate-x-1/2` 向上悬浮而不推挤主条坐标；为工具条与属性条全部按钮/分隔线补 `shrink-0` / `whitespace-nowrap`，并为「存为图片」菜单补充 `maxHeight: popoverMaxHeight`、`overflow-y-auto` 与菜单项 `whitespace-nowrap`。
 
 **验证与 QC 审查**
 
-- 软件产品 QC 角色两轮独立对抗代码审查（`01300a53`）：一轮指出 **`P0 = 0, P1 = 4, P2 = 7`**（`genChanged` 漏清 `isComposingText`、旧草稿迟到组合事件缺 `draftId` 校验、React 19 异步 updater 竞态、`CaptureToolbar` 容器内缝隙防抢焦与测试缺口），全部修复并补强单测后二轮复核确认 **`P0 = 0, P1 = 0`**。
-- 全量自动化套件通过：`npm run typecheck`、Vitest **32 文件 / 653 用例**、`npm run build`、`cargo test --locked` **434 用例**（真机 WKWebView 键鼠快照及全应用端到端可视化验收结果见提交记录与 `MAINTENANCE_RULES.md §3`）。
+- 软件产品 QC 角色四轮独立对抗代码审查（`01300a53`）：一轮指出 **`P0 = 0, P1 = 4, P2 = 7`**（`genChanged` 漏清 `isComposingText`、旧草稿迟到组合事件缺 `draftId` 校验、React 19 异步 updater 竞态、`CaptureToolbar` 容器内缝隙防抢焦与测试缺口），二轮复核 **`P0 = 0, P1 = 0`**；真机画面验收回调后第 3 轮对抗审查指出 **`P0 = 0, P1 = 2, P2 = 2`**（`subbarAbove` 全屏底边裁切、全 4 组合/`inside-bottom` 单测与菜单限高防换行），全部修复并扩展回归单测后第 4 轮复核确认 **`P0 = 0, P1 = 0`**（无新增 P2）。
+- 全量自动化套件通过：`npm run typecheck`、Vitest **32 文件 / 655 用例**、`npm run build`、`cargo test --locked` **434 用例**（真机 WKWebView 键鼠快照与实时全应用可视化 QC 验收结果见提交记录与 `MAINTENANCE_RULES.md §3`）。
 
 ## [0.1.1] - 2026-11-14
 
