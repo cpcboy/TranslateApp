@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-14
+
+### 发布准备 · 2026-11-14 — 升级版本号至 `0.1.1` 并同步 `origin/main` 与双架构更新包
+
+- 将 `sense/src-tauri/tauri.conf.json`、`sense/package.json`、`sense/package-lock.json`、`sense/src-tauri/Cargo.toml`、`sense/src-tauri/Cargo.lock` 版本号统一从 `0.1.0` 升至 `0.1.1`（`0ca4fb8`），快进合并并推送 `main` 至 `origin/main`，重装本机 `/Applications/SENSE.app`（`0.1.1`），并经 `./tools/release.sh` 构建及用内嵌公钥验签 Apple 芯片 + Intel 双架构更新包与 `latest.json`（保留 `--publish` 供负责人在交互终端输入 `yes` 发布 GitHub Release）。
+
 ### 修复 · 2026-11-14 — 四轮与五轮 QC 复审闭环：多显示器坐标解构、未回车文字保存菜单/两步撤销与贴顶窗口原点同步
 
 **问题解决**
@@ -121,6 +127,8 @@
   - 右下角贴边空选区扩窗（`ocr-en-readme.png`，`rect=500,420,140,28`, `164×40 → 300×84`）：`empty=true`，`target_win=(360.0,386.0,300.0x84.0)`、`actual_win=Some((360.0, 386.0, 300.0, 84.0))`（`0.0pt` 误差）。
 - 提交后将快进合并至主仓库 `main`，备份后由 `./tools/install-app.sh` 重装 `/Applications/SENSE.app`。
 - **未验证（已知边界）**：物理按键 `⌃⌥⌘X` 真人手拖框、物理刘海屏真机与线上 DeepSeek API 实测延迟仍待用户本机体验确认。
+
+## [0.1.0] - 2026-11-01
 
 ### D1 · 2026-10-22 — 工程骨架与窗口
 

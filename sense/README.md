@@ -183,7 +183,7 @@ macOS 上的 AI 翻译器。查一个词，给一张完整的义项卡——音�
 产物是两个包（Apple 芯片 `aarch64`、Intel `x64`）加一份 `latest.json`，都发在 GitHub Release 上。**一条命令构建，发布要你另外确认**：
 
 ```bash
-# 1. 改版本号，四处必须一致：src-tauri/tauri.conf.json、src-tauri/Cargo.toml、src-tauri/Cargo.lock（在 src-tauri 里跑一次 cargo check，它会自己更新）、package.json。提交，再 push（push 要单独授权）
+# 1. 改版本号，五处必须一致：src-tauri/tauri.conf.json、src-tauri/Cargo.toml、src-tauri/Cargo.lock（在 src-tauri 里跑一次 cargo check，它会自己更新）、package.json、package-lock.json。提交，再 push（push 要单独授权）
 # 2. 只构建，不上传任何东西：产物在 dist-release/
 ./tools/release.sh --notes-file notes.md      # notes.md 是更新说明，应用里会显示；不写就是「SENSE vX.Y.Z」
 # 3. 确认没问题再发布（必须在交互式终端里运行，会让你亲自输入 yes；发布前核对 HEAD 已在 origin/main、这个版本没发过）
@@ -194,10 +194,10 @@ macOS 上的 AI 翻译器。查一个词，给一张完整的义项卡——音�
 
 脚本做的事：**开头**就核对版本号四处一致、`tauri.conf.json` 里的更新安全开关没被关（`requireSignedVersion`、不开明文 http）、私钥权限是 600 且和配置里的公钥一致、`SENSE Dev` 证书的 SHA-1 指纹对得上；`--publish` 的前提（`origin` 就是本仓库、`gh` 已登录、HEAD 已在 `origin/main`、这个版本没发过）也在构建之前查，不等构建完才发现。然后跑 `npm run typecheck`、`npm test`、`cargo test --locked`，不绿就停；两种芯片各构建一次（`--locked`），核对芯片、OCR 辅助程序的最低系统版本、主程序里带着配置里的更新公钥；用 `SENSE Dev` 签名（与 `install-app.sh` 同一种签法）；打成 `.app.tar.gz`，审一遍里面的成员（没有 `._` 附属文件、没有路径穿越）并解包回来再验一次签名；用更新私钥签名并绑定版本号；生成 `latest.json` 并核对；**用应用里写死的公钥给两个包真的验一次签**（`node tools/update-manifest.mjs verify …`，也可以单独拿来验任何一个 Release）。发布后把线上的 `latest.json` 和它指向的两个安装包下载回来，再用同一把公钥验一遍。
 
-**第一次发布，以及怎么验证真实的更新链**：现在的版本号 0.1.0 就是带更新器的第一个版本。**更早装在其他电脑上的 SENSE 没有更新器，不会自己更新**，每台要手动装一次这个版本（见下面「在另一台电脑上第一次安装」）。所以：
+**首次基线（`v0.1.0`）与升级链验证**：`0.1.0` 是带更新器的首个已发布版本；**更早装在其他电脑上的 SENSE 没有更新器，不会自己更新**，每台要手动装一次带更新器的版本（见下面「在另一台电脑上第一次安装」）。以 `v0.1.0 → v0.1.1` 为例：
 
-1. 先发 `v0.1.0`（上面的 3），在另一台电脑上手动装好；
-2. 再把版本号改成 `0.1.1`（四处）、提交、push，发 `v0.1.1`；
+1. 先确保机器上装有 `v0.1.0`（或通过 Releases 手动安装）；
+2. 把版本号改成 `0.1.1`（五处）、提交、push，发 `v0.1.1`；
 3. 那台电脑上的 SENSE 会在 6 小时内自己发现并下载（也可以在设置页点「检查更新」立刻触发），窗口顶部出现「立即重启」，点它，应用以 0.1.1 重新打开，设置页写着「最近一次更新：v0.1.0 → v0.1.1」。
 
 这条链上下载走的是真的 GitHub（CDN 重定向）、真的管理员授权弹窗（如果那台电脑上装在 `/Applications` 里而账户没有写权限）——这些是本机演练碰不到的，值得在这一步亲眼看一遍。
