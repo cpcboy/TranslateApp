@@ -183,6 +183,7 @@ pub fn run() {
             window::set_hotkey,
             capture::start_capture,
             capture::close_overlay,
+            capture::focus_overlay,
             capture::capture_blocks,
             capture::capture_original_image,
             capture::set_capture_hit_rects,

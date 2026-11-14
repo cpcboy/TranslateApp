@@ -111,6 +111,7 @@ export function CaptureToolbar({
       data-testid="capture-toolbar"
       className={`pointer-events-auto flex ${subbarOrderClass} items-center gap-1.5 select-none`}
       onClick={(e) => e.stopPropagation()}
+      onMouseDown={(e) => e.preventDefault()}
       onPointerDown={(e) => e.stopPropagation()}
     >
       {/* 主工具条 */}

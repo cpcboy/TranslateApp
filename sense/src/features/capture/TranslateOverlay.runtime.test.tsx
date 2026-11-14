@@ -91,6 +91,7 @@ const ipcMock = vi.hoisted(() => ({
   setCaptureHitRects: vi.fn<(rects: unknown, lock?: boolean, gen?: number) => Promise<void>>(),
   retranslateCapture: vi.fn<(target: string) => Promise<void>>(),
   saveCaptureImage: vi.fn<(kind: SaveImageKind, pngBase64: string | null) => Promise<SaveImageResult>>(),
+  focusOverlay: vi.fn<(generation?: number) => Promise<void>>(),
   closeOverlay: vi.fn<(generation?: number) => Promise<void>>(),
   updateHandlers: [] as Array<(view: CaptureView) => void>,
   updateUnlistenCalls: 0,
@@ -111,6 +112,7 @@ vi.mock("../../lib/ipc", async (importOriginal) => {
       setCaptureHitRects: ipcMock.setCaptureHitRects,
       retranslateCapture: ipcMock.retranslateCapture,
       saveCaptureImage: ipcMock.saveCaptureImage,
+      focusOverlay: ipcMock.focusOverlay,
       closeOverlay: ipcMock.closeOverlay,
     },
     onCaptureUpdate: (handler: (view: CaptureView) => void) => {
@@ -272,6 +274,8 @@ beforeEach(() => {
   ipcMock.retranslateCapture.mockResolvedValue();
   ipcMock.saveCaptureImage.mockReset();
   ipcMock.saveCaptureImage.mockResolvedValue({ saved: true, path: "/tmp/out.png" });
+  ipcMock.focusOverlay.mockReset();
+  ipcMock.focusOverlay.mockResolvedValue();
   ipcMock.closeOverlay.mockReset();
   ipcMock.closeOverlay.mockResolvedValue();
   ipcMock.updateHandlers = [];
@@ -963,5 +967,387 @@ describe("TranslateOverlay 运行时状态机与工具条回归测试", () => {
     (findToolbarProps(root)!.onUndo as () => void)();
     root = renderOverlay();
     expect(findToolbarProps(root)!.annotationsCount).toBe(0);
+  });
+
+  it("[FIX-TEXT-INPUT] 点击画布 preventDefault + 聚焦叠加窗 + 切换点击防旧失焦竞态 + IME/窗口失焦保护 + 刁钻输入实测", async () => {
+    let appFocused = true;
+    (globalThis as Record<string, unknown>).document = {
+      createElement: () => ({ getContext: () => null }),
+      hasFocus: () => appFocused,
+    };
+
+    ipcMock.captureBlocks.mockResolvedValue({
+      blocks: [sampleBlock()],
+      error: null,
+      notice: null,
+      stage: "done",
+      generation: 33,
+      revision: 1,
+      has_image: true,
+      scale: 2,
+      bounds: { w: 800, h: 600 },
+      image_rect: { x: 0, y: 0, w: 800, h: 600 },
+    });
+
+    let root = renderOverlay();
+    await flush();
+    root = renderOverlay();
+
+    // 1) 选中文字工具时触发 focusOverlay
+    (findToolbarProps(root)!.onSelectTool as (tool: "text") => void)("text");
+    root = renderOverlay();
+    expect(ipcMock.focusOverlay).toHaveBeenCalledWith(33);
+
+    // 2) 在 A 点 (120, 90) 点击画布：必须调用 preventDefault() 阻断原生 mousedown 回抢焦点，再次调用 focusOverlay，
+    // 并验证 svg.onMouseDown 与 CaptureToolbar 根容器（保护分隔缝隙/边距）均 preventDefault
+    const svg1 = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    const preventA = vi.fn();
+    (svg1.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 1,
+      clientX: 120,
+      clientY: 90,
+      preventDefault: preventA,
+      stopPropagation: () => {},
+      currentTarget: {},
+    });
+    root = renderOverlay();
+    expect(preventA).toHaveBeenCalledTimes(1);
+    expect(ipcMock.focusOverlay).toHaveBeenCalledTimes(2);
+    expect(ipcMock.focusOverlay).toHaveBeenLastCalledWith(33);
+
+    const preventSvgMouseDown = vi.fn();
+    ((findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!.props.onMouseDown) as (
+      e: unknown,
+    ) => void)({ button: 0, preventDefault: preventSvgMouseDown });
+    expect(preventSvgMouseDown).toHaveBeenCalledTimes(1);
+
+    const toolbarRoot = CaptureToolbar(findToolbarProps(root) as Parameters<typeof CaptureToolbar>[0]) as El;
+    const preventToolbarWrap = vi.fn();
+    (toolbarRoot.props.onMouseDown as (e: { preventDefault: () => void }) => void)({
+      preventDefault: preventToolbarWrap,
+    });
+    expect(preventToolbarWrap).toHaveBeenCalledTimes(1);
+
+    const taA = findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!;
+    expect(taA).not.toBeNull();
+    expect(taA.props["data-hit-rect"]).toBe("true");
+    expect(findElement(root, (el) => el.props["data-testid"] === "annotation-text-placeholder")).not.toBeNull();
+
+    // 挂载模拟 DOM node 验证聚焦管理与 window focus 恢复聚焦
+    const mockTaDom = {
+      value: "",
+      dataset: { draftId: String(taA.props["data-draft-id"]) },
+      focus: vi.fn(),
+      setSelectionRange: vi.fn(),
+    };
+    const taRef = (taA.props.ref ?? (taA as unknown as { ref?: unknown }).ref) as
+      | { current: unknown }
+      | undefined;
+    expect(taRef && typeof taRef === "object" && "current" in taRef).toBe(true);
+    taRef!.current = mockTaDom;
+    for (const fn of windowState.listeners.get("focus") ?? []) {
+      fn({});
+    }
+    expect(mockTaDom.focus).toHaveBeenCalledWith({ preventScroll: true });
+
+    // 输入 IME 组合中（isComposing / keyCode=229）按 Enter 和 Escape 不提交、不取消
+    (taA.props.onCompositionStart as () => void)();
+    root = renderOverlay();
+    expect(findElement(root, (el) => el.props["data-testid"] === "annotation-text-placeholder")).toBeNull();
+
+    const taADuringIme = findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!;
+    (taADuringIme.props.onKeyDown as (e: unknown) => void)({
+      key: "Enter",
+      shiftKey: false,
+      nativeEvent: { isComposing: true },
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    for (const fn of windowState.listeners.get("keydown") ?? []) {
+      fn({ key: "Escape", isComposing: true, keyCode: 229 });
+    }
+    root = renderOverlay();
+    expect(findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")).not.toBeNull();
+
+    // 窗口失焦（appFocused=false）触发 textarea onBlur 不销毁正在输入的草稿
+    appFocused = false;
+    (taADuringIme.props.onBlur as () => void)();
+    root = renderOverlay();
+    expect(findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")).not.toBeNull();
+    appFocused = true;
+
+    // 提交纯中文 + 引号 + 多空格文本（同步真实 DOM value）
+    mockTaDom.value = '中文标注："引号"   三空格';
+    (taADuringIme.props.onCompositionEnd as (e: unknown) => void)({
+      currentTarget: mockTaDom,
+    });
+    root = renderOverlay();
+
+    // 3) 直接点击新位置 B (340, 220)：自动提交 A，且旧草稿 A 迟到的 onBlur 不得销毁新草稿 B
+    const svg2 = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svg2.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 2,
+      clientX: 340,
+      clientY: 220,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+      currentTarget: {},
+    });
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.annotationsCount).toBe(1);
+    const taB = findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!;
+    expect((taB.props.style as { left: number }).left).toBe(340);
+
+    // 模拟旧输入框 A 迟到 onBlur：不得摧毁 B
+    (taADuringIme.props.onBlur as () => void)();
+    root = renderOverlay();
+    const taBAfterStaleBlur = findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!;
+    expect(taBAfterStaleBlur).not.toBeNull();
+    expect((taBAfterStaleBlur.props.style as { left: number }).left).toBe(340);
+
+    // 验证 AnnotationShape 渲染出的 SVG <text> 使用 whiteSpace: "pre" 保留连续空格
+    const svgWithAnn = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    const shapeHost = findElement(svgWithAnn, (el) => typeof el.type === "function" && "item" in el.props)!;
+    const shapeEl = (shapeHost.type as (props: unknown) => El)(shapeHost.props);
+    const svgText = findElement(shapeEl, (el) => el.type === "text")!;
+    expect((shapeHost.props.item as { text: string }).text).toBe('中文标注："引号"   三空格');
+    expect((svgText.props.style as { whiteSpace: string }).whiteSpace).toBe("pre");
+
+    // 重复提交完全相同的中文文字（重名），并验证导出 PNG 收到两条独立 id 且都完整保留三空格
+    (taBAfterStaleBlur.props.onChange as (e: unknown) => void)({ target: { value: '中文标注："引号"   三空格' } });
+    root = renderOverlay();
+    (findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!.props.onKeyDown as (
+      e: unknown,
+    ) => void)({
+      key: "Enter",
+      shiftKey: false,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.annotationsCount).toBe(2);
+
+    await (findToolbarProps(root)!.onSave as (kind: SaveImageKind) => Promise<void>)("original_annotated");
+    root = renderOverlay();
+    expect(exportMock.renderCapturePngBase64).toHaveBeenCalledTimes(1);
+    const dupExportArgs = exportMock.renderCapturePngBase64.mock.calls[0]![0] as {
+      annotations: Array<{ id: string; text: string }>;
+    };
+    expect(dupExportArgs.annotations).toHaveLength(2);
+    expect(dupExportArgs.annotations[0]!.id).not.toBe(dupExportArgs.annotations[1]!.id);
+    expect(dupExportArgs.annotations[0]!.text).toBe('中文标注："引号"   三空格');
+    expect(dupExportArgs.annotations[1]!.text).toBe('中文标注："引号"   三空格');
+
+    // 新点一处后空着直接回车提交：不新增标注，仍维持 2 条
+    const svgEmpty = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svgEmpty.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 3,
+      clientX: 380,
+      clientY: 250,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+      currentTarget: {},
+    });
+    root = renderOverlay();
+    const taEmpty = findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!;
+    (taEmpty.props.onChange as (e: unknown) => void)({ target: { value: "   " } });
+    root = renderOverlay();
+    (findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!.props.onKeyDown as (
+      e: unknown,
+    ) => void)({
+      key: "Enter",
+      shiftKey: false,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.annotationsCount).toBe(2);
+
+    // 连续快速点击 6 个位置：不产生空标注、最终框稳定留在最后一个点击点 (450, 310)
+    for (let i = 0; i < 6; i++) {
+      const s = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+      (s.props.onPointerDown as (e: unknown) => void)({
+        button: 0,
+        pointerId: 10 + i,
+        clientX: 200 + i * 50,
+        clientY: 160 + i * 30,
+        preventDefault: () => {},
+        stopPropagation: () => {},
+        currentTarget: {},
+      });
+      root = renderOverlay();
+    }
+    expect(findToolbarProps(root)!.annotationsCount).toBe(2);
+    const finalTa = findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!;
+    expect((finalTa.props.style as { left: number; top: number })).toMatchObject({ left: 450, top: 310 });
+  });
+
+  it("[FIX-TEXT-INPUT-EDGE] 旧草稿迟到 composition 不串扰、未重渲染即时失焦不丢字、切代重置 IME、Shift+Enter 换行与 Esc 取消", async () => {
+    ipcMock.captureBlocks.mockResolvedValue({
+      blocks: [sampleBlock()],
+      error: null,
+      notice: null,
+      stage: "done",
+      generation: 41,
+      revision: 1,
+      has_image: true,
+      scale: 2,
+      bounds: { w: 800, h: 600 },
+      image_rect: { x: 0, y: 0, w: 800, h: 600 },
+    });
+
+    let root = renderOverlay();
+    await flush();
+    root = renderOverlay();
+
+    (findToolbarProps(root)!.onSelectTool as (tool: "text") => void)("text");
+    root = renderOverlay();
+
+    // 1) 在 A 点开框并处于 IME 组合态，随后切去 B 点并在 B 开启组合后投递旧 A 迟到的 onCompositionEnd
+    const svg1 = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svg1.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 1,
+      clientX: 100,
+      clientY: 80,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+      currentTarget: {},
+    });
+    root = renderOverlay();
+    const taA = findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!;
+    (taA.props.onCompositionStart as () => void)();
+    root = renderOverlay();
+
+    (findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!.props.onPointerDown as (
+      e: unknown,
+    ) => void)({
+      button: 0,
+      pointerId: 2,
+      clientX: 260,
+      clientY: 160,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+      currentTarget: {},
+    });
+    root = renderOverlay();
+    const taB = findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!;
+    (taB.props.onCompositionStart as () => void)();
+    root = renderOverlay();
+    expect(findElement(root, (el) => el.props["data-testid"] === "annotation-text-placeholder")).toBeNull();
+
+    // 旧 A 迟到触发 onCompositionEnd：因 draftId 校验不得清空 B 的 isComposingText 或覆写内容
+    (taA.props.onCompositionEnd as (e: unknown) => void)({ currentTarget: { value: "旧草稿泄露" } });
+    root = renderOverlay();
+    expect(findElement(root, (el) => el.props["data-testid"] === "annotation-text-placeholder")).toBeNull();
+    expect(findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!.props.value).toBe("");
+
+    // 2) 测试同批次不重渲染即触发 onBlur 也不丢字，以及 Shift+Enter 多行递增 rows
+    const liveTaB = findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!;
+    (liveTaB.props.onCompositionEnd as (e: unknown) => void)({ currentTarget: { value: "第一行\n第二行" } });
+    root = renderOverlay();
+    const multiTa = findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!;
+    expect(multiTa.props.rows).toBe(2);
+
+    // Shift+Enter 不提前提交草稿
+    const shiftPrevent = vi.fn();
+    (multiTa.props.onKeyDown as (e: unknown) => void)({
+      key: "Enter",
+      shiftKey: true,
+      preventDefault: shiftPrevent,
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+    expect(shiftPrevent).not.toHaveBeenCalled();
+    expect(findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")).not.toBeNull();
+
+    // 不经重渲染直接在 onChange 后紧接 onBlur（模拟批处理/末尾瞬态），必须完整提交
+    const multiTa2 = findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!;
+    (multiTa2.props.onChange as (e: unknown) => void)({ target: { value: "第一行\n第二行末字" } });
+    (multiTa2.props.onBlur as (e: unknown) => void)({ currentTarget: { value: "第一行\n第二行末字" } });
+    root = renderOverlay();
+    await (findToolbarProps(root)!.onSave as (kind: SaveImageKind) => Promise<void>)("translated");
+    root = renderOverlay();
+    const savedMulti = (
+      exportMock.renderCapturePngBase64.mock.calls[0]![0] as { annotations: Array<{ text: string }> }
+    ).annotations[0]!;
+    expect(savedMulti.text).toBe("第一行\n第二行末字");
+
+    // 3) 非空草稿按 Escape 取消不新增标注
+    (findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!.props.onPointerDown as (
+      e: unknown,
+    ) => void)({
+      button: 0,
+      pointerId: 3,
+      clientX: 180,
+      clientY: 140,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+      currentTarget: {},
+    });
+    root = renderOverlay();
+    const taEsc = findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!;
+    (taEsc.props.onChange as (e: unknown) => void)({ target: { value: "要放弃的文字" } });
+    root = renderOverlay();
+    (findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!.props.onKeyDown as (
+      e: unknown,
+    ) => void)({
+      key: "Escape",
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+    expect(findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")).toBeNull();
+    expect(findToolbarProps(root)!.annotationsCount).toBe(1);
+
+    // 4) isComposingText === true 时触发新世代截图（genChanged）必须清空组合状态，使下一代占位符正常显示
+    (findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!.props.onPointerDown as (
+      e: unknown,
+    ) => void)({
+      button: 0,
+      pointerId: 4,
+      clientX: 200,
+      clientY: 160,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+      currentTarget: {},
+    });
+    root = renderOverlay();
+    (findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!.props.onCompositionStart as () => void)();
+    root = renderOverlay();
+
+    for (const h of ipcMock.updateHandlers) {
+      h({
+        blocks: [sampleBlock()],
+        error: null,
+        notice: null,
+        stage: "done",
+        generation: 42,
+        revision: 1,
+        has_image: true,
+        scale: 2,
+        bounds: { w: 800, h: 600 },
+        image_rect: { x: 0, y: 0, w: 800, h: 600 },
+      });
+    }
+    root = renderOverlay();
+    (findToolbarProps(root)!.onSelectTool as (tool: "text") => void)("text");
+    root = renderOverlay();
+    (findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!.props.onPointerDown as (
+      e: unknown,
+    ) => void)({
+      button: 0,
+      pointerId: 5,
+      clientX: 210,
+      clientY: 170,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+      currentTarget: {},
+    });
+    root = renderOverlay();
+    expect(findElement(root, (el) => el.props["data-testid"] === "annotation-text-placeholder")).not.toBeNull();
   });
 });

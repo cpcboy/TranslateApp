@@ -202,6 +202,7 @@ export const api = {
     invoke<void>("retranslate_capture", { targetLang }),
   saveCaptureImage: (kind: SaveImageKind, pngBase64?: string | null) =>
     invoke<SaveImageResult>("save_capture_image", { kind, pngBase64: pngBase64 ?? null }),
+  focusOverlay: (generation?: number) => invoke<void>("focus_overlay", { generation: generation ?? null }),
   closeOverlay: (generation?: number) => invoke<void>("close_overlay", { generation: generation ?? null }),
   translateText: (text: string, requestId: string) =>
     invoke<LongTextResult>("translate_text", {

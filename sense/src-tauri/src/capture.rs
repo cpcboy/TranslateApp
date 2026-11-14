@@ -749,6 +749,20 @@ pub fn close_overlay(app: AppHandle, state: State<'_, CaptureState>, generation:
 }
 
 #[tauri::command]
+pub fn focus_overlay(app: AppHandle, state: State<'_, CaptureState>, generation: Option<u64>) {
+    if let Some(g) = generation {
+        if !is_current(&state.generation, g) {
+            return;
+        }
+    }
+    if let Some(overlay) = app.get_webview_window(OVERLAY_WINDOW) {
+        if overlay.is_visible().unwrap_or(false) {
+            let _ = overlay.set_focus();
+        }
+    }
+}
+
+#[tauri::command]
 pub fn capture_blocks(app: AppHandle, state: State<'_, CaptureState>) -> CaptureView {
     let snap = state
         .snapshot

@@ -98,7 +98,8 @@ export function TranslateOverlay() {
   const [activeSize, setActiveSize] = useState<AnnotationSize["id"]>("md");
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [draftAnnotation, setDraftAnnotation] = useState<Annotation | null>(null);
-  const [textDraft, setTextDraft] = useState<{ x: number; y: number; value: string } | null>(null);
+  const [textDraft, setTextDraft] = useState<{ id: number; x: number; y: number; value: string } | null>(null);
+  const [isComposingText, setIsComposingText] = useState(false);
 
   const [viewport, setViewport] = useState(() => ({
     w: typeof window !== "undefined" ? window.innerWidth : 0,
@@ -114,11 +115,37 @@ export function TranslateOverlay() {
   const stageElRef = useRef<HTMLDivElement | null>(null);
   const toolbarAnchorRef = useRef<HTMLDivElement | null>(null);
   const openPopoverRef = useRef<ToolbarPopover>("none");
-  const textDraftRef = useRef<{ x: number; y: number; value: string } | null>(null);
+  const textDraftRef = useRef<{ id: number; x: number; y: number; value: string } | null>(null);
+  const textDraftSeqRef = useRef<number>(0);
+  const textInputRef = useRef<HTMLTextAreaElement | null>(null);
   const annotationsRef = useRef<Annotation[]>([]);
   const originalUrlRef = useRef<string | null>(null);
   const originalLoadPromiseRef = useRef<Promise<string | null> | null>(null);
   const toastTimerRef = useRef<number | undefined>(undefined);
+
+  const focusTextDraftInput = useCallback((placeCaretEnd = false) => {
+    const ta = textInputRef.current;
+    if (!ta || typeof ta.focus !== "function") return;
+    try {
+      ta.focus({ preventScroll: true });
+    } catch {
+      ta.focus();
+    }
+    if (placeCaretEnd && typeof ta.setSelectionRange === "function") {
+      const len = ta.value?.length ?? 0;
+      ta.setSelectionRange(len, len);
+    }
+  }, []);
+
+  const ensureOverlayWindowFocused = useCallback(() => {
+    void api.focusOverlay?.(generationRef.current)?.catch?.(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (textDraft?.id == null) return () => {};
+    focusTextDraftInput(true);
+    return () => {};
+  }, [textDraft?.id, focusTextDraftInput]);
 
   const sizePreset = useMemo(
     () => ANNOTATION_SIZES.find((item) => item.id === activeSize) ?? ANNOTATION_SIZES[1],
@@ -189,6 +216,11 @@ export function TranslateOverlay() {
       return () => {};
     }
     const onResize = () => setViewport({ w: window.innerWidth, h: window.innerHeight });
+    const onFocus = () => {
+      if (textDraftRef.current) {
+        focusTextDraftInput();
+      }
+    };
     const onBlur = () => {
       if (openPopoverRef.current !== "none") {
         openPopoverRef.current = "none";
@@ -196,12 +228,14 @@ export function TranslateOverlay() {
       }
     };
     window.addEventListener("resize", onResize);
+    window.addEventListener("focus", onFocus);
     window.addEventListener("blur", onBlur);
     return () => {
       window.removeEventListener("resize", onResize);
+      window.removeEventListener("focus", onFocus);
       window.removeEventListener("blur", onBlur);
     };
-  }, []);
+  }, [focusTextDraftInput]);
 
   useEffect(() => {
     let disposed = false;
@@ -249,6 +283,7 @@ export function TranslateOverlay() {
         setDraftAnnotation(null);
         textDraftRef.current = null;
         setTextDraft(null);
+        setIsComposingText(false);
         setActiveTool("none");
         setShowOriginal(false);
         openPopoverRef.current = "none";
@@ -306,10 +341,12 @@ export function TranslateOverlay() {
       });
 
     const onKey = (event: KeyboardEvent) => {
+      if (event.isComposing || event.keyCode === 229) return;
       if (event.key === "Escape") {
         if (textDraftRef.current) {
           textDraftRef.current = null;
           setTextDraft(null);
+          setIsComposingText(false);
           return;
         }
         if (openPopoverRef.current !== "none") {
@@ -381,12 +418,22 @@ export function TranslateOverlay() {
     [stageRect.h, stageRect.w],
   );
 
-  const flushTextDraft = useCallback((): Annotation[] => {
+  const flushTextDraft = useCallback((expectedId?: number): Annotation[] => {
     const current = textDraftRef.current;
     if (!current) return annotationsRef.current;
+    const targetId = typeof expectedId === "number" ? expectedId : undefined;
+    if (targetId !== undefined && current.id !== targetId) {
+      return annotationsRef.current;
+    }
     textDraftRef.current = null;
     setTextDraft(null);
-    const trimmed = current.value.trim();
+    setIsComposingText(false);
+    const domTa = textInputRef.current;
+    const rawValue =
+      domTa && domTa.dataset?.draftId === String(current.id) && typeof domTa.value === "string"
+        ? domTa.value
+        : current.value;
+    const trimmed = rawValue.trim();
     if (!trimmed) return annotationsRef.current;
     const layout = computeTextBoxLayout({
       x: current.x,
@@ -484,16 +531,19 @@ export function TranslateOverlay() {
     (tool: AnnotationTool) => {
       if (tool !== "text" && textDraftRef.current) {
         flushTextDraft();
+      } else if (tool === "text") {
+        ensureOverlayWindowFocused();
       }
       setActiveTool(tool);
     },
-    [flushTextDraft],
+    [ensureOverlayWindowFocused, flushTextDraft],
   );
 
   const handleUndo = useCallback(() => {
     if (textDraftRef.current) {
       textDraftRef.current = null;
       setTextDraft(null);
+      setIsComposingText(false);
       return;
     }
     const nextList = annotationsRef.current.slice(0, -1);
@@ -504,6 +554,7 @@ export function TranslateOverlay() {
   const handleStagePointerDown = useCallback(
     (event: ReactPointerEvent<SVGSVGElement>) => {
       if (event.button !== 0 || activeTool === "none") return;
+      event.preventDefault?.();
       event.stopPropagation();
       openPopoverRef.current = "none";
       setOpenPopover("none");
@@ -511,9 +562,12 @@ export function TranslateOverlay() {
       const pt = stageLocalPoint(event.clientX, event.clientY);
       if (activeTool === "text") {
         flushTextDraft();
-        const fresh = { x: pt.x, y: pt.y, value: "" };
+        const nextId = ++textDraftSeqRef.current;
+        const fresh = { id: nextId, x: pt.x, y: pt.y, value: "" };
         textDraftRef.current = fresh;
         setTextDraft(fresh);
+        setIsComposingText(false);
+        ensureOverlayWindowFocused();
         return;
       }
       flushTextDraft();
@@ -541,7 +595,7 @@ export function TranslateOverlay() {
         });
       }
     },
-    [activeColor, activeTool, flushTextDraft, sizePreset.strokeWidth, stageLocalPoint],
+    [activeColor, activeTool, ensureOverlayWindowFocused, flushTextDraft, sizePreset.strokeWidth, stageLocalPoint],
   );
 
   const handleStagePointerMove = useCallback(
@@ -681,12 +735,17 @@ export function TranslateOverlay() {
     openPopover,
     retranslating,
     showToolbar,
+    activeSize,
     stage,
     stageRect.h,
     stageRect.w,
     stageRect.x,
     stageRect.y,
     targetLang,
+    textDraft?.id ?? null,
+    textDraft?.value.length ?? 0,
+    textDraft?.x ?? null,
+    textDraft?.y ?? null,
     toolbarLeft,
     toolbarTop,
   ]);
@@ -709,7 +768,7 @@ export function TranslateOverlay() {
           ref={stageElRef}
           data-testid="capture-stage"
           data-hit-rect="true"
-          className="absolute overflow-hidden"
+          className="absolute"
           style={{
             left: stageRect.x,
             top: stageRect.y,
@@ -717,27 +776,29 @@ export function TranslateOverlay() {
             height: stageRect.h,
           }}
         >
-          {originalImageUrl && (
-            <img
-              src={originalImageUrl}
-              alt=""
-              draggable={false}
-              data-testid="capture-original-image"
-              className="pointer-events-none absolute inset-0 h-full w-full select-none object-fill"
-            />
-          )}
+          <div className="pointer-events-none absolute inset-0 overflow-hidden">
+            {originalImageUrl && (
+              <img
+                src={originalImageUrl}
+                alt=""
+                draggable={false}
+                data-testid="capture-original-image"
+                className="pointer-events-none absolute inset-0 h-full w-full select-none object-fill"
+              />
+            )}
 
-          <OverlayView
-            blocks={blocks}
-            error={actionError ?? error}
-            notice={saveToast ?? notice}
-            stage={stage}
-            hint={hint}
-            bounds={{ w: stageRect.w, h: stageRect.h }}
-            hideTranslation={showOriginal}
-            hideFloatingEsc={showToolbar}
-            hideChrome
-          />
+            <OverlayView
+              blocks={blocks}
+              error={actionError ?? error}
+              notice={saveToast ?? notice}
+              stage={stage}
+              hint={hint}
+              bounds={{ w: stageRect.w, h: stageRect.h }}
+              hideTranslation={showOriginal}
+              hideFloatingEsc={showToolbar}
+              hideChrome
+            />
+          </div>
 
           {(annotations.length > 0 || draftAnnotation !== null || activeTool !== "none") && (
             <svg
@@ -746,6 +807,11 @@ export function TranslateOverlay() {
               height={stageRect.h}
               viewBox={`0 0 ${stageRect.w} ${stageRect.h}`}
               onPointerDown={handleStagePointerDown}
+              onMouseDown={(e) => {
+                if (e.button === 0 && activeTool !== "none") {
+                  e.preventDefault();
+                }
+              }}
               onPointerMove={handleStagePointerMove}
               onPointerUp={finishDraft}
               onPointerCancel={finishDraft}
@@ -765,6 +831,7 @@ export function TranslateOverlay() {
           )}
 
           {textDraft && (() => {
+            const draftId = textDraft.id;
             const box = computeTextBoxLayout({
               x: textDraft.x,
               y: textDraft.y,
@@ -774,44 +841,112 @@ export function TranslateOverlay() {
               stageHeight: stageRect.h,
             });
             return (
-              <textarea
-                data-testid="annotation-text-input"
-                autoFocus
-                rows={box.rows}
-                value={textDraft.value}
-                placeholder="输入文字"
-                onChange={(e) => {
-                  const val = e.target.value;
-                  setTextDraft((prev) => {
-                    const next = prev ? { ...prev, value: val } : null;
-                    textDraftRef.current = next;
-                    return next;
-                  });
-                }}
-                onBlur={flushTextDraft}
-                onKeyDown={(e) => {
-                  e.stopPropagation();
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    flushTextDraft();
-                  } else if (e.key === "Escape") {
-                    e.preventDefault();
-                    textDraftRef.current = null;
-                    setTextDraft(null);
-                  }
-                }}
-                className="absolute z-30 box-border min-w-[96px] resize-none overflow-hidden rounded border border-white/75 bg-black/55 font-semibold outline-none"
-                style={{
-                  left: box.left,
-                  top: box.top,
-                  maxWidth: box.maxWidth,
-                  maxHeight: box.maxHeight,
-                  padding: `${TEXT_DRAFT_PAD_Y - 1}px ${TEXT_DRAFT_PAD_X - 1}px`,
-                  lineHeight: `${box.lineHeight}px`,
-                  color: activeColor,
-                  fontSize: sizePreset.fontSize,
-                }}
-              />
+              <>
+                <textarea
+                  key={draftId}
+                  ref={textInputRef}
+                  data-testid="annotation-text-input"
+                  data-draft-id={String(draftId)}
+                  data-hit-rect="true"
+                  aria-label="输入标注文字"
+                  autoFocus
+                  wrap="off"
+                  rows={box.rows}
+                  value={textDraft.value}
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onCompositionStart={() => {
+                    if (textDraftRef.current?.id !== draftId) return;
+                    setIsComposingText(true);
+                  }}
+                  onCompositionEnd={(e) => {
+                    if (textDraftRef.current?.id !== draftId) return;
+                    setIsComposingText(false);
+                    const nextVal = (e.currentTarget as HTMLTextAreaElement | undefined)?.value;
+                    if (typeof nextVal === "string" && textDraftRef.current.value !== nextVal) {
+                      textDraftRef.current = { ...textDraftRef.current, value: nextVal };
+                      setTextDraft((prev) => {
+                        if (!prev || prev.id !== draftId || prev.value === nextVal) return prev;
+                        return { ...prev, value: nextVal };
+                      });
+                    }
+                  }}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    if (textDraftRef.current?.id === draftId) {
+                      textDraftRef.current = { ...textDraftRef.current, value: val };
+                    }
+                    setTextDraft((prev) => {
+                      if (!prev || prev.id !== draftId) return prev;
+                      return { ...prev, value: val };
+                    });
+                  }}
+                  onBlur={(e) => {
+                    if (
+                      typeof document !== "undefined" &&
+                      typeof document.hasFocus === "function" &&
+                      !document.hasFocus()
+                    ) {
+                      return;
+                    }
+                    const currentVal = (e?.currentTarget as HTMLTextAreaElement | undefined)?.value;
+                    if (
+                      typeof currentVal === "string" &&
+                      textDraftRef.current?.id === draftId &&
+                      textDraftRef.current.value !== currentVal
+                    ) {
+                      textDraftRef.current = { ...textDraftRef.current, value: currentVal };
+                    }
+                    flushTextDraft(draftId);
+                  }}
+                  onKeyDown={(e) => {
+                    e.stopPropagation();
+                    const native = (e as { nativeEvent?: { isComposing?: boolean; keyCode?: number } }).nativeEvent;
+                    if (native?.isComposing || (e as { keyCode?: number }).keyCode === 229) {
+                      return;
+                    }
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      flushTextDraft(draftId);
+                    } else if (e.key === "Escape") {
+                      e.preventDefault();
+                      textDraftRef.current = null;
+                      setTextDraft(null);
+                      setIsComposingText(false);
+                    }
+                  }}
+                  className="absolute z-30 box-border resize-none overflow-hidden rounded border border-white/75 bg-black/55 font-semibold outline-none"
+                  style={{
+                    left: box.left,
+                    top: box.top,
+                    width: box.width,
+                    minWidth: box.minWidth,
+                    maxWidth: box.maxWidth,
+                    maxHeight: box.maxHeight,
+                    padding: `${TEXT_DRAFT_PAD_Y - 1}px ${TEXT_DRAFT_PAD_X - 1}px`,
+                    lineHeight: `${box.lineHeight}px`,
+                    color: activeColor,
+                    fontSize: sizePreset.fontSize,
+                    whiteSpace: "pre",
+                  }}
+                />
+                {!textDraft.value && !isComposingText && box.width > TEXT_DRAFT_PAD_X * 2 && (
+                  <span
+                    data-testid="annotation-text-placeholder"
+                    aria-hidden="true"
+                    className="pointer-events-none absolute z-30 select-none overflow-hidden whitespace-nowrap font-semibold text-white/55"
+                    style={{
+                      left: box.textX,
+                      top: box.textY,
+                      maxWidth: Math.max(0, box.width - TEXT_DRAFT_PAD_X * 2),
+                      lineHeight: `${box.lineHeight}px`,
+                      fontSize: sizePreset.fontSize,
+                    }}
+                  >
+                    输入文字
+                  </span>
+                )}
+              </>
             );
           })()}
         </div>
@@ -955,7 +1090,7 @@ function AnnotationShape({ item }: { item: Annotation }) {
       fontSize={item.fontSize}
       fontWeight={600}
       dominantBaseline="text-before-edge"
-      style={{ textShadow: "0 1px 2px rgba(0,0,0,0.45)" }}
+      style={{ textShadow: "0 1px 2px rgba(0,0,0,0.45)", whiteSpace: "pre" }}
     >
       {item.text.split("\n").map((line, idx) => (
         <tspan key={idx} x={item.x} y={item.y + idx * lineH}>

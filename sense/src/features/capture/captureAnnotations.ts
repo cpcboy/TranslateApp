@@ -138,12 +138,35 @@ export const TEXT_DRAFT_PAD_Y = 3;
 export interface TextBoxLayout {
   left: number;
   top: number;
+  width: number;
+  minWidth: number;
   maxWidth: number;
   maxHeight: number;
   lineHeight: number;
   rows: number;
   textX: number;
   textY: number;
+}
+
+function estimateTextLineWidth(line: string, fontSize: number): number {
+  let width = 0;
+  for (const ch of line) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (code > 0xff) {
+      width += fontSize * 1.02;
+    } else if (ch === " " || ch === "\t") {
+      width += fontSize * 0.42;
+    } else if ("MWGQO@#%".includes(ch)) {
+      width += fontSize * 0.92;
+    } else if ((ch >= "A" && ch <= "Z") || (ch >= "0" && ch <= "9")) {
+      width += fontSize * 0.72;
+    } else if (".,:;!'|()[]{}`\"\\/".includes(ch)) {
+      width += fontSize * 0.48;
+    } else {
+      width += fontSize * 0.64;
+    }
+  }
+  return width;
 }
 
 /**
@@ -167,11 +190,22 @@ export function computeTextBoxLayout(options: {
   const boxHeight = rows * lineHeight + TEXT_DRAFT_PAD_Y * 2;
   const left = Math.max(0, Math.min(x, Math.max(0, safeW - maxBoxW)));
   const top = Math.max(0, Math.min(y, Math.max(0, safeH - boxHeight)));
-  const maxWidth = Math.max(40, Math.min(260, Math.max(40, safeW - left)));
+  const availableW = Math.max(0, safeW - left);
+  const minFloor = safeW > 0 ? Math.min(40, safeW) : 0;
+  const maxWidth = safeW > 0 ? Math.max(minFloor, availableW) : 0;
+  const minWidth = safeW > 0 ? Math.min(96, maxWidth) : 0;
+  const contentLineWidth = Math.max(
+    estimateTextLineWidth("输入文字", fontSize),
+    ...lines.map((line) => estimateTextLineWidth(line, fontSize)),
+  );
+  const desiredWidth = Math.ceil(contentLineWidth + TEXT_DRAFT_PAD_X * 2 + 12);
+  const width = safeW > 0 ? Math.max(minWidth, Math.min(maxWidth, desiredWidth)) : 0;
   const maxHeight = Math.max(lineHeight + TEXT_DRAFT_PAD_Y * 2, safeH - top);
   return {
     left,
     top,
+    width,
+    minWidth,
     maxWidth,
     maxHeight,
     lineHeight,

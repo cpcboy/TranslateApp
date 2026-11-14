@@ -134,7 +134,7 @@ describe("captureAnnotations 工具函数", () => {
     expect(rightBottom.left + rightBottom.maxWidth).toBeLessThanOrEqual(500);
     expect(rightBottom.top + rightBottom.maxHeight).toBeLessThanOrEqual(300);
 
-    // 3) 极窄画布不产出负位置
+    // 3) 极窄画布不产出负位置且宽度收紧在画布内
     const tiny = computeTextBoxLayout({
       x: 70,
       y: 35,
@@ -146,5 +146,76 @@ describe("captureAnnotations 工具函数", () => {
     expect(tiny.left).toBe(0);
     expect(tiny.top).toBeGreaterThanOrEqual(0);
     expect(tiny.textX).toBe(TEXT_DRAFT_PAD_X);
+    expect(tiny.minWidth).toBeLessThanOrEqual(80);
+    expect(tiny.width).toBeLessThanOrEqual(80);
+
+    // 4) 宽画布输入较长纯中文、引号与多空格文本时，输入框宽度随内容动态放宽且不越出画布
+    const emptyWide = computeTextBoxLayout({
+      x: 40,
+      y: 50,
+      value: "",
+      fontSize: 18,
+      stageWidth: 800,
+      stageHeight: 600,
+    });
+    const wideChinese = computeTextBoxLayout({
+      x: 40,
+      y: 50,
+      value: '重要提示："多空格   测试中文长句不要被过窄裁剪"',
+      fontSize: 18,
+      stageWidth: 800,
+      stageHeight: 600,
+    });
+    expect(wideChinese.width).toBeGreaterThan(emptyWide.width);
+    expect(wideChinese.width).toBeGreaterThan(260);
+    expect(wideChinese.left + wideChinese.width).toBeLessThanOrEqual(800);
+
+    // 5) 零宽画布无边界跳变
+    const zeroW = computeTextBoxLayout({
+      x: 10,
+      y: 10,
+      value: "测试",
+      fontSize: 18,
+      stageWidth: 0,
+      stageHeight: 40,
+    });
+    expect(zeroW.left).toBe(0);
+    expect(zeroW.minWidth).toBe(0);
+    expect(zeroW.width).toBe(0);
+    expect(zeroW.maxWidth).toBe(0);
+
+    // 6) 极扁画布 (stageHeight < boxHeight) 贴顶保底可读高
+    const flatStrip = computeTextBoxLayout({
+      x: 20,
+      y: 10,
+      value: "扁条测试",
+      fontSize: 18,
+      stageWidth: 300,
+      stageHeight: 16,
+    });
+    expect(flatStrip.top).toBe(0);
+    expect(flatStrip.maxHeight).toBeGreaterThanOrEqual(flatStrip.lineHeight + TEXT_DRAFT_PAD_Y * 2);
+
+    // 7) 超过 5 行文本时 rows 封顶为 5；宽大写字母不超出画布
+    const sixLines = computeTextBoxLayout({
+      x: 10,
+      y: 10,
+      value: "L1\nL2\nL3\nL4\nL5\nL6",
+      fontSize: 18,
+      stageWidth: 500,
+      stageHeight: 400,
+    });
+    expect(sixLines.rows).toBe(5);
+
+    const wideCaps = computeTextBoxLayout({
+      x: 20,
+      y: 20,
+      value: "WWWWMMMM@#WWWWMMMM",
+      fontSize: 18,
+      stageWidth: 400,
+      stageHeight: 200,
+    });
+    expect(wideCaps.width).toBeGreaterThan(240);
+    expect(wideCaps.left + wideCaps.width).toBeLessThanOrEqual(400);
   });
 });
