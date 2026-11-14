@@ -4,6 +4,31 @@
 
 ## [Unreleased]
 
+### 修复 · 2026-11-14 — 截屏「文字」标注点击指定位置无法输入：兼容 `mousedown` 抢焦、覆盖窗焦点与中文 IME 防护
+
+**问题解决**
+
+1. **点击指定位置无法输入文字（同一次点击即失焦销毁）**：此前选中「文字」标注工具后点击画面，`<svg onPointerDown>` 只调用了 `stopPropagation()` 而未调用 `preventDefault()`。在 macOS `WKWebView` 下，React 于 `pointerdown` 阶段挂载并 `autoFocus` `<textarea>` 后，紧随其后的原生兼容性 `mousedown` 默认行为立刻将焦点拉回 `<svg>`/`<body>`，触发 `<textarea onBlur={flushTextDraft}>`，把刚创建的空白草稿当场提交丢弃，表现为“点哪都弹不出/瞬间消失无法打字”。
+2. **重点击位置与迟到 `onBlur` / `compositionend` 串扰、切窗误关草稿**：在 A 点尚未提交时点击 B 点，复用无 `key` 的 `<textarea>` 使 `autoFocus` 不再触发、旧输入框迟到的 `onBlur`/`compositionend` 可破坏 B 点草稿；透明覆盖窗口从鼠标穿透状态切回时可能尚未成为 Mac Key Window；用户 `Cmd+Tab` 切窗或窗口失焦也会提前销毁正在输入的草稿。
+3. **中文输入法（IME）误触发与 `WKWebView` 中文占位/多空格裁剪**：Pinyin 组合期间按 `Enter` / `Escape` 缺少 `isComposing` / `keyCode === 229` 守卫而误提交或关框；macOS `WKWebView` 原生 `<textarea placeholder="输入文字">` 无法渲染中文占位符；`computeTextBoxLayout` 硬编码 `260px` 上限且 `capture-stage` 外层 `overflow-hidden` 会裁剪长句；SVG `<text>` 默认折叠连续空格，与 `<textarea>` 和 Canvas 导出不一致。
+
+**改动**
+
+- **Rust 覆盖层主动获焦命令（`sense/src-tauri/src/capture.rs`、`sense/src-tauri/src/lib.rs`、`sense/src/lib/ipc.ts`）**
+  - 新增带 `generation` 代数校验与 `overlay.is_visible()` 检查的 `focus_overlay` 命令（调用 `overlay.set_focus()` 将覆盖窗升为 Key Window）并在 `api.focusOverlay` 暴露给前端。
+- **输入框焦点生命周期与防竞态状态机（`sense/src/features/capture/TranslateOverlay.tsx`、`sense/src/features/capture/CaptureToolbar.tsx`）**
+  - `<svg onPointerDown>` 调用 `event.preventDefault?.()`（并补充 `<svg onMouseDown>` 兜底），从源头阻断兼容性 `mousedown` 回抢焦点；选中「文字」工具及点击画布时调用 `ensureOverlayWindowFocused()`。
+  - 为 `textDraft` 引入单调递增 `id`（`textDraftSeqRef`）与 `<textarea key={draftId} ref={textInputRef} data-draft-id={...} data-hit-rect="true">`，切换点位强制重建输入节点并通过 `useEffect([textDraft?.id])` + `window` `focus` 监听恢复焦点与光标。
+  - `flushTextDraft(expectedId?)` 与 `onCompositionStart`/`onCompositionEnd` 均校验当前 `draftId`，且在 `onChange`/`onCompositionEnd` 同步写 `textDraftRef.current`、`onBlur`/`flushTextDraft` 读取真实 DOM `value` 兜底，消除 React 19 批处理下先失焦后更新导致的丢字竞态；`genChanged` 分支同步清零 `isComposingText`。
+  - 增加 `!document.hasFocus()` 失焦保活守卫、IME `isComposing || keyCode === 229` 键盘防护、自绘不拦截指针的中文占位符 `annotation-text-placeholder`（组合态自动隐身、极窄画布不换行不溢出）；将背景 `overflow-hidden` 下沉至背景封装层，SVG `<text>` 增加 `whiteSpace: "pre"`；在 `CaptureToolbar` 根容器补 `onMouseDown={(e) => e.preventDefault()}`，防止点偏到分隔线或边距缝隙抢走输入焦点。
+- **动态排版与回归单测（`sense/src/features/capture/captureAnnotations.ts`、`captureAnnotations.test.ts`、`TranslateOverlay.runtime.test.tsx`）**
+  - 扩展 `TextBoxLayout`（`width`、`minWidth` 与中英文宽字符估算 `estimateTextLineWidth`），放宽 `maxWidth` 至画布右缘，修复 `stageWidth = 0` 边界跳变并去掉 `<textarea>` 硬编码 `min-w-[96px]`；新增 10+ 项单测与运行时边缘测试（含动态扩宽、极窄/零宽/极扁/6 行截顶、重名导出留白、迟到 `blur`/IME 串扰、批处理即时失焦、切代复位、`Shift+Enter` 与连点 6 次）。
+
+**验证与 QC 审查**
+
+- 软件产品 QC 角色两轮独立对抗代码审查（`01300a53`）：一轮指出 **`P0 = 0, P1 = 4, P2 = 7`**（`genChanged` 漏清 `isComposingText`、旧草稿迟到组合事件缺 `draftId` 校验、React 19 异步 updater 竞态、`CaptureToolbar` 容器内缝隙防抢焦与测试缺口），全部修复并补强单测后二轮复核确认 **`P0 = 0, P1 = 0`**。
+- 全量自动化套件通过：`npm run typecheck`、Vitest **32 文件 / 653 用例**、`npm run build`、`cargo test --locked` **434 用例**（真机 WKWebView 键鼠快照及全应用端到端可视化验收结果见提交记录与 `MAINTENANCE_RULES.md §3`）。
+
 ## [0.1.1] - 2026-11-14
 
 ### 发布准备 · 2026-11-14 — 升级版本号至 `0.1.1` 并同步 `origin/main` 与双架构更新包
