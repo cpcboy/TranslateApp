@@ -185,6 +185,7 @@ pub fn run() {
             capture::close_overlay,
             capture::capture_blocks,
             capture::capture_original_image,
+            capture::set_capture_hit_rects,
             capture::retranslate_capture,
             capture::save_capture_image,
             updater::update_status,

@@ -138,9 +138,15 @@ export async function renderCapturePngBase64(options: {
     annotations,
   } = options;
 
-  const img = originalImageUrl ? await loadImageElement(originalImageUrl) : null;
-  const targetW = img && img.naturalWidth > 0 ? img.naturalWidth : Math.max(1, Math.round(stageWidth * scale));
-  const targetH = img && img.naturalHeight > 0 ? img.naturalHeight : Math.max(1, Math.round(stageHeight * scale));
+  if (!originalImageUrl) {
+    throw new Error("当前截屏原图尚未就绪，无法导出图片");
+  }
+  const img = await loadImageElement(originalImageUrl);
+  if (!img || img.naturalWidth <= 0 || img.naturalHeight <= 0) {
+    throw new Error("截屏原图加载失败，无法导出图片");
+  }
+  const targetW = img.naturalWidth;
+  const targetH = img.naturalHeight;
 
   const canvas = document.createElement("canvas");
   canvas.width = targetW;
@@ -152,15 +158,10 @@ export async function renderCapturePngBase64(options: {
   const ratioY = stageHeight > 0 ? targetH / stageHeight : scale;
   ctx.scale(ratioX, ratioY);
 
-  if (img) {
-    ctx.drawImage(img, 0, 0, stageWidth, stageHeight);
-  } else {
-    ctx.fillStyle = "#16161b";
-    ctx.fillRect(0, 0, stageWidth, stageHeight);
-  }
+  ctx.drawImage(img, 0, 0, stageWidth, stageHeight);
 
   if (includeTranslation && blocks.length > 0 && plans.length > 0) {
-    drawBlocksToContext(ctx, blocks, plans, Boolean(img));
+    drawBlocksToContext(ctx, blocks, plans, true);
   }
   if (annotations.length > 0) {
     drawAnnotationsToContext(ctx, annotations);

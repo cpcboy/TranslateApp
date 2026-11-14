@@ -131,3 +131,52 @@ export function isMeaningfulAnnotation(item: Annotation): boolean {
   const dy = Math.abs(item.y2 - item.y1);
   return Math.hypot(dx, dy) >= 4;
 }
+
+export const TEXT_DRAFT_PAD_X = 6;
+export const TEXT_DRAFT_PAD_Y = 3;
+
+export interface TextBoxLayout {
+  left: number;
+  top: number;
+  maxWidth: number;
+  maxHeight: number;
+  lineHeight: number;
+  rows: number;
+  textX: number;
+  textY: number;
+}
+
+/**
+ * 计算文字标注输入框与 SVG/Canvas 落盘共用位置，避免边缘夹逼后确认跳变或被画布裁剪。
+ */
+export function computeTextBoxLayout(options: {
+  x: number;
+  y: number;
+  value: string;
+  fontSize: number;
+  stageWidth: number;
+  stageHeight: number;
+}): TextBoxLayout {
+  const { x, y, value, fontSize, stageWidth, stageHeight } = options;
+  const safeW = Math.max(0, stageWidth);
+  const safeH = Math.max(0, stageHeight);
+  const lineHeight = Math.round(fontSize * 1.25);
+  const lines = value.split("\n");
+  const rows = Math.min(5, Math.max(1, lines.length));
+  const maxBoxW = Math.min(110, safeW);
+  const boxHeight = rows * lineHeight + TEXT_DRAFT_PAD_Y * 2;
+  const left = Math.max(0, Math.min(x, Math.max(0, safeW - maxBoxW)));
+  const top = Math.max(0, Math.min(y, Math.max(0, safeH - boxHeight)));
+  const maxWidth = Math.max(40, Math.min(260, Math.max(40, safeW - left)));
+  const maxHeight = Math.max(lineHeight + TEXT_DRAFT_PAD_Y * 2, safeH - top);
+  return {
+    left,
+    top,
+    maxWidth,
+    maxHeight,
+    lineHeight,
+    rows,
+    textX: left + TEXT_DRAFT_PAD_X,
+    textY: top + TEXT_DRAFT_PAD_Y,
+  };
+}

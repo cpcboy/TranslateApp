@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   ANNOTATION_COLORS,
   ANNOTATION_SIZES,
+  TEXT_DRAFT_PAD_X,
+  TEXT_DRAFT_PAD_Y,
   clampPoint,
   computeArrowHeadPoints,
+  computeTextBoxLayout,
   isMeaningfulAnnotation,
   normalizeRect,
   type Annotation,
@@ -96,5 +99,52 @@ describe("captureAnnotations 工具函数", () => {
     expect(isMeaningfulAnnotation(validText)).toBe(true);
     expect(isMeaningfulAnnotation(singlePointPen)).toBe(false);
     expect(isMeaningfulAnnotation(multiPointPen)).toBe(true);
+  });
+
+  it("[R3-P1-3] computeTextBoxLayout 边缘夹逼且与文本偏移一致，避免提交后跳变或溢出", () => {
+    // 1) 画布内部点击：输入框在点击点，落盘 textX/textY 精确加 CSS 边衬 (6, 3)
+    const interior = computeTextBoxLayout({
+      x: 50,
+      y: 40,
+      value: "重点",
+      fontSize: 16,
+      stageWidth: 500,
+      stageHeight: 300,
+    });
+    expect(interior.left).toBe(50);
+    expect(interior.top).toBe(40);
+    expect(interior.textX).toBe(50 + TEXT_DRAFT_PAD_X);
+    expect(interior.textY).toBe(40 + TEXT_DRAFT_PAD_Y);
+    expect(interior.lineHeight).toBe(20);
+
+    // 2) 贴近右下角点击：先夹逼 left/top 再按同一规则推算 textX/textY，提交后不向外跳变
+    const rightBottom = computeTextBoxLayout({
+      x: 492,
+      y: 294,
+      value: "行1\n行2\n行3",
+      fontSize: 16,
+      stageWidth: 500,
+      stageHeight: 300,
+    });
+    expect(rightBottom.rows).toBe(3);
+    expect(rightBottom.left).toBe(390);
+    expect(rightBottom.top).toBe(234);
+    expect(rightBottom.textX).toBe(390 + TEXT_DRAFT_PAD_X);
+    expect(rightBottom.textY).toBe(234 + TEXT_DRAFT_PAD_Y);
+    expect(rightBottom.left + rightBottom.maxWidth).toBeLessThanOrEqual(500);
+    expect(rightBottom.top + rightBottom.maxHeight).toBeLessThanOrEqual(300);
+
+    // 3) 极窄画布不产出负位置
+    const tiny = computeTextBoxLayout({
+      x: 70,
+      y: 35,
+      value: "短",
+      fontSize: 16,
+      stageWidth: 80,
+      stageHeight: 40,
+    });
+    expect(tiny.left).toBe(0);
+    expect(tiny.top).toBeGreaterThanOrEqual(0);
+    expect(tiny.textX).toBe(TEXT_DRAFT_PAD_X);
   });
 });

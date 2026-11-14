@@ -114,6 +114,8 @@ export type ImageRect = { x: number; y: number; w: number; h: number };
 
 export type SaveImageKind = "original" | "original_annotated" | "translated";
 
+export type CaptureHitRect = { x: number; y: number; w: number; h: number };
+
 export type SaveImageResult = { saved: boolean; path: string | null };
 
 /**
@@ -190,6 +192,12 @@ export const api = {
   startCapture: () => invoke<void>("start_capture"),
   captureBlocks: () => invoke<CaptureView>("capture_blocks"),
   captureOriginalImage: () => invoke<string | null>("capture_original_image"),
+  setCaptureHitRects: (rects: CaptureHitRect[], pointerLock = false, generation?: number) =>
+    invoke<void>("set_capture_hit_rects", {
+      rects,
+      pointerLock,
+      generation: generation ?? null,
+    }),
   retranslateCapture: (targetLang: string) =>
     invoke<void>("retranslate_capture", { targetLang }),
   saveCaptureImage: (kind: SaveImageKind, pngBase64?: string | null) =>

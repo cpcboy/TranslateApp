@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -296,6 +296,15 @@ struct CaptureWindowFrame {
     image: ImageRect,
 }
 
+/// 覆盖层前端真实占据交互面积的窗口内局部矩形（CSS 逻辑像素）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct HitRect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
 #[derive(Clone)]
 struct CaptureSnapshot {
     blocks: Vec<Block>,
@@ -313,6 +322,10 @@ struct CaptureSnapshot {
     target_lang: Option<String>,
     revision: u64,
     mixed: bool,
+    hit_rects: Vec<HitRect>,
+    hit_rects_from_dom: bool,
+    pointer_lock: bool,
+    win_origin: Option<(f64, f64)>,
 }
 
 impl Default for CaptureSnapshot {
@@ -330,6 +343,10 @@ impl Default for CaptureSnapshot {
             target_lang: None,
             revision: 0,
             mixed: false,
+            hit_rects: Vec::new(),
+            hit_rects_from_dom: false,
+            pointer_lock: false,
+            win_origin: None,
         }
     }
 }
@@ -344,6 +361,10 @@ pub struct CaptureState {
     generation: Arc<AtomicU64>,
     /// 同一代截屏里重译的序号：在工具条连续切换语言时取消在途旧请求并丢弃过期事件
     translate_seq: Arc<AtomicU64>,
+    /// 透明区鼠标穿透轮询任务序号：每次重开覆盖层递增，旧任务自动退出
+    watcher_seq: Arc<AtomicU64>,
+    /// 覆盖层当前穿透模式 cache：0=未知，1=接收鼠标，2=穿透鼠标，避免每 25ms 重复 dispatch AppKit
+    passthrough_mode: Arc<AtomicU8>,
 }
 
 /// 离开作用域就把「选框开着」标志放掉，早退和 panic 都不会卡死之后的截屏。
@@ -480,7 +501,129 @@ fn try_cancel_generation(current: &AtomicU64, target: Option<u64>) -> bool {
     }
 }
 
+fn default_hit_rects(
+    stage: CaptureStage,
+    image_rect: Option<ImageRect>,
+    bounds: Option<OverlayBounds>,
+    has_alert: bool,
+) -> Vec<HitRect> {
+    let mut rects = Vec::new();
+    if let Some(img) = image_rect {
+        rects.push(HitRect {
+            x: img.x,
+            y: img.y,
+            w: img.w,
+            h: img.h,
+        });
+        if has_alert {
+            let view_w = bounds.map(|b| b.w).unwrap_or(img.w);
+            let alert_w = img.w.max(300.0).min(view_w.max(img.w));
+            let alert_x = img.x.min((view_w - alert_w).max(0.0));
+            rects.push(HitRect {
+                x: alert_x,
+                y: img.y,
+                w: alert_w,
+                h: img.h.max(84.0),
+            });
+        }
+        if stage == CaptureStage::Done {
+            let view_w = bounds.map(|b| b.w).unwrap_or(img.w);
+            let view_h = bounds.map(|b| b.h).unwrap_or(img.y + img.h);
+            let bar_w = TOOLBAR_MIN_WIDTH.min(view_w.max(img.w));
+            let bar_x = ((img.x + img.w / 2.0) - bar_w / 2.0).clamp(0.0, (view_w - bar_w).max(0.0));
+            let space_below = (view_h - (img.y + img.h)).max(0.0);
+            let bar_y = if space_below >= 52.0 {
+                img.y + img.h + 6.0
+            } else if img.y >= 52.0 {
+                (img.y - 46.0).max(4.0)
+            } else {
+                (view_h - 52.0).max(4.0)
+            };
+            rects.push(HitRect {
+                x: bar_x,
+                y: bar_y,
+                w: bar_w,
+                h: 44.0,
+            });
+        }
+    } else if let Some(b) = bounds {
+        rects.push(HitRect {
+            x: 0.0,
+            y: 0.0,
+            w: b.w,
+            h: b.h,
+        });
+    }
+    rects
+}
+
+fn should_ignore_cursor_events(
+    hit_rects: &[HitRect],
+    pointer_lock: bool,
+    win_origin: Option<(f64, f64)>,
+    cursor: Option<(f64, f64)>,
+) -> bool {
+    if pointer_lock || hit_rects.is_empty() {
+        return false;
+    }
+    let (Some((wx, wy)), Some((cx, cy))) = (win_origin, cursor) else {
+        return false;
+    };
+    let lx = cx - wx;
+    let ly = cy - wy;
+    const MARGIN: f64 = 6.0;
+    let inside_any = hit_rects.iter().any(|r| {
+        r.w.is_finite()
+            && r.h.is_finite()
+            && r.w > 0.0
+            && r.h > 0.0
+            && lx >= r.x - MARGIN
+            && lx <= r.x + r.w + MARGIN
+            && ly >= r.y - MARGIN
+            && ly <= r.y + r.h + MARGIN
+    });
+    !inside_any
+}
+
+fn sync_overlay_passthrough(app: &AppHandle, state: &CaptureState) {
+    let Some(overlay) = app.get_webview_window(OVERLAY_WINDOW) else {
+        return;
+    };
+    let (hit_rects, pointer_lock, win_origin) = match state.snapshot.lock() {
+        Ok(slot) => (slot.hit_rects.clone(), slot.pointer_lock, slot.win_origin),
+        Err(_) => return,
+    };
+    let cursor = cursor_logical(app);
+    let ignored = should_ignore_cursor_events(&hit_rects, pointer_lock, win_origin, cursor);
+    let next_mode: u8 = if ignored { 2 } else { 1 };
+    if state.passthrough_mode.swap(next_mode, Ordering::SeqCst) != next_mode {
+        let _ = overlay.set_ignore_cursor_events(ignored);
+    }
+}
+
+fn start_passthrough_watcher(app: AppHandle, state: &CaptureState) {
+    let seq = state.watcher_seq.fetch_add(1, Ordering::SeqCst) + 1;
+    let watcher_seq = Arc::clone(&state.watcher_seq);
+    tauri::async_runtime::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(25));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            if watcher_seq.load(Ordering::SeqCst) != seq {
+                break;
+            }
+            if app.get_webview_window(OVERLAY_WINDOW).is_none() {
+                break;
+            }
+            let cap_state = app.state::<CaptureState>();
+            sync_overlay_passthrough(&app, &cap_state);
+        }
+    });
+}
+
 fn reset_capture_snapshot(state: &CaptureState) {
+    state.watcher_seq.fetch_add(1, Ordering::SeqCst);
+    state.passthrough_mode.store(0, Ordering::SeqCst);
     if let Ok(mut slot) = state.snapshot.lock() {
         *slot = CaptureSnapshot {
             stage: CaptureStage::Done,
@@ -500,8 +643,49 @@ fn publish_view(app: &AppHandle, state: &CaptureState, view: CaptureView) {
         slot.target_lang = view.target_lang.clone();
         slot.revision = view.revision;
         slot.scale = if view.scale.is_finite() && view.scale > 0.0 { view.scale } else { 1.0 };
+        if !slot.hit_rects_from_dom {
+            let has_alert = slot.error.is_some()
+                || slot.notice.is_some()
+                || (!slot.blocks.is_empty() && slot.blocks.iter().all(|b| b.unchanged));
+            slot.hit_rects = default_hit_rects(slot.stage, slot.image_rect, slot.bounds, has_alert);
+        }
     }
     let _ = app.emit("sense://capture-update", &view);
+}
+
+#[tauri::command]
+pub fn set_capture_hit_rects(
+    app: AppHandle,
+    state: State<'_, CaptureState>,
+    generation: Option<u64>,
+    rects: Vec<HitRect>,
+    pointer_lock: bool,
+) {
+    if let Some(g) = generation {
+        if state.generation.load(Ordering::SeqCst) != g {
+            return;
+        }
+    }
+    let valid: Vec<HitRect> = rects
+        .into_iter()
+        .filter(|r| {
+            r.x.is_finite()
+                && r.y.is_finite()
+                && r.w.is_finite()
+                && r.h.is_finite()
+                && r.w > 0.0
+                && r.h > 0.0
+        })
+        .take(64)
+        .collect();
+    if let Ok(mut slot) = state.snapshot.lock() {
+        slot.pointer_lock = pointer_lock;
+        if !valid.is_empty() {
+            slot.hit_rects = valid;
+            slot.hit_rects_from_dom = true;
+        }
+    }
+    sync_overlay_passthrough(&app, &state);
 }
 
 #[tauri::command]
@@ -590,18 +774,11 @@ pub async fn retranslate_capture(
         capture_plan_with_mode(&blocks, lang::AUTO)
             .ok_or_else(|| "选区里没有可翻译的文字".to_string())?
     } else if let Some(chosen) = lang::lang_by_code(&target_lang) {
-        let m = snap.mixed || has_mixed_languages(&blocks);
-        let dir = if m {
-            protocol::Direction::Other
-        } else {
-            let sample: String = blocks.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join(" ");
-            match (lang::detect(&sample).lang.map(|l| l.code), chosen.name) {
-                (Some("zh"), "英文") => protocol::Direction::ToEnglish,
-                (Some("en"), "中文") => protocol::Direction::ToChinese,
-                _ => protocol::Direction::Other,
-            }
-        };
-        (chosen, dir, m)
+        capture_plan_with_mode(&blocks, &target_lang).unwrap_or((
+            chosen,
+            protocol::Direction::Other,
+            snap.mixed || has_mixed_languages(&blocks),
+        ))
     } else {
         return Err(format!("不支持的目标语言：{target_lang}"));
     };
@@ -1080,6 +1257,30 @@ fn open_overlay_window(app: &AppHandle, x: f64, y: f64, w: f64, h: f64) -> Resul
     Ok(overlay)
 }
 
+fn open_overlay_window_tracked(
+    app: &AppHandle,
+    state: &CaptureState,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+) -> Result<tauri::WebviewWindow, String> {
+    let overlay = open_overlay_window(app, x, y, w, h)?;
+    if let Ok(mut slot) = state.snapshot.lock() {
+        slot.win_origin = Some((x, y));
+        slot.hit_rects_from_dom = false;
+        slot.pointer_lock = false;
+        let has_alert = slot.error.is_some()
+            || slot.notice.is_some()
+            || (!slot.blocks.is_empty() && slot.blocks.iter().all(|b| b.unchanged));
+        slot.hit_rects = default_hit_rects(slot.stage, slot.image_rect, slot.bounds, has_alert);
+    }
+    state.passthrough_mode.store(1, Ordering::SeqCst);
+    sync_overlay_passthrough(app, state);
+    start_passthrough_watcher(app.clone(), state);
+    Ok(overlay)
+}
+
 /// 按最小尺寸扩窗并夹进当前屏幕，算出最终窗口外框与需要同步平移给 `blocks` 的补偿量。
 #[cfg(test)]
 fn fitted_overlay_frame(
@@ -1123,7 +1324,8 @@ fn compute_capture_window_frame(
 
     let win_w = image_w.max(TOOLBAR_MIN_WIDTH.min(sw.max(image_w)));
     let max_x = (sx + sw - win_w).max(sx);
-    let win_x = sel_x.clamp(sx, max_x);
+    let centered_x = sel_x + (image_w - win_w) / 2.0;
+    let win_x = centered_x.round().clamp(sx, max_x);
     let image_x = (sel_x - win_x).clamp(0.0, (win_w - image_w).max(0.0));
 
     let extra_needed = if image_h < 220.0 {
@@ -1321,8 +1523,9 @@ pub async fn start_capture(app: AppHandle, state: State<'_, CaptureState>) -> Re
             scale: screen.scale,
         },
     );
-    if let Err(err) = open_overlay_window(
+    if let Err(err) = open_overlay_window_tracked(
         &app,
+        &state,
         capture_frame.win.win_x,
         capture_frame.win.win_y,
         capture_frame.win.win_w,
@@ -1682,8 +1885,9 @@ async fn finish_capture_blocks(
     }
 
     publish_view(app, state, final_view);
-    let overlay = open_overlay_window(
+    let overlay = open_overlay_window_tracked(
         app,
+        state,
         capture_frame.win.win_x,
         capture_frame.win.win_y,
         capture_frame.win.win_w,
@@ -2128,28 +2332,344 @@ fn choose_target_with_mode(
     Some((target, direction, mixed))
 }
 
-/// 识别截图里是否包含多种语言（尤其是中英混排、中文+日韩俄等，以及拉丁+非拉丁多语种）。
-/// 注意排除纯中文段落里夹少量产品缩写/图标字母（例如整段中文说明里只有 `SENSE`/`macOS`/`AI` 或单个菜单字母 `B`）。
-fn has_mixed_languages(blocks: &[Block]) -> bool {
+fn contains_han(text: &str) -> bool {
+    text.chars().any(|ch| {
+        matches!(
+            ch as u32,
+            0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0xF900..=0xFAFF | 0x20000..=0x2A6DF
+        )
+    })
+}
+
+fn is_cjk_or_fullwidth(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x3000..=0x303F
+            | 0x3040..=0x30FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xAC00..=0xD7AF
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE4F
+            | 0xFF00..=0xFFEF
+    ) || matches!(ch, '“' | '”' | '‘' | '’' | '—' | '…' | '·')
+}
+
+fn split_cjk_boundary_tokens(text: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut prev_cjk = false;
+    for (idx, ch) in text.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(s) = start.take() {
+                tokens.push(&text[s..idx]);
+            }
+            continue;
+        }
+        let cjk = is_cjk_or_fullwidth(ch);
+        match start {
+            Some(s) if prev_cjk != cjk => {
+                tokens.push(&text[s..idx]);
+                start = Some(idx);
+                prev_cjk = cjk;
+            }
+            None => {
+                start = Some(idx);
+                prev_cjk = cjk;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        tokens.push(&text[s..]);
+    }
+    tokens
+}
+
+fn is_modifier_or_key_part(part: &str) -> bool {
+    let lower = part.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "ctrl"
+            | "control"
+            | "cmd"
+            | "command"
+            | "alt"
+            | "opt"
+            | "option"
+            | "shift"
+            | "meta"
+            | "super"
+            | "win"
+            | "fn"
+            | "tab"
+            | "esc"
+            | "escape"
+            | "enter"
+            | "return"
+            | "space"
+            | "backspace"
+            | "del"
+            | "delete"
+            | "up"
+            | "down"
+            | "left"
+            | "right"
+            | "pgup"
+            | "pgdn"
+            | "home"
+            | "end"
+    ) {
+        return true;
+    }
+    if let Some(rest) = lower.strip_prefix('f') {
+        if let Ok(n) = rest.parse::<u8>() {
+            return (1..=12).contains(&n);
+        }
+    }
+    false
+}
+
+fn is_shortcut_line(trimmed: &str) -> bool {
+    let has_plus = trimmed.contains('+');
+    let has_mac_glyph = trimmed
+        .chars()
+        .any(|c| matches!(c, '⌘' | '⌥' | '⌃' | '⇧' | '⌫' | '⏎' | '⇥' | '⎋'));
+    if !has_plus && !has_mac_glyph {
+        return false;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for raw in trimmed.split_whitespace() {
+        for seg in raw.split('+') {
+            if !seg.is_empty() {
+                parts.push(seg);
+            }
+        }
+    }
+    if parts.is_empty() {
+        return false;
+    }
+    let has_modifier = has_mac_glyph || parts.iter().any(|p| is_modifier_or_key_part(p));
+    has_modifier
+        && parts.iter().all(|p| {
+            is_modifier_or_key_part(p)
+                || p.chars().count() == 1
+                || p.chars()
+                    .all(|c| matches!(c, '⌘' | '⌥' | '⌃' | '⇧' | '⌫' | '⏎' | '⇥' | '⎋'))
+        })
+}
+
+fn is_non_prose_whole_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || contains_han(trimmed) {
+        return trimmed.is_empty();
+    }
+    trimmed.starts_with("$ ")
+        || trimmed.starts_with("% ")
+        || trimmed.starts_with("❯ ")
+        || trimmed
+            .split_once("$ ")
+            .is_some_and(|(lhs, rhs)| !lhs.chars().any(char::is_whitespace) && !rhs.is_empty())
+        || is_shortcut_line(trimmed)
+}
+
+fn trim_token_punct(mut tok: &str) -> &str {
+    const START_STRIP: &[char] = &[',', ';', '!', '?', '"', '\'', '(', '[', '{', '<', '`'];
+    const END_STRIP: &[char] = &[',', ';', '!', '?', '"', '\'', ')', ']', '}', '>', '.', ':', '`'];
+    tok = tok.trim_start_matches(START_STRIP);
+    while let Some(last) = tok.chars().last() {
+        if END_STRIP.contains(&last) {
+            tok = &tok[..tok.len() - last.len_utf8()];
+        } else {
+            break;
+        }
+    }
+    tok
+}
+
+fn is_technical_token(tok: &str) -> bool {
+    if tok.is_empty() {
+        return true;
+    }
+    if tok
+        .chars()
+        .any(|c| matches!(c, '⌘' | '⌥' | '⌃' | '⇧' | '⌫' | '⏎' | '⇥' | '⎋'))
+    {
+        return true;
+    }
+    let lower = tok.to_ascii_lowercase();
+    if lower == "c++"
+        || lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("ftp://")
+        || lower.starts_with("file://")
+        || lower.starts_with("ws://")
+        || lower.starts_with("wss://")
+        || lower.starts_with("mailto:")
+        || lower.contains("://")
+        || lower.starts_with("www.")
+    {
+        return true;
+    }
+    if let Some((_, host)) = tok.split_once('@') {
+        if host.contains('.') && host.chars().any(|c| c.is_ascii_alphabetic()) {
+            return true;
+        }
+    }
+    let has_alnum = tok.chars().any(|c| c.is_ascii_alphanumeric());
+    if has_alnum
+        && (tok.starts_with('/')
+            || tok.starts_with("~/")
+            || tok.starts_with("./")
+            || tok.starts_with("../")
+            || tok.matches('/').count() >= 2
+            || (tok.contains('/') && tok.contains('.'))
+            || tok.contains('\\'))
+    {
+        return true;
+    }
+    if tok.starts_with("--")
+        && tok.len() >= 3
+        && tok[2..]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return true;
+    }
+    if tok.len() == 2 && tok.starts_with('-') && tok.as_bytes()[1].is_ascii_alphabetic() {
+        return true;
+    }
+    if (tok.contains('_') || tok.contains("::")) && tok.chars().any(|c| c.is_ascii_alphabetic()) {
+        return true;
+    }
+    if tok.contains('.') {
+        let parts: Vec<&str> = tok.split('.').collect();
+        if parts.len() >= 2
+            && parts.iter().all(|p| {
+                !p.is_empty()
+                    && p.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':')
+            })
+            && parts.iter().any(|p| p.chars().any(|c| c.is_ascii_alphabetic()))
+        {
+            return true;
+        }
+    }
+    if tok.contains('+') {
+        let parts: Vec<&str> = tok.split('+').collect();
+        if parts.len() >= 2
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+            && parts.iter().any(|p| is_modifier_or_key_part(p))
+        {
+            return true;
+        }
+    }
+    tok.chars().any(|c| c.is_ascii_alphabetic()) && tok.chars().any(|c| c.is_ascii_digit())
+}
+
+fn is_all_caps_word(tok: &str) -> bool {
+    tok.len() >= 2 && tok.bytes().all(|b| b.is_ascii_uppercase())
+}
+
+fn is_brand_or_acronym_word(tok: &str, adjacent_all_caps: bool) -> bool {
+    if tok.len() < 2 || !tok.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return false;
+    }
+    let has_lower = tok.bytes().any(|b| b.is_ascii_lowercase());
+    let has_internal_upper = tok.bytes().skip(1).any(|b| b.is_ascii_uppercase());
+    if has_lower && has_internal_upper {
+        return true;
+    }
+    is_all_caps_word(tok) && !adjacent_all_caps
+}
+
+fn analyze_mixed_and_sample(blocks: &[Block]) -> (bool, String, String) {
+    let raw_sample: String = blocks.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join(" ");
+    let mut has_any_han = false;
+    let mut block_non_tech_lines: Vec<Vec<Vec<&str>>> = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        let mut lines_tokens = Vec::new();
+        for line in block.text.lines() {
+            if is_non_prose_whole_line(line) {
+                continue;
+            }
+            let kept: Vec<&str> = split_cjk_boundary_tokens(line)
+                .into_iter()
+                .map(trim_token_punct)
+                .filter(|t| !t.is_empty() && !is_technical_token(t))
+                .collect();
+            for tok in &kept {
+                if contains_han(tok) {
+                    has_any_han = true;
+                }
+            }
+            if !kept.is_empty() {
+                lines_tokens.push(kept);
+            }
+        }
+        block_non_tech_lines.push(lines_tokens);
+    }
+
+    let mut clean_parts: Vec<&str> = Vec::new();
     let mut total_han = 0usize;
     let mut total_latin = 0usize;
     let mut total_other = 0usize;
-    let mut separate_foreign_block = false;
-    for block in blocks {
-        let c = lang::script_counts(&block.text);
-        total_han += c.han;
-        total_latin += c.latin;
-        total_other += c.other;
-        if c.han == 0 && (c.latin >= 4 || c.other >= 2) {
-            separate_foreign_block = true;
+    let mut foreign_blocks: Vec<(usize, usize, usize)> = Vec::new();
+
+    for lines in &block_non_tech_lines {
+        let mut block_han = 0usize;
+        let mut block_latin = 0usize;
+        let mut block_other = 0usize;
+        let mut block_latin_words = 0usize;
+        for line_toks in lines {
+            for (idx, &tok) in line_toks.iter().enumerate() {
+                let adj_caps = (idx > 0 && is_all_caps_word(line_toks[idx - 1]))
+                    || (idx + 1 < line_toks.len() && is_all_caps_word(line_toks[idx + 1]));
+                if has_any_han && is_brand_or_acronym_word(tok, adj_caps) {
+                    continue;
+                }
+                clean_parts.push(tok);
+                let c = lang::script_counts(tok);
+                block_han += c.han;
+                block_latin += c.latin;
+                block_other += c.other;
+                if c.latin >= 2 && c.han == 0 {
+                    block_latin_words += 1;
+                }
+            }
+        }
+        total_han += block_han;
+        total_latin += block_latin;
+        total_other += block_other;
+        if block_han == 0 && (block_latin > 0 || block_other > 0) {
+            foreign_blocks.push((block_latin, block_other, block_latin_words));
         }
     }
-    if total_han >= 1 {
-        return separate_foreign_block
-            || total_other >= 4
-            || (total_latin >= 4 && total_latin * 3 >= total_han);
-    }
-    total_latin >= 4 && total_other >= 4
+
+    let clean_sample = clean_parts.join(" ");
+    let mixed = if total_han >= 1 {
+        let ratio_mixed = total_latin >= 4 && total_latin * 2 >= total_han;
+        let separate_foreign = foreign_blocks.iter().any(|&(latin, other, words)| {
+            other >= 2
+                || (words >= 2 && latin >= 8)
+                || latin >= 12
+                || (latin >= 4 && total_latin * 2 >= total_han)
+        });
+        separate_foreign || total_other >= 4 || ratio_mixed
+    } else {
+        total_latin >= 4 && total_other >= 4
+    };
+
+    (mixed, clean_sample, raw_sample)
+}
+
+/// 识别截图里是否包含多种语言（尤其是中英混排、中文+日韩俄等，以及拉丁+非拉丁多语种）。
+/// 注意排除纯中文界面/技术截图中独立出现的品牌名、首字母缩写、快捷键、URL、路径、命令行与单字母图标，
+/// 避免把中文页面误判成混排从而在 `auto` 下倒置译回中文导致 100% 原样空转。
+fn has_mixed_languages(blocks: &[Block]) -> bool {
+    analyze_mixed_and_sample(blocks).0
 }
 
 #[cfg(test)]
@@ -2164,9 +2684,16 @@ fn capture_plan_with_mode(
     blocks: &[Block],
     pref: &str,
 ) -> Option<(&'static Lang, protocol::Direction, bool)> {
-    let sample: String = blocks.iter().map(|block| block.text.as_str()).collect::<Vec<_>>().join(" ");
-    let mixed = has_mixed_languages(blocks);
-    let plan = lang::plan(&sample, pref);
+    let (mixed, clean_sample, raw_sample) = analyze_mixed_and_sample(blocks);
+    if !lang::detect(&raw_sample).letters {
+        return None;
+    }
+    let detect_sample = if lang::detect(&clean_sample).letters {
+        clean_sample.as_str()
+    } else {
+        raw_sample.as_str()
+    };
+    let plan = lang::plan(detect_sample, pref);
     if !plan.source.letters {
         return None;
     }
@@ -4698,6 +5225,51 @@ mod tests {
         assert!(!has_mixed_languages(&zh_icon));
         assert_eq!(capture_plan_with_mode(&zh_icon, lang::AUTO).map(|(l, _, m)| (l.code, m)), Some(("en", false)));
 
+        // [R3-P1-1] 纯中文软件/技术截图中包含独立品牌名、驼峰产品名、快捷键、URL、路径或命令行时，
+        // 不得误判为混排并倒置译回中文，也不得被长 URL 拉偏成 Source=en
+        let zh_ui_with_brand_and_tech = vec![
+            merge_lines(&[line("新建任务", 10.0, 10.0, 80.0, 20.0)], 1.0).remove(0),
+            merge_lines(&[line("设置与偏好", 10.0, 35.0, 90.0, 20.0)], 1.0).remove(0),
+            merge_lines(&[line("SENSE", 10.0, 60.0, 60.0, 20.0)], 1.0).remove(0),
+            merge_lines(&[line("macOS", 80.0, 60.0, 60.0, 20.0)], 1.0).remove(0),
+            merge_lines(&[line("GitHub", 150.0, 60.0, 60.0, 20.0)], 1.0).remove(0),
+            merge_lines(&[line("Ctrl+C", 10.0, 85.0, 60.0, 20.0)], 1.0).remove(0),
+            merge_lines(&[line("⌘⇧Space", 80.0, 85.0, 70.0, 20.0)], 1.0).remove(0),
+            merge_lines(&[line("https://github.com/cpcboy/TranslateApp/releases/latest", 10.0, 110.0, 320.0, 20.0)], 1.0).remove(0),
+            merge_lines(&[line("/Applications/SENSE.app", 10.0, 135.0, 200.0, 20.0)], 1.0).remove(0),
+            merge_lines(&[line("$ cargo test --locked", 10.0, 160.0, 180.0, 20.0)], 1.0).remove(0),
+        ];
+        assert!(!has_mixed_languages(&zh_ui_with_brand_and_tech));
+        assert_eq!(
+            capture_plan_with_mode(&zh_ui_with_brand_and_tech, lang::AUTO).map(|(l, d, m)| (l.code, d, m)),
+            Some(("en", protocol::Direction::ToEnglish, false))
+        );
+
+        let zh_short_plus_long_url = vec![
+            merge_lines(&[line("新建", 10.0, 10.0, 40.0, 20.0)], 1.0).remove(0),
+            merge_lines(&[line("https://github.com/cpcboy/TranslateApp/releases/latest/download/latest.json", 10.0, 40.0, 420.0, 20.0)], 1.0).remove(0),
+        ];
+        assert!(!has_mixed_languages(&zh_short_plus_long_url));
+        assert_eq!(
+            capture_plan_with_mode(&zh_short_plus_long_url, lang::AUTO).map(|(l, _, m)| (l.code, m)),
+            Some(("en", false))
+        );
+
+        let zh_inline_tech = one_block("在macOS上用GitHub管理SENSE，按Ctrl+C复制 /Applications/SENSE.app 到剪贴板");
+        assert!(!has_mixed_languages(&zh_inline_tech));
+        assert_eq!(
+            capture_plan_with_mode(&zh_inline_tech, lang::AUTO).map(|(l, _, m)| (l.code, m)),
+            Some(("en", false))
+        );
+
+        // 纯英文标题包含品牌或技术路径时仍正常判为英文→中文
+        let pure_en_brand = one_block("SENSE macOS Desktop");
+        assert!(!has_mixed_languages(&pure_en_brand));
+        assert_eq!(
+            capture_plan_with_mode(&pure_en_brand, lang::AUTO).map(|(l, _, m)| (l.code, m)),
+            Some(("zh", false))
+        );
+
         // 中英混排（哪怕汉字数量更多）：auto 与手选 zh 都必须统一译为中文，不触发英文↔中文比率误报
         let mixed_cn_en = vec![
             merge_lines(&[line("新建任务", 10.0, 10.0, 80.0, 20.0)], 1.0).remove(0),
@@ -4754,6 +5326,19 @@ mod tests {
         assert_eq!(right_small.win.win_x + right_small.image.x, 1220.0);
         assert!(right_small.win.win_h >= 30.0 + TOOLBAR_EXTRA_SMALL);
 
+        // 2b) 居中且极窄的 200×80 选区：窗口水平居中包住选区，原图与窗口正中对齐、工具条可正对选区居中
+        let center_small = compute_capture_window_frame(620.0, 200.0, 200.0, 80.0, bounds);
+        assert_eq!(center_small.win.win_w, TOOLBAR_MIN_WIDTH);
+        assert_eq!(center_small.win.win_x, 430.0);
+        assert_eq!(center_small.image.x, 190.0);
+        assert_eq!(center_small.win.win_x + center_small.image.x, 620.0);
+
+        // 2c) 贴左的窄选区：win_x 夹在屏幕左缘 sx=0，不冲出左边界
+        let left_small = compute_capture_window_frame(10.0, 200.0, 120.0, 40.0, bounds);
+        assert_eq!(left_small.win.win_w, TOOLBAR_MIN_WIDTH);
+        assert_eq!(left_small.win.win_x, 0.0);
+        assert_eq!(left_small.image.x, 10.0);
+
         // 3) 贴近屏幕底部（下面只剩 20px）：工具条自动翻到上方，原图桌面坐标保持 (200, 480)
         let bottom_edge = compute_capture_window_frame(200.0, 480.0, 600.0, 400.0, bounds);
         assert!(bottom_edge.image.y >= TOOLBAR_RESERVE);
@@ -4777,5 +5362,31 @@ mod tests {
         assert_eq!(base64_decode(&format!("data:image/png;base64,{encoded}")).unwrap(), sample);
         assert!(base64_decode("not!valid").is_err());
         assert!(base64_decode("abc").is_err());
+    }
+
+    #[test]
+    fn passthrough_hit_rect_logic_respects_margin_and_pointer_lock() {
+        let hits = default_hit_rects(
+            CaptureStage::Done,
+            Some(ImageRect { x: 190.0, y: 0.0, w: 200.0, h: 80.0 }),
+            Some(OverlayBounds { w: 580.0, h: 348.0 }),
+            false,
+        );
+        assert!(hits.len() >= 2);
+        let origin = Some((430.0, 200.0));
+        // 选区内部与工具条区应接收鼠标
+        assert!(!should_ignore_cursor_events(&hits, false, origin, Some((430.0 + 250.0, 200.0 + 40.0))));
+        assert!(!should_ignore_cursor_events(&hits, false, origin, Some((430.0 + 290.0, 200.0 + 100.0))));
+        // 紧贴选区外缘 4px 余量内不抖动
+        assert!(!should_ignore_cursor_events(&hits, false, origin, Some((430.0 + 186.0, 200.0 + 40.0))));
+        // 透明空白左侧 [0..184] 必须穿透回桌面
+        assert!(should_ignore_cursor_events(&hits, false, origin, Some((430.0 + 40.0, 200.0 + 40.0))));
+        // 透明空白底部超出工具条的区域也穿透回桌面
+        assert!(should_ignore_cursor_events(&hits, false, origin, Some((430.0 + 40.0, 200.0 + 260.0))));
+        // 正在拖拽标注（pointer_lock=true）时即使划到选区外也不得穿透，保证释放事件不丢失
+        assert!(!should_ignore_cursor_events(&hits, true, origin, Some((430.0 + 40.0, 200.0 + 40.0))));
+        // 无 hit_rects 或取不到光标坐标时保守关闭穿透
+        assert!(!should_ignore_cursor_events(&[], false, origin, Some((470.0, 240.0))));
+        assert!(!should_ignore_cursor_events(&hits, false, origin, None));
     }
 }

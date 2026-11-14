@@ -2,6 +2,7 @@ import { Component, useCallback, useEffect, useMemo, useRef, useState, type Poin
 import {
   api,
   onCaptureUpdate,
+  type CaptureHitRect,
   type CaptureStage,
   type CaptureView,
   type ImageRect,
@@ -12,8 +13,11 @@ import {
 import {
   ANNOTATION_COLORS,
   ANNOTATION_SIZES,
+  TEXT_DRAFT_PAD_X,
+  TEXT_DRAFT_PAD_Y,
   clampPoint,
   computeArrowHeadPoints,
+  computeTextBoxLayout,
   isMeaningfulAnnotation,
   normalizeRect,
   type Annotation,
@@ -100,29 +104,103 @@ export function TranslateOverlay() {
     w: typeof window !== "undefined" ? window.innerWidth : 0,
     h: typeof window !== "undefined" ? window.innerHeight : 0,
   }));
+  const [toolbarWidth, setToolbarWidth] = useState(560);
 
   const generationRef = useRef<number | undefined>(undefined);
   const revisionRef = useRef<number>(0);
   const stageRef = useRef<CaptureStage>("ocr");
   const loadedImageGenRef = useRef<number | undefined>(undefined);
+  const rootElRef = useRef<HTMLDivElement | null>(null);
   const stageElRef = useRef<HTMLDivElement | null>(null);
+  const toolbarAnchorRef = useRef<HTMLDivElement | null>(null);
   const openPopoverRef = useRef<ToolbarPopover>("none");
   const textDraftRef = useRef<{ x: number; y: number; value: string } | null>(null);
+  const annotationsRef = useRef<Annotation[]>([]);
+  const originalUrlRef = useRef<string | null>(null);
+  const originalLoadPromiseRef = useRef<Promise<string | null> | null>(null);
   const toastTimerRef = useRef<number | undefined>(undefined);
-
-  openPopoverRef.current = openPopover;
-  textDraftRef.current = textDraft;
 
   const sizePreset = useMemo(
     () => ANNOTATION_SIZES.find((item) => item.id === activeSize) ?? ANNOTATION_SIZES[1],
     [activeSize],
   );
+  const activeColorRef = useRef<string>(activeColor);
+  const sizePresetRef = useRef<AnnotationSize>(sizePreset);
+
+  openPopoverRef.current = openPopover;
+  textDraftRef.current = textDraft;
+  annotationsRef.current = annotations;
+  originalUrlRef.current = originalImageUrl;
+  activeColorRef.current = activeColor;
+  sizePresetRef.current = sizePreset;
+
+  const fetchOriginalForGen = useCallback(
+    async (gen?: number, isDisposed?: () => boolean): Promise<string | null> => {
+      const targetGen = gen ?? generationRef.current;
+      if (
+        originalUrlRef.current &&
+        (targetGen === undefined || generationRef.current === targetGen)
+      ) {
+        return originalUrlRef.current;
+      }
+      if (
+        targetGen !== undefined &&
+        loadedImageGenRef.current === targetGen &&
+        originalLoadPromiseRef.current
+      ) {
+        return originalLoadPromiseRef.current;
+      }
+      loadedImageGenRef.current = targetGen;
+      const req = api
+        .captureOriginalImage()
+        .then((url) => {
+          if (originalLoadPromiseRef.current === req) {
+            originalLoadPromiseRef.current = null;
+          }
+          if (isDisposed?.()) return null;
+          if (targetGen !== undefined && generationRef.current !== targetGen) return null;
+          if (url) {
+            originalUrlRef.current = url;
+            setOriginalImageUrl(url);
+            return url;
+          }
+          if (loadedImageGenRef.current === targetGen) {
+            loadedImageGenRef.current = undefined;
+          }
+          return null;
+        })
+        .catch(() => {
+          if (originalLoadPromiseRef.current === req) {
+            originalLoadPromiseRef.current = null;
+          }
+          if (loadedImageGenRef.current === targetGen) {
+            loadedImageGenRef.current = undefined;
+          }
+          return null;
+        });
+      originalLoadPromiseRef.current = req;
+      return req;
+    },
+    [],
+  );
 
   useEffect(() => {
-    if (typeof window === "undefined" || typeof window.addEventListener !== "function") return;
+    if (typeof window === "undefined" || typeof window.addEventListener !== "function") {
+      return () => {};
+    }
     const onResize = () => setViewport({ w: window.innerWidth, h: window.innerHeight });
+    const onBlur = () => {
+      if (openPopoverRef.current !== "none") {
+        openPopoverRef.current = "none";
+        setOpenPopover("none");
+      }
+    };
     window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("resize", onResize);
+      window.removeEventListener("blur", onBlur);
+    };
   }, []);
 
   useEffect(() => {
@@ -130,17 +208,7 @@ export function TranslateOverlay() {
     let sawPushEvent = false;
 
     const loadOriginalForGen = (gen: number) => {
-      if (loadedImageGenRef.current === gen) return;
-      loadedImageGenRef.current = gen;
-      void api
-        .captureOriginalImage()
-        .then((url) => {
-          if (disposed || generationRef.current !== gen) return;
-          if (url) setOriginalImageUrl(url);
-        })
-        .catch(() => {
-          /* 取不到原图时仍保底显示译文块与工具条 */
-        });
+      void fetchOriginalForGen(gen, () => disposed);
     };
 
     const applyView = (view: CaptureView, fromPush: boolean) => {
@@ -173,12 +241,17 @@ export function TranslateOverlay() {
 
       if (genChanged) {
         loadedImageGenRef.current = undefined;
+        originalLoadPromiseRef.current = null;
+        originalUrlRef.current = null;
         setOriginalImageUrl(null);
+        annotationsRef.current = [];
         setAnnotations([]);
         setDraftAnnotation(null);
+        textDraftRef.current = null;
         setTextDraft(null);
         setActiveTool("none");
         setShowOriginal(false);
+        openPopoverRef.current = "none";
         setOpenPopover("none");
         setSaveToast(null);
         setActionError(null);
@@ -202,7 +275,7 @@ export function TranslateOverlay() {
       if (incomingStage === "done") {
         setRetranslating(false);
       }
-      if (view?.has_image === true && incomingGen !== undefined) {
+      if (view?.has_image === true && incomingGen !== undefined && !originalUrlRef.current) {
         loadOriginalForGen(incomingGen);
       }
     };
@@ -235,10 +308,12 @@ export function TranslateOverlay() {
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         if (textDraftRef.current) {
+          textDraftRef.current = null;
           setTextDraft(null);
           return;
         }
         if (openPopoverRef.current !== "none") {
+          openPopoverRef.current = "none";
           setOpenPopover("none");
           return;
         }
@@ -248,7 +323,9 @@ export function TranslateOverlay() {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z") {
         if (textDraftRef.current) return;
         event.preventDefault();
-        setAnnotations((prev) => prev.slice(0, -1));
+        const nextList = annotationsRef.current.slice(0, -1);
+        annotationsRef.current = nextList;
+        setAnnotations(nextList);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -263,7 +340,7 @@ export function TranslateOverlay() {
       }
       unlistenUpdate?.();
     };
-  }, []);
+  }, [fetchOriginalForGen]);
 
   const viewW = bounds?.w ?? (typeof window !== "undefined" ? window.innerWidth : viewport.w);
   const viewH = bounds?.h ?? (typeof window !== "undefined" ? window.innerHeight : viewport.h);
@@ -307,23 +384,70 @@ export function TranslateOverlay() {
     toastTimerRef.current = window.setTimeout(() => setSaveToast(null), 2600);
   }, []);
 
+  const stageLocalPoint = useCallback(
+    (clientX: number, clientY: number) => {
+      const rect = stageElRef.current?.getBoundingClientRect();
+      if (!rect) return clampPoint({ x: clientX, y: clientY }, stageRect.w, stageRect.h);
+      return clampPoint({ x: clientX - rect.left, y: clientY - rect.top }, stageRect.w, stageRect.h);
+    },
+    [stageRect.h, stageRect.w],
+  );
+
+  const flushTextDraft = useCallback((): Annotation[] => {
+    const current = textDraftRef.current;
+    if (!current) return annotationsRef.current;
+    textDraftRef.current = null;
+    setTextDraft(null);
+    const trimmed = current.value.trim();
+    if (!trimmed) return annotationsRef.current;
+    const layout = computeTextBoxLayout({
+      x: current.x,
+      y: current.y,
+      value: trimmed,
+      fontSize: sizePresetRef.current.fontSize,
+      stageWidth: stageRect.w,
+      stageHeight: stageRect.h,
+    });
+    const nextItem: Annotation = {
+      id: `ann-${Date.now()}-${annotationsRef.current.length}`,
+      kind: "text",
+      x: layout.textX,
+      y: layout.textY,
+      text: trimmed,
+      color: activeColorRef.current,
+      fontSize: sizePresetRef.current.fontSize,
+    };
+    const nextList = [...annotationsRef.current, nextItem];
+    annotationsRef.current = nextList;
+    setAnnotations(nextList);
+    return nextList;
+  }, [stageRect.h, stageRect.w]);
+
   const handleSave = useCallback(
     async (kind: SaveImageKind) => {
       if (saving) return;
       setActionError(null);
       setSaving(true);
       try {
+        const committedAnnotations = flushTextDraft();
         let payload: string | null = null;
         if (kind !== "original") {
+          let imgUrl = originalUrlRef.current ?? originalImageUrl;
+          if (!imgUrl) {
+            imgUrl = await fetchOriginalForGen(generationRef.current);
+          }
+          if (!imgUrl) {
+            throw new Error("当前截屏原图尚未就绪，无法导出图片");
+          }
           payload = await renderCapturePngBase64({
-            originalImageUrl,
+            originalImageUrl: imgUrl,
             stageWidth: stageRect.w,
             stageHeight: stageRect.h,
             scale,
             includeTranslation: kind === "translated",
             blocks: blocks ?? [],
             plans: stagePlans,
-            annotations,
+            annotations: committedAnnotations,
           });
         }
         const res = await api.saveCaptureImage(kind, payload);
@@ -336,54 +460,41 @@ export function TranslateOverlay() {
         setSaving(false);
       }
     },
-    [annotations, blocks, originalImageUrl, saving, scale, showToast, stagePlans, stageRect.h, stageRect.w],
+    [blocks, fetchOriginalForGen, flushTextDraft, originalImageUrl, saving, scale, showToast, stagePlans, stageRect.h, stageRect.w],
   );
 
-  const stageLocalPoint = useCallback(
-    (clientX: number, clientY: number) => {
-      const rect = stageElRef.current?.getBoundingClientRect();
-      if (!rect) return clampPoint({ x: clientX, y: clientY }, stageRect.w, stageRect.h);
-      return clampPoint({ x: clientX - rect.left, y: clientY - rect.top }, stageRect.w, stageRect.h);
-    },
-    [stageRect.h, stageRect.w],
-  );
-
-  const commitTextDraft = useCallback(() => {
-    setTextDraft((current) => {
-      if (!current) return null;
-      const trimmed = current.value.trim();
-      if (trimmed) {
-        setAnnotations((prev) => [
-          ...prev,
-          {
-            id: `ann-${Date.now()}-${prev.length}`,
-            kind: "text",
-            x: current.x,
-            y: current.y,
-            text: trimmed,
-            color: activeColor,
-            fontSize: sizePreset.fontSize,
-          },
-        ]);
+  const handleSelectTool = useCallback(
+    (tool: AnnotationTool) => {
+      if (tool !== "text" && textDraftRef.current) {
+        flushTextDraft();
       }
-      return null;
-    });
-  }, [activeColor, sizePreset.fontSize]);
+      setActiveTool(tool);
+    },
+    [flushTextDraft],
+  );
+
+  const handleUndo = useCallback(() => {
+    const nextList = annotationsRef.current.slice(0, -1);
+    annotationsRef.current = nextList;
+    setAnnotations(nextList);
+  }, []);
 
   const handleStagePointerDown = useCallback(
     (event: ReactPointerEvent<SVGSVGElement>) => {
       if (event.button !== 0 || activeTool === "none") return;
       event.stopPropagation();
+      openPopoverRef.current = "none";
       setOpenPopover("none");
 
       const pt = stageLocalPoint(event.clientX, event.clientY);
       if (activeTool === "text") {
-        if (textDraftRef.current) {
-          commitTextDraft();
-        }
-        setTextDraft({ x: pt.x, y: pt.y, value: "" });
+        flushTextDraft();
+        const fresh = { x: pt.x, y: pt.y, value: "" };
+        textDraftRef.current = fresh;
+        setTextDraft(fresh);
         return;
       }
+      flushTextDraft();
 
       event.currentTarget.setPointerCapture?.(event.pointerId);
       const id = `ann-${Date.now()}`;
@@ -408,7 +519,7 @@ export function TranslateOverlay() {
         });
       }
     },
-    [activeColor, activeTool, commitTextDraft, sizePreset.strokeWidth, stageLocalPoint],
+    [activeColor, activeTool, flushTextDraft, sizePreset.strokeWidth, stageLocalPoint],
   );
 
   const handleStagePointerMove = useCallback(
@@ -430,7 +541,9 @@ export function TranslateOverlay() {
   const finishDraft = useCallback(() => {
     setDraftAnnotation((current) => {
       if (current && isMeaningfulAnnotation(current)) {
-        setAnnotations((prev) => [...prev, current]);
+        const nextList = [...annotationsRef.current, current];
+        annotationsRef.current = nextList;
+        setAnnotations(nextList);
       }
       return null;
     });
@@ -470,13 +583,100 @@ export function TranslateOverlay() {
   );
 
   const showToolbar = stage === "done" || retranslating;
+  const effectiveViewW = viewW > 0 ? viewW : stageRect.x + stageRect.w;
+  const measuredBarW = Math.min(effectiveViewW, Math.max(240, toolbarWidth));
+  const maxToolbarLeft = Math.max(0, effectiveViewW - measuredBarW - 4);
+  const toolbarLeft = Math.max(
+    Math.min(4, maxToolbarLeft),
+    Math.min(maxToolbarLeft, stageRect.x + stageRect.w / 2 - measuredBarW / 2),
+  );
+
+  useEffect(() => {
+    const el = toolbarAnchorRef.current;
+    if (!showToolbar || !el) return () => {};
+    const measure = () => {
+      const w = el.getBoundingClientRect?.().width || el.offsetWidth;
+      if (w > 0 && Number.isFinite(w)) {
+        setToolbarWidth((prev) => (Math.abs(prev - w) > 0.5 ? Math.round(w) : prev));
+      }
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return () => {};
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [showToolbar, targetLang, activeTool, annotations.length, saving, retranslating]);
+
+  const isDraggingAnnotation = draftAnnotation !== null;
+  const isEditingText = textDraft !== null;
+
+  useEffect(() => {
+    const rects: CaptureHitRect[] = [];
+    const root = rootElRef.current;
+    if (root && typeof root.querySelectorAll === "function") {
+      const nodes = root.querySelectorAll("[data-hit-rect='true']");
+      for (const node of nodes) {
+        const rect = node.getBoundingClientRect?.();
+        if (
+          rect &&
+          Number.isFinite(rect.width) &&
+          Number.isFinite(rect.height) &&
+          rect.width > 0 &&
+          rect.height > 0
+        ) {
+          rects.push({ x: rect.left, y: rect.top, w: rect.width, h: rect.height });
+        }
+      }
+    }
+    if (rects.length === 0 && stageRect.w > 0 && stageRect.h > 0) {
+      rects.push({ x: stageRect.x, y: stageRect.y, w: stageRect.w, h: stageRect.h });
+      if (showToolbar) {
+        rects.push({
+          x: toolbarLeft,
+          y: toolbarTop,
+          w: measuredBarW,
+          h: activeTool !== "none" ? 84 : 44,
+        });
+      }
+    }
+    if (rects.length > 0) {
+      void api.setCaptureHitRects(rects, isDraggingAnnotation, generationRef.current);
+    }
+    return () => {};
+  }, [
+    activeTool,
+    annotations.length,
+    blocks,
+    error,
+    actionError,
+    isDraggingAnnotation,
+    isEditingText,
+    measuredBarW,
+    notice,
+    saveToast,
+    openPopover,
+    retranslating,
+    showToolbar,
+    stage,
+    stageRect.h,
+    stageRect.w,
+    stageRect.x,
+    stageRect.y,
+    targetLang,
+    toolbarLeft,
+    toolbarTop,
+  ]);
 
   return (
     <div
+      ref={rootElRef}
       className="relative h-full w-full overflow-hidden"
       style={{ fontFamily: OVERLAY_FONT }}
       onClick={() => {
-        if (openPopover !== "none") setOpenPopover("none");
+        if (openPopover !== "none") {
+          openPopoverRef.current = "none";
+          setOpenPopover("none");
+        }
       }}
     >
       <OverlayBoundary blocks={blocks}>
@@ -484,6 +684,7 @@ export function TranslateOverlay() {
         <div
           ref={stageElRef}
           data-testid="capture-stage"
+          data-hit-rect="true"
           className="absolute overflow-hidden"
           style={{
             left: stageRect.x,
@@ -540,34 +741,49 @@ export function TranslateOverlay() {
           )}
 
           {textDraft && (() => {
-            const draftLines = textDraft.value.split("\n").length;
-            const rows = Math.min(5, Math.max(1, draftLines));
-            const lineH = Math.round(sizePreset.fontSize * 1.25);
+            const box = computeTextBoxLayout({
+              x: textDraft.x,
+              y: textDraft.y,
+              value: textDraft.value,
+              fontSize: sizePreset.fontSize,
+              stageWidth: stageRect.w,
+              stageHeight: stageRect.h,
+            });
             return (
               <textarea
                 data-testid="annotation-text-input"
                 autoFocus
-                rows={rows}
+                rows={box.rows}
                 value={textDraft.value}
                 placeholder="输入文字"
-                onChange={(e) =>
-                  setTextDraft((prev) => (prev ? { ...prev, value: e.target.value } : null))
-                }
-                onBlur={commitTextDraft}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setTextDraft((prev) => {
+                    const next = prev ? { ...prev, value: val } : null;
+                    textDraftRef.current = next;
+                    return next;
+                  });
+                }}
+                onBlur={flushTextDraft}
                 onKeyDown={(e) => {
                   e.stopPropagation();
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
-                    commitTextDraft();
+                    flushTextDraft();
                   } else if (e.key === "Escape") {
                     e.preventDefault();
+                    textDraftRef.current = null;
                     setTextDraft(null);
                   }
                 }}
-                className="absolute z-30 min-w-[96px] resize-none rounded border border-white/75 bg-black/55 px-1.5 py-0.5 font-semibold leading-tight outline-none"
+                className="absolute z-30 box-border min-w-[96px] resize-none overflow-hidden rounded border border-white/75 bg-black/55 font-semibold outline-none"
                 style={{
-                  left: Math.min(textDraft.x, Math.max(0, stageRect.w - 110)),
-                  top: Math.min(textDraft.y, Math.max(0, stageRect.h - 32 - (rows - 1) * lineH)),
+                  left: box.left,
+                  top: box.top,
+                  maxWidth: box.maxWidth,
+                  maxHeight: box.maxHeight,
+                  padding: `${TEXT_DRAFT_PAD_Y - 1}px ${TEXT_DRAFT_PAD_X - 1}px`,
+                  lineHeight: `${box.lineHeight}px`,
                   color: activeColor,
                   fontSize: sizePreset.fontSize,
                 }}
@@ -600,8 +816,10 @@ export function TranslateOverlay() {
 
       {showToolbar && (
         <div
-          className="pointer-events-none absolute inset-x-1 z-30 flex justify-center"
-          style={{ top: toolbarTop }}
+          ref={toolbarAnchorRef}
+          data-testid="capture-toolbar-anchor"
+          className="pointer-events-none absolute z-30"
+          style={{ left: toolbarLeft, top: toolbarTop }}
         >
           <CaptureToolbar
             targetLang={targetLang}
@@ -610,18 +828,21 @@ export function TranslateOverlay() {
             onToggleOriginal={setShowOriginal}
             onSelectLang={handleSelectLang}
             activeTool={activeTool}
-            onSelectTool={setActiveTool}
+            onSelectTool={handleSelectTool}
             activeColor={activeColor}
             onSelectColor={setActiveColor}
             activeSize={activeSize}
             onSelectSize={setActiveSize}
             annotationsCount={annotations.length}
-            onUndo={() => setAnnotations((prev) => prev.slice(0, -1))}
+            onUndo={handleUndo}
             onSave={handleSave}
             saving={saving}
             hasImage={hasImage || !!originalImageUrl}
             openPopover={openPopover}
-            onTogglePopover={setOpenPopover}
+            onTogglePopover={(next) => {
+              openPopoverRef.current = next;
+              setOpenPopover(next);
+            }}
             popoverUp={popoverUp}
             subbarAbove={subbarAbove}
             popoverMaxHeight={popoverMaxHeight}
@@ -758,6 +979,7 @@ export function OverlayChrome({
       {nothingToReplace && !error && !hideTranslation && (
         <div
           role="status"
+          data-hit-rect="true"
           className="pointer-events-auto absolute inset-x-1 top-1 z-10 rounded bg-[rgba(14,14,18,0.95)] px-2.5 py-1.5 text-[12.5px] leading-snug text-[#f6f3ed]"
         >
           译文和原文一样，没有要替换的内容。点击关闭按钮或 Esc 退出。
@@ -767,6 +989,7 @@ export function OverlayChrome({
       {stage === "done" && blocks !== null && blocks.length === 0 && !error && (
         <div
           role="status"
+          data-hit-rect="true"
           className="pointer-events-auto absolute inset-x-1 top-1 z-10 rounded bg-[rgba(14,14,18,0.95)] px-2.5 py-1.5 text-[12.5px] leading-snug text-[#f6f3ed]"
         >
           没识别到文字，仍可在工具条里标注或保存原图 · Esc 关闭
@@ -776,6 +999,7 @@ export function OverlayChrome({
       {error && (
         <div
           role="alert"
+          data-hit-rect="true"
           className="pointer-events-auto absolute inset-x-1 top-1 z-10 max-h-[calc(100%-8px)] overflow-y-auto rounded border border-[rgba(255,107,74,0.6)] bg-[rgba(48,14,10,0.97)] px-2.5 py-1.5 text-[12.5px] leading-snug text-[#ffd8cc]"
         >
           翻译失败：{error.replace(/[。.\s]+$/, "")}。
@@ -786,6 +1010,7 @@ export function OverlayChrome({
       {notice && !error && (
         <div
           role="status"
+          data-hit-rect="true"
           className="pointer-events-auto absolute inset-x-1 bottom-1 z-10 max-h-[calc(100%-8px)] overflow-y-auto rounded border border-[rgba(240,180,94,0.6)] bg-[rgba(44,32,10,0.97)] px-2.5 py-1.5 text-[12.5px] leading-snug text-[#f6e3bd]"
         >
           {notice}

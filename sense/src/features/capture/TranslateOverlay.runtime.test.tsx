@@ -88,6 +88,7 @@ vi.mock("react", async (importOriginal) => {
 const ipcMock = vi.hoisted(() => ({
   captureBlocks: vi.fn<() => Promise<CaptureView>>(),
   captureOriginalImage: vi.fn<() => Promise<string | null>>(),
+  setCaptureHitRects: vi.fn<(rects: unknown, lock?: boolean, gen?: number) => Promise<void>>(),
   retranslateCapture: vi.fn<(target: string) => Promise<void>>(),
   saveCaptureImage: vi.fn<(kind: SaveImageKind, pngBase64: string | null) => Promise<SaveImageResult>>(),
   closeOverlay: vi.fn<(generation?: number) => Promise<void>>(),
@@ -96,7 +97,7 @@ const ipcMock = vi.hoisted(() => ({
 }));
 
 const exportMock = vi.hoisted(() => ({
-  renderCapturePngBase64: vi.fn<() => Promise<string>>(),
+  renderCapturePngBase64: vi.fn<(options: unknown) => Promise<string>>(),
 }));
 
 vi.mock("../../lib/ipc", async (importOriginal) => {
@@ -107,6 +108,7 @@ vi.mock("../../lib/ipc", async (importOriginal) => {
       ...actual.api,
       captureBlocks: ipcMock.captureBlocks,
       captureOriginalImage: ipcMock.captureOriginalImage,
+      setCaptureHitRects: ipcMock.setCaptureHitRects,
       retranslateCapture: ipcMock.retranslateCapture,
       saveCaptureImage: ipcMock.saveCaptureImage,
       closeOverlay: ipcMock.closeOverlay,
@@ -264,6 +266,8 @@ beforeEach(() => {
   ipcMock.captureBlocks.mockReset();
   ipcMock.captureOriginalImage.mockReset();
   ipcMock.captureOriginalImage.mockResolvedValue("data:image/png;base64,iVBORw0KGgo=");
+  ipcMock.setCaptureHitRects.mockReset();
+  ipcMock.setCaptureHitRects.mockResolvedValue();
   ipcMock.retranslateCapture.mockReset();
   ipcMock.retranslateCapture.mockResolvedValue();
   ipcMock.saveCaptureImage.mockReset();
@@ -651,5 +655,204 @@ describe("TranslateOverlay 运行时状态机与工具条回归测试", () => {
     expect(typeof toolbar.popoverMaxHeight).toBe("number");
     expect(toolbar.popoverMaxHeight as number).toBeGreaterThanOrEqual(108);
     expect(toolbar.popoverMaxHeight as number).toBeLessThanOrEqual(220);
+  });
+
+  it("[R3-P1-2] 窄选区工具条水平正对选区居中，拖拽期间锁定指针且窗口失焦自动收起弹层", async () => {
+    ipcMock.captureBlocks.mockResolvedValue({
+      blocks: [sampleBlock()],
+      error: null,
+      notice: null,
+      stage: "done",
+      generation: 15,
+      revision: 1,
+      has_image: true,
+      bounds: { w: 580, h: 348 },
+      image_rect: { x: 190, y: 0, w: 200, h: 80 },
+    });
+
+    let root = renderOverlay();
+    await flush();
+    root = renderOverlay();
+
+    // 工具条水平正对 image_rect (center=290) 居中于 580px 窗口，而不是左偏移到 x=190
+    const anchor = findElement(root, (el) => el.props["data-testid"] === "capture-toolbar-anchor")!;
+    expect(anchor).not.toBeNull();
+    expect((anchor.props.style as { left: number }).left).toBe(10);
+
+    // 初始 hit_rects 已同步且未锁指针
+    expect(ipcMock.setCaptureHitRects).toHaveBeenCalled();
+    const initialHitCall = ipcMock.setCaptureHitRects.mock.calls[ipcMock.setCaptureHitRects.mock.calls.length - 1] as unknown[];
+    expect(initialHitCall[1]).toBe(false);
+    expect(initialHitCall[2]).toBe(15);
+
+    // 展开语言菜单后触发 window blur -> 自动收起弹窗（配合透明区鼠标穿透切回桌面）
+    (findToolbarProps(root)!.onTogglePopover as (next: "lang" | "save" | "none") => void)("lang");
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.openPopover).toBe("lang");
+    for (const listener of windowState.listeners.get("blur") ?? []) {
+      listener({});
+    }
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.openPopover).toBe("none");
+
+    // 拖拽矩形期间 pointer_lock=true，松手后恢复 false
+    (findToolbarProps(root)!.onSelectTool as (tool: "rect") => void)("rect");
+    root = renderOverlay();
+    const svg = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svg.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 1,
+      clientX: 210,
+      clientY: 20,
+      stopPropagation: () => {},
+      currentTarget: {},
+    });
+    root = renderOverlay();
+    const callsAtDragStart = ipcMock.setCaptureHitRects.mock.calls.length;
+    const lockedCall = ipcMock.setCaptureHitRects.mock.calls[callsAtDragStart - 1] as unknown[];
+    expect(lockedCall[1]).toBe(true);
+
+    // [R4-P2-1] 连续 pointerMove 不改变 isDraggingAnnotation 布尔态，不得触发高频 setCaptureHitRects IPC
+    const svgMove1 = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svgMove1.props.onPointerMove as (e: unknown) => void)({ clientX: 230, clientY: 30 });
+    root = renderOverlay();
+    const svgMove2 = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svgMove2.props.onPointerMove as (e: unknown) => void)({ clientX: 250, clientY: 45 });
+    root = renderOverlay();
+    expect(ipcMock.setCaptureHitRects.mock.calls.length).toBe(callsAtDragStart);
+
+    const svgUp = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svgUp.props.onPointerUp as () => void)();
+    root = renderOverlay();
+    const unlockedCall = ipcMock.setCaptureHitRects.mock.calls[ipcMock.setCaptureHitRects.mock.calls.length - 1] as unknown[];
+    expect(unlockedCall[1]).toBe(false);
+  });
+
+  it("[R3-P1-3] 文字标注边缘夹逼不跳变、切色保活焦点不提前落盘、点击保存先自动落盘再合成", async () => {
+    ipcMock.captureBlocks.mockResolvedValue({
+      blocks: [sampleBlock()],
+      error: null,
+      notice: null,
+      stage: "done",
+      generation: 16,
+      revision: 1,
+      has_image: true,
+      scale: 2,
+      bounds: { w: 500, h: 200 },
+      image_rect: { x: 0, y: 0, w: 500, h: 140 },
+    });
+
+    let root = renderOverlay();
+    await flush();
+    root = renderOverlay();
+
+    // 1) 在靠近右下角 (492, 134) 启动文字标注，输入时切换二级属性条颜色与字号应保持编辑态不失焦
+    (findToolbarProps(root)!.onSelectTool as (tool: "text") => void)("text");
+    root = renderOverlay();
+    const svg = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svg.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 1,
+      clientX: 492,
+      clientY: 134,
+      stopPropagation: () => {},
+      currentTarget: {},
+    });
+    root = renderOverlay();
+
+    const textarea = findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!;
+    expect(textarea).not.toBeNull();
+    const areaStyle = textarea.props.style as { left: number; top: number };
+    expect(areaStyle.left).toBe(390);
+    // 默认中号 18px 时 lineHeight=23, boxHeight=29 -> top=140-29=111
+    expect(areaStyle.top).toBe(111);
+
+    // 验证二级属性条的颜色/字号按钮均在 onMouseDown 调用 preventDefault，防止浏览器先触发 textarea.onBlur
+    const toolbarEl = CaptureToolbar(findToolbarProps(root) as Parameters<typeof CaptureToolbar>[0]) as El;
+    const orangeBtn = findElement(toolbarEl, (el) => el.props["aria-label"] === "颜色橙")!;
+    const largeBtn = findElement(toolbarEl, (el) => el.props["aria-label"] === "粗细粗")!;
+    const prevent1 = vi.fn();
+    const prevent2 = vi.fn();
+    (orangeBtn.props.onMouseDown as (e: { preventDefault: () => void }) => void)({ preventDefault: prevent1 });
+    (largeBtn.props.onMouseDown as (e: { preventDefault: () => void }) => void)({ preventDefault: prevent2 });
+    expect(prevent1).toHaveBeenCalledTimes(1);
+    expect(prevent2).toHaveBeenCalledTimes(1);
+
+    (findToolbarProps(root)!.onSelectColor as (hex: string) => void)("#ff9500");
+    (findToolbarProps(root)!.onSelectSize as (id: "sm" | "md" | "lg") => void)("lg");
+    root = renderOverlay();
+
+    // 仍在编辑态中，输入文字且尚未失焦，直接点击「保存翻译后图片」
+    const editingArea = findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!;
+    expect(editingArea).not.toBeNull();
+    (editingArea.props.onChange as (e: { target: { value: string } }) => void)({ target: { value: "重要提示" } });
+    root = renderOverlay();
+
+    await (findToolbarProps(root)!.onSave as (kind: SaveImageKind) => Promise<void>)("translated");
+    root = renderOverlay();
+
+    // 保存时自动把草稿用新颜色/粗号落盘，且落盘坐标精确对齐 textarea 内部文本偏移 (left+6, top+3)
+    expect(exportMock.renderCapturePngBase64).toHaveBeenCalledTimes(1);
+    const exportArgs = exportMock.renderCapturePngBase64.mock.calls[0]![0] as {
+      annotations: Array<{ kind: string; x: number; y: number; text: string; color: string; fontSize: number }>;
+    };
+    expect(exportArgs.annotations).toHaveLength(1);
+    expect(exportArgs.annotations[0]).toMatchObject({
+      kind: "text",
+      text: "重要提示",
+      color: "#ff9500",
+      fontSize: 24,
+      x: 396,
+      // 粗号 24px 时 lineHeight=30, boxHeight=36 -> top=104, textY=107
+      y: 107,
+    });
+
+    // 保存后再迟到的 onBlur 不得重复提交一条相同的文字标注
+    (editingArea.props.onBlur as () => void)();
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.annotationsCount).toBe(1);
+  });
+
+  it("[R3-P2-1] 原图初次返回 null 时允许后续按需补拉，仍取不到时报错并拦截黑底保存，菜单项同步禁用", async () => {
+    // 1) 工具条在 hasImage=false 时三个保存菜单项均禁用
+    ipcMock.captureBlocks.mockResolvedValue({
+      blocks: [sampleBlock()],
+      error: null,
+      notice: null,
+      stage: "done",
+      generation: 17,
+      revision: 1,
+      has_image: false,
+      bounds: { w: 500, h: 200 },
+      image_rect: { x: 0, y: 0, w: 500, h: 140 },
+    });
+    ipcMock.captureOriginalImage.mockResolvedValue(null);
+
+    let root = renderOverlay();
+    await flush();
+    root = renderOverlay();
+
+    (findToolbarProps(root)!.onTogglePopover as (next: "save") => void)("save");
+    root = renderOverlay();
+    const disabledToolbar = CaptureToolbar(findToolbarProps(root) as Parameters<typeof CaptureToolbar>[0]) as El;
+    expect(findElement(disabledToolbar, (el) => el.props.children === "保存未翻译原图")!.props.disabled).toBe(true);
+    expect(findElement(disabledToolbar, (el) => el.props.children === "保存翻译后图片")!.props.disabled).toBe(true);
+
+    // 点击「保存翻译后图片」按需拉取原图仍返回 null -> 展示错误且不导出黑底、不弹窗
+    await (findToolbarProps(root)!.onSave as (kind: SaveImageKind) => Promise<void>)("translated");
+    root = renderOverlay();
+    expect(findOverlayViewProps(root).error).toContain("原图尚未就绪");
+    expect(exportMock.renderCapturePngBase64).not.toHaveBeenCalled();
+    expect(ipcMock.saveCaptureImage).not.toHaveBeenCalled();
+
+    // 2) 后续原图就绪后，再次点击「保存翻译后图片」不被 loadedImageGenRef 锁死，可按需拉取并成功保存
+    ipcMock.captureOriginalImage.mockResolvedValueOnce("data:image/png;base64,RECOVERED");
+    await (findToolbarProps(root)!.onSave as (kind: SaveImageKind) => Promise<void>)("translated");
+    root = renderOverlay();
+    expect(ipcMock.captureOriginalImage).toHaveBeenCalledTimes(2);
+    expect(exportMock.renderCapturePngBase64).toHaveBeenCalledWith(
+      expect.objectContaining({ originalImageUrl: "data:image/png;base64,RECOVERED" }),
+    );
+    expect(ipcMock.saveCaptureImage).toHaveBeenCalledWith("translated", "RAW_PNG_BASE64");
   });
 });
