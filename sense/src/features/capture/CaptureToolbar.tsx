@@ -73,6 +73,7 @@ export function CaptureToolbar({
   popoverUp,
   subbarAbove,
   popoverMaxHeight,
+  maxWidth,
   onClose,
 }: {
   targetLang: string | null;
@@ -96,6 +97,7 @@ export function CaptureToolbar({
   popoverUp: boolean;
   subbarAbove: boolean;
   popoverMaxHeight?: number;
+  maxWidth?: number;
   onClose: () => void;
 }) {
   const languages: Language[] = CAPTURE_LANGUAGES;
@@ -104,6 +106,15 @@ export function CaptureToolbar({
     : "自动";
 
   const popoverPosClass = popoverUp ? "bottom-full mb-1.5" : "top-full mt-1.5";
+  const isCompact = maxWidth !== undefined && maxWidth < 608;
+  const isUltraNarrow = maxWidth !== undefined && maxWidth < 348;
+  const langMenuAlignClass = isUltraNarrow
+    ? "left-1/2 -translate-x-1/2"
+    : isCompact
+      ? "right-0"
+      : "left-0";
+  const showClusterDivider = !isCompact;
+  const showInnerClusterDivider = !isUltraNarrow;
   const subbarPosClass = subbarAbove
     ? "absolute bottom-full left-1/2 z-10 mb-1.5 -translate-x-1/2"
     : "relative z-10";
@@ -116,229 +127,240 @@ export function CaptureToolbar({
       onMouseDown={(e) => e.preventDefault()}
       onPointerDown={(e) => e.stopPropagation()}
     >
-      {/* 主工具条 */}
+      {/* 主工具条：宽屏单行展开，窄屏（maxWidth < 608px）按两大功能簇排成均衡双行且无悬空分隔线、不套 overflow-x 裁剪弹层 */}
       <div
         data-testid="capture-toolbar-main"
         data-hit-rect="true"
-        className="relative z-20 flex flex-nowrap items-center gap-1 rounded-xl border border-white/15 bg-[rgba(22,23,28,0.94)] px-2 py-1 text-[12px] text-[#f4f2ec] shadow-[0_10px_28px_rgba(0,0,0,0.45)] backdrop-blur-md"
+        style={maxWidth ? { maxWidth } : undefined}
+        className={`relative z-20 flex max-w-[calc(100vw-8px)] items-center justify-center rounded-xl border border-white/15 bg-[rgba(22,23,28,0.94)] px-2 py-1 text-[12px] text-[#f4f2ec] shadow-[0_10px_28px_rgba(0,0,0,0.45)] backdrop-blur-md ${
+          isCompact ? "flex-col gap-y-1" : "flex-wrap gap-x-1 gap-y-1"
+        }`}
       >
-        {/* 显示原文 / 显示结果 */}
-        <div role="group" aria-label="视图切换" className="flex shrink-0 items-center rounded-lg bg-white/8 p-0.5">
-          <button
-            type="button"
-            aria-pressed={showOriginal}
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={() => onToggleOriginal(true)}
-            className={`whitespace-nowrap rounded-md px-2 py-1 text-[11.5px] transition-colors ${
-              showOriginal
-                ? "bg-white text-[#141418] font-medium"
-                : "text-[#c8c4bc] hover:text-white"
-            }`}
-          >
-            显示原文
-          </button>
-          <button
-            type="button"
-            aria-pressed={!showOriginal}
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={() => onToggleOriginal(false)}
-            className={`whitespace-nowrap rounded-md px-2 py-1 text-[11.5px] transition-colors ${
-              !showOriginal
-                ? "bg-white text-[#141418] font-medium"
-                : "text-[#c8c4bc] hover:text-white"
-            }`}
-          >
-            显示结果
-          </button>
-        </div>
-
-        <div className="mx-0.5 h-4 w-px shrink-0 bg-white/15" />
-
-        {/* 翻译目标语言选择 */}
-        <div className="relative shrink-0">
-          <button
-            type="button"
-            data-testid="capture-lang-btn"
-            aria-expanded={openPopover === "lang"}
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={() => onTogglePopover(openPopover === "lang" ? "none" : "lang")}
-            className={`flex items-center gap-1 whitespace-nowrap rounded-lg px-2 py-1 text-[11.5px] transition-colors ${
-              openPopover === "lang"
-                ? "bg-white/20 text-white"
-                : "bg-white/8 text-[#f4f2ec] hover:bg-white/15"
-            }`}
-          >
-            <span>{retranslating ? "重译中…" : `译为 ${activeLangName}`}</span>
-            <span className="text-[10px] text-[#a7a299]">▾</span>
-          </button>
-
-          {openPopover === "lang" && (
-            <div
-              role="menu"
-              data-hit-rect="true"
-              aria-label="选择翻译目标语言"
-              style={popoverMaxHeight ? { maxHeight: popoverMaxHeight } : undefined}
-              className={`absolute left-0 ${popoverPosClass} z-30 w-[240px] overflow-y-auto rounded-xl border border-white/15 bg-[rgba(24,25,31,0.98)] p-1.5 shadow-[0_12px_32px_rgba(0,0,0,0.55)]`}
+        {/* 第一功能簇：视图切换 + 目标语言选择 */}
+        <div className="flex max-w-full shrink-0 flex-wrap items-center justify-center gap-1">
+          {/* 显示原文 / 显示结果 */}
+          <div role="group" aria-label="视图切换" className="flex shrink-0 items-center rounded-lg bg-white/8 p-0.5">
+            <button
+              type="button"
+              aria-pressed={showOriginal}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => onToggleOriginal(true)}
+              className={`whitespace-nowrap rounded-md px-2 py-1 text-[11.5px] transition-colors ${
+                showOriginal
+                  ? "bg-white text-[#141418] font-medium"
+                  : "text-[#c8c4bc] hover:text-white"
+              }`}
             >
-              <button
-                type="button"
-                role="menuitem"
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={() => {
-                  onTogglePopover("none");
-                  onSelectLang("auto");
-                }}
-                className="mb-1 flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[11.5px] text-[#e7e4dc] hover:bg-white/12"
-              >
-                <span>自动识别（混合语种默认译中文）</span>
-              </button>
-              <div className="grid grid-cols-2 gap-0.5 pr-0.5">
-                {languages.map((lang) => {
-                  const selected = lang.code === targetLang;
-                  return (
-                    <button
-                      key={lang.code}
-                      type="button"
-                      role="menuitem"
-                      onMouseDown={(e) => e.preventDefault()}
-                      onClick={() => {
-                        onTogglePopover("none");
-                        onSelectLang(lang.code);
-                      }}
-                      className={`flex items-center justify-between rounded-md px-2 py-1 text-left text-[11.5px] transition-colors ${
-                        selected
-                          ? "bg-[#2f7cf6] text-white font-medium"
-                          : "text-[#dcd8cf] hover:bg-white/10"
-                      }`}
-                    >
-                      <span className="truncate">{lang.name}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
+              显示原文
+            </button>
+            <button
+              type="button"
+              aria-pressed={!showOriginal}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => onToggleOriginal(false)}
+              className={`whitespace-nowrap rounded-md px-2 py-1 text-[11.5px] transition-colors ${
+                !showOriginal
+                  ? "bg-white text-[#141418] font-medium"
+                  : "text-[#c8c4bc] hover:text-white"
+              }`}
+            >
+              显示结果
+            </button>
+          </div>
+
+          {(maxWidth === undefined || maxWidth >= 260) && (
+            <div className="mx-0.5 h-4 w-px shrink-0 bg-white/15" />
           )}
-        </div>
 
-        <div className="mx-0.5 h-4 w-px shrink-0 bg-white/15" />
-
-        {/* 钉钉风格标注工具 */}
-        <div role="group" aria-label="图片编辑工具" className="flex shrink-0 items-center gap-0.5">
-          {TOOL_ITEMS.map(({ id, label }) => {
-            const active = activeTool === id;
-            return (
-              <button
-                key={id}
-                type="button"
-                title={label}
-                aria-label={label}
-                aria-pressed={active}
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={() => onSelectTool(active ? "none" : id)}
-                className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-lg transition-colors ${
-                  active
-                    ? "bg-[#2f7cf6] text-white"
-                    : "text-[#d2cec5] hover:bg-white/12 hover:text-white"
-                }`}
-              >
-                <ToolIcon tool={id} />
-              </button>
-            );
-          })}
-          <button
-            type="button"
-            title="撤销标注"
-            aria-label="撤销"
-            disabled={annotationsCount === 0}
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={onUndo}
-            className="flex h-7 shrink-0 items-center justify-center whitespace-nowrap rounded-lg px-2 text-[11.5px] text-[#d2cec5] transition-colors hover:bg-white/12 hover:text-white disabled:cursor-not-allowed disabled:opacity-35"
-          >
-            撤销
-          </button>
-        </div>
-
-        <div className="mx-0.5 h-4 w-px shrink-0 bg-white/15" />
-
-        {/* 存为图片 */}
-        <div className="relative shrink-0">
-          <button
-            type="button"
-            data-testid="capture-save-btn"
-            disabled={saving}
-            aria-expanded={openPopover === "save"}
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={() => onTogglePopover(openPopover === "save" ? "none" : "save")}
-            className="flex items-center gap-1 whitespace-nowrap rounded-lg bg-white/8 px-2 py-1 text-[11.5px] text-[#f4f2ec] transition-colors hover:bg-white/15 disabled:opacity-50"
-          >
-            <span>{saving ? "保存中…" : "存为图片"}</span>
-            <span className="text-[10px] text-[#a7a299]">▾</span>
-          </button>
-
-          {openPopover === "save" && (
-            <div
-              role="menu"
-              data-hit-rect="true"
-              aria-label="保存图片选项"
-              style={popoverMaxHeight ? { maxHeight: popoverMaxHeight } : undefined}
-              className={`absolute right-0 ${popoverPosClass} z-30 min-w-[156px] overflow-y-auto rounded-xl border border-white/15 bg-[rgba(24,25,31,0.98)] p-1 shadow-[0_12px_32px_rgba(0,0,0,0.55)]`}
+          {/* 翻译目标语言选择 */}
+          <div className={isUltraNarrow ? "shrink-0" : "relative shrink-0"}>
+            <button
+              type="button"
+              data-testid="capture-lang-btn"
+              aria-expanded={openPopover === "lang"}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => onTogglePopover(openPopover === "lang" ? "none" : "lang")}
+              className={`flex items-center gap-1 whitespace-nowrap rounded-lg px-2 py-1 text-[11.5px] transition-colors ${
+                openPopover === "lang"
+                  ? "bg-white/20 text-white"
+                  : "bg-white/8 text-[#f4f2ec] hover:bg-white/15"
+              }`}
             >
-              <button
-                type="button"
-                role="menuitem"
-                disabled={!hasImage}
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={() => {
-                  onTogglePopover("none");
-                  onSave("original");
-                }}
-                className="flex w-full items-center whitespace-nowrap rounded-lg px-2.5 py-1.5 text-left text-[11.5px] text-[#e7e4dc] hover:bg-white/12 disabled:cursor-not-allowed disabled:opacity-40"
+              <span>{retranslating ? "重译中…" : `译为 ${activeLangName}`}</span>
+              <span className="text-[10px] text-[#a7a299]">▾</span>
+            </button>
+
+            {openPopover === "lang" && (
+              <div
+                role="menu"
+                data-hit-rect="true"
+                aria-label="选择翻译目标语言"
+                style={popoverMaxHeight ? { maxHeight: popoverMaxHeight } : undefined}
+                className={`absolute ${langMenuAlignClass} ${popoverPosClass} z-30 w-[240px] max-w-[calc(100vw-16px)] overflow-y-auto rounded-xl border border-white/15 bg-[rgba(24,25,31,0.98)] p-1.5 shadow-[0_12px_32px_rgba(0,0,0,0.55)]`}
               >
-                保存未翻译原图
-              </button>
-              {annotationsCount > 0 && (
                 <button
                   type="button"
                   role="menuitem"
-                  disabled={!hasImage}
                   onMouseDown={(e) => e.preventDefault()}
                   onClick={() => {
                     onTogglePopover("none");
-                    onSave("original_annotated");
+                    onSelectLang("auto");
                   }}
-                  className="flex w-full items-center whitespace-nowrap rounded-lg px-2.5 py-1.5 text-left text-[11.5px] text-[#e7e4dc] hover:bg-white/12 disabled:cursor-not-allowed disabled:opacity-40"
+                  className="mb-1 flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[11.5px] text-[#e7e4dc] hover:bg-white/12"
                 >
-                  保存带标注原图
+                  <span>自动识别（混合语种默认译中文）</span>
                 </button>
-              )}
-              <button
-                type="button"
-                role="menuitem"
-                disabled={!hasImage}
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={() => {
-                  onTogglePopover("none");
-                  onSave("translated");
-                }}
-                className="flex w-full items-center whitespace-nowrap rounded-lg px-2.5 py-1.5 text-left text-[11.5px] text-[#e7e4dc] hover:bg-white/12 disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                保存翻译后图片
-              </button>
-            </div>
-          )}
+                <div className="grid grid-cols-2 gap-0.5 pr-0.5">
+                  {languages.map((lang) => {
+                    const selected = lang.code === targetLang;
+                    return (
+                      <button
+                        key={lang.code}
+                        type="button"
+                        role="menuitem"
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={() => {
+                          onTogglePopover("none");
+                          onSelectLang(lang.code);
+                        }}
+                        className={`flex items-center justify-between rounded-md px-2 py-1 text-left text-[11.5px] transition-colors ${
+                          selected
+                            ? "bg-[#2f7cf6] text-white font-medium"
+                            : "text-[#dcd8cf] hover:bg-white/10"
+                        }`}
+                      >
+                        <span className="truncate">{lang.name}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
         </div>
 
-        {/* 关闭 */}
-        <button
-          type="button"
-          data-testid="capture-close-btn"
-          aria-label="关闭"
-          onMouseDown={(e) => e.preventDefault()}
-          onClick={onClose}
-          className="ml-0.5 shrink-0 whitespace-nowrap rounded-lg bg-[#e5484d]/90 px-2.5 py-1 text-[11.5px] font-medium text-white transition-colors hover:bg-[#e5484d]"
-        >
-          关闭
-        </button>
+        {showClusterDivider && <div className="mx-0.5 h-4 w-px shrink-0 bg-white/15" />}
+
+        {/* 第二功能簇：钉钉风格标注工具 + 存为图片 + 关闭 */}
+        <div className="flex max-w-full shrink-0 flex-wrap items-center justify-center gap-1">
+          <div role="group" aria-label="图片编辑工具" className="flex shrink-0 items-center gap-0.5">
+            {TOOL_ITEMS.map(({ id, label }) => {
+              const active = activeTool === id;
+              return (
+                <button
+                  key={id}
+                  type="button"
+                  title={label}
+                  aria-label={label}
+                  aria-pressed={active}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => onSelectTool(active ? "none" : id)}
+                  className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-lg transition-colors ${
+                    active
+                      ? "bg-[#2f7cf6] text-white"
+                      : "text-[#d2cec5] hover:bg-white/12 hover:text-white"
+                  }`}
+                >
+                  <ToolIcon tool={id} />
+                </button>
+              );
+            })}
+            <button
+              type="button"
+              title="撤销标注"
+              aria-label="撤销"
+              disabled={annotationsCount === 0}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={onUndo}
+              className="flex h-7 shrink-0 items-center justify-center whitespace-nowrap rounded-lg px-2 text-[11.5px] text-[#d2cec5] transition-colors hover:bg-white/12 hover:text-white disabled:cursor-not-allowed disabled:opacity-35"
+            >
+              撤销
+            </button>
+          </div>
+
+          {showInnerClusterDivider && <div className="mx-0.5 h-4 w-px shrink-0 bg-white/15" />}
+
+          {/* 存为图片与关闭同组折行，窄屏下保持成对居中且永不溢出右缘 */}
+          <div role="group" aria-label="导出与关闭" className="flex shrink-0 items-center gap-1">
+            <div className="relative shrink-0">
+              <button
+                type="button"
+                data-testid="capture-save-btn"
+                disabled={saving}
+                aria-expanded={openPopover === "save"}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => onTogglePopover(openPopover === "save" ? "none" : "save")}
+                className="flex items-center gap-1 whitespace-nowrap rounded-lg bg-white/8 px-2 py-1 text-[11.5px] text-[#f4f2ec] transition-colors hover:bg-white/15 disabled:opacity-50"
+              >
+                <span>{saving ? "保存中…" : "存为图片"}</span>
+                <span className="text-[10px] text-[#a7a299]">▾</span>
+              </button>
+
+              {openPopover === "save" && (
+                <div
+                  role="menu"
+                  data-hit-rect="true"
+                  aria-label="保存图片选项"
+                  style={popoverMaxHeight ? { maxHeight: popoverMaxHeight } : undefined}
+                  className={`absolute right-0 ${popoverPosClass} z-30 min-w-[156px] max-w-[calc(100vw-16px)] overflow-y-auto rounded-xl border border-white/15 bg-[rgba(24,25,31,0.98)] p-1 shadow-[0_12px_32px_rgba(0,0,0,0.55)]`}
+                >
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={!hasImage}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => {
+                      onTogglePopover("none");
+                      onSave("original");
+                    }}
+                    className="flex w-full items-center whitespace-nowrap rounded-lg px-2.5 py-1.5 text-left text-[11.5px] text-[#e7e4dc] hover:bg-white/12 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    保存未翻译原图
+                  </button>
+                  {annotationsCount > 0 && (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      disabled={!hasImage}
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => {
+                        onTogglePopover("none");
+                        onSave("original_annotated");
+                      }}
+                      className="flex w-full items-center whitespace-nowrap rounded-lg px-2.5 py-1.5 text-left text-[11.5px] text-[#e7e4dc] hover:bg-white/12 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      保存带标注原图
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={!hasImage}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => {
+                      onTogglePopover("none");
+                      onSave("translated");
+                    }}
+                    className="flex w-full items-center whitespace-nowrap rounded-lg px-2.5 py-1.5 text-left text-[11.5px] text-[#e7e4dc] hover:bg-white/12 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    保存翻译后图片
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <button
+              type="button"
+              data-testid="capture-close-btn"
+              aria-label="关闭"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={onClose}
+              className="ml-0.5 shrink-0 whitespace-nowrap rounded-lg bg-[#e5484d]/90 px-2.5 py-1 text-[11.5px] font-medium text-white transition-colors hover:bg-[#e5484d]"
+            >
+              关闭
+            </button>
+          </div>
+        </div>
       </div>
 
       {/* 钉钉风格二级属性条（颜色 + 粗细） */}

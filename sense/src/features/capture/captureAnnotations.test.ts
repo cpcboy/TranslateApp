@@ -7,8 +7,10 @@ import {
   clampPoint,
   computeArrowHeadPoints,
   computeTextBoxLayout,
+  estimateTextLineWidth,
   isMeaningfulAnnotation,
   normalizeRect,
+  wrapAnnotationText,
   type Annotation,
 } from "./captureAnnotations";
 
@@ -217,5 +219,44 @@ describe("captureAnnotations 工具函数", () => {
     });
     expect(wideCaps.width).toBeGreaterThan(240);
     expect(wideCaps.left + wideCaps.width).toBeLessThanOrEqual(400);
+  });
+
+  it("[FIX-RIGHT-EDGE-WRAP] 画布右侧边缘单行超长中文/英文批注自动折行，零字符丢失且不越出 stageWidth", () => {
+    // 复现外部真机 QC 场景：360px 宽舞台在 x=245 处输入 17 字超长中文单行
+    const longZh = "右侧边缘超长中文批注测试会不会被裁剪";
+    const rightLong = computeTextBoxLayout({
+      x: 245,
+      y: 18,
+      value: longZh,
+      fontSize: 18,
+      stageWidth: 360,
+      stageHeight: 190,
+    });
+
+    expect(rightLong.left).toBe(245);
+    expect(rightLong.width).toBe(115);
+    expect(rightLong.wrappedLines.length).toBeGreaterThanOrEqual(3);
+    expect(rightLong.rows).toBe(Math.min(5, rightLong.wrappedLines.length));
+    // 所有折行拼接回原文 0 字符丢失，且每一行右边缘都严格落在 360px 舞台内
+    expect(rightLong.wrappedLines.join("")).toBe(longZh);
+    for (const line of rightLong.wrappedLines) {
+      expect(rightLong.textX + estimateTextLineWidth(line, 18)).toBeLessThanOrEqual(360);
+    }
+
+    // 英文带空格优先按词折行，超长连续单词再按字符兜底切分，极小 maxLineWidth 也不死循环
+    const enLines = wrapAnnotationText(
+      "Hello world Supercalifragilisticexpialidocious",
+      16,
+      95,
+    );
+    expect(enLines.length).toBeGreaterThanOrEqual(4);
+    expect(enLines[0]).toBe("Hello");
+    expect(enLines[1]).toBe("world");
+    for (const line of enLines) {
+      expect(estimateTextLineWidth(line, 16)).toBeLessThanOrEqual(95);
+    }
+
+    const tinyWrap = wrapAnnotationText("测A😊", 18, 4);
+    expect(tinyWrap).toEqual(["测", "A", "😊"]);
   });
 });

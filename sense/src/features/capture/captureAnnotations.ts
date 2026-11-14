@@ -142,13 +142,17 @@ export interface TextBoxLayout {
   minWidth: number;
   maxWidth: number;
   maxHeight: number;
+  maxLineWidth: number;
   lineHeight: number;
   rows: number;
   textX: number;
   textY: number;
+  wrappedLines: string[];
 }
 
-function estimateTextLineWidth(line: string, fontSize: number): number {
+export type MeasureAnnotationTextFn = (line: string, fontSize: number) => number;
+
+export function estimateTextLineWidth(line: string, fontSize: number): number {
   let width = 0;
   for (const ch of line) {
     const code = ch.codePointAt(0) ?? 0;
@@ -169,6 +173,117 @@ function estimateTextLineWidth(line: string, fontSize: number): number {
   return width;
 }
 
+function splitWrapUnits(line: string): string[] {
+  const units: string[] = [];
+  let asciiWord = "";
+  const isAsciiWordChar = (ch: string) =>
+    (ch >= "A" && ch <= "Z") ||
+    (ch >= "a" && ch <= "z") ||
+    (ch >= "0" && ch <= "9") ||
+    ch === "_" ||
+    ch === "-" ||
+    ch === "'";
+
+  for (const ch of Array.from(line)) {
+    if (isAsciiWordChar(ch)) {
+      asciiWord += ch;
+    } else {
+      if (asciiWord) {
+        units.push(asciiWord);
+        asciiWord = "";
+      }
+      units.push(ch);
+    }
+  }
+  if (asciiWord) {
+    units.push(asciiWord);
+  }
+  return units;
+}
+
+/**
+ * 将文字标注按可用行宽 `maxLineWidth` 自动折行，供 `<textarea>` 行高估算、SVG `<text>` 与 Canvas 导出共用，
+ * 防止在画布右侧边缘输入单行长文本时越出 `stageWidth` 被硬裁剪。
+ */
+export function wrapAnnotationText(
+  text: string,
+  fontSize: number,
+  maxLineWidth: number,
+  measureFn: MeasureAnnotationTextFn = estimateTextLineWidth,
+): string[] {
+  const rawLines = text.split("\n");
+  if (!Number.isFinite(maxLineWidth) || maxLineWidth <= 0) {
+    return rawLines;
+  }
+
+  const out: string[] = [];
+  const splitOversizedToken = (token: string): string[] => {
+    const chars = Array.from(token);
+    const parts: string[] = [];
+    let chunk = "";
+    for (const ch of chars) {
+      const candidate = chunk + ch;
+      if (chunk.length > 0 && measureFn(candidate, fontSize) > maxLineWidth) {
+        parts.push(chunk);
+        chunk = ch;
+      } else {
+        chunk = candidate;
+      }
+    }
+    if (chunk.length > 0) {
+      parts.push(chunk);
+    }
+    return parts;
+  };
+
+  for (const rawLine of rawLines) {
+    if (rawLine.length === 0 || measureFn(rawLine, fontSize) <= maxLineWidth) {
+      out.push(rawLine);
+      continue;
+    }
+
+    let current = "";
+    for (const unit of splitWrapUnits(rawLine)) {
+      if (current.length === 0) {
+        if (measureFn(unit, fontSize) <= maxLineWidth) {
+          current = unit;
+        } else {
+          const parts = splitOversizedToken(unit);
+          for (let i = 0; i < parts.length - 1; i += 1) {
+            out.push(parts[i]);
+          }
+          current = parts[parts.length - 1] ?? "";
+        }
+        continue;
+      }
+
+      const candidate = current + unit;
+      if (measureFn(candidate, fontSize) <= maxLineWidth) {
+        current = candidate;
+      } else {
+        const trimmedCurrent = current.replace(/ +$/, "");
+        out.push(trimmedCurrent.length > 0 ? trimmedCurrent : current);
+        if (unit === " ") {
+          current = "";
+        } else if (measureFn(unit, fontSize) <= maxLineWidth) {
+          current = unit;
+        } else {
+          const parts = splitOversizedToken(unit);
+          for (let i = 0; i < parts.length - 1; i += 1) {
+            out.push(parts[i]);
+          }
+          current = parts[parts.length - 1] ?? "";
+        }
+      }
+    }
+    if (current.length > 0) {
+      out.push(current);
+    }
+  }
+
+  return out;
+}
+
 /**
  * 计算文字标注输入框与 SVG/Canvas 落盘共用位置，避免边缘夹逼后确认跳变或被画布裁剪。
  */
@@ -179,27 +294,37 @@ export function computeTextBoxLayout(options: {
   fontSize: number;
   stageWidth: number;
   stageHeight: number;
+  measureFn?: MeasureAnnotationTextFn;
 }): TextBoxLayout {
-  const { x, y, value, fontSize, stageWidth, stageHeight } = options;
+  const { x, y, value, fontSize, stageWidth, stageHeight, measureFn = estimateTextLineWidth } = options;
   const safeW = Math.max(0, stageWidth);
   const safeH = Math.max(0, stageHeight);
   const lineHeight = Math.round(fontSize * 1.25);
-  const lines = value.split("\n");
-  const rows = Math.min(5, Math.max(1, lines.length));
+  const rawLines = value.split("\n");
   const maxBoxW = Math.min(110, safeW);
-  const boxHeight = rows * lineHeight + TEXT_DRAFT_PAD_Y * 2;
   const left = Math.max(0, Math.min(x, Math.max(0, safeW - maxBoxW)));
-  const top = Math.max(0, Math.min(y, Math.max(0, safeH - boxHeight)));
   const availableW = Math.max(0, safeW - left);
   const minFloor = safeW > 0 ? Math.min(40, safeW) : 0;
   const maxWidth = safeW > 0 ? Math.max(minFloor, availableW) : 0;
   const minWidth = safeW > 0 ? Math.min(96, maxWidth) : 0;
+  const maxLineWidth = safeW > 0 ? Math.max(1, maxWidth - TEXT_DRAFT_PAD_X * 2) : 0;
+  const wrappedLines =
+    safeW > 0 ? wrapAnnotationText(value, fontSize, maxLineWidth, measureFn) : rawLines;
+  const didSoftWrap = wrappedLines.length > rawLines.length;
+  const rows = Math.min(5, Math.max(1, wrappedLines.length));
+  const boxHeight = rows * lineHeight + TEXT_DRAFT_PAD_Y * 2;
+  const top = Math.max(0, Math.min(y, Math.max(0, safeH - boxHeight)));
   const contentLineWidth = Math.max(
-    estimateTextLineWidth("输入文字", fontSize),
-    ...lines.map((line) => estimateTextLineWidth(line, fontSize)),
+    measureFn("输入文字", fontSize),
+    ...wrappedLines.map((line) => measureFn(line, fontSize)),
   );
   const desiredWidth = Math.ceil(contentLineWidth + TEXT_DRAFT_PAD_X * 2 + 12);
-  const width = safeW > 0 ? Math.max(minWidth, Math.min(maxWidth, desiredWidth)) : 0;
+  const width =
+    safeW > 0
+      ? didSoftWrap
+        ? maxWidth
+        : Math.max(minWidth, Math.min(maxWidth, desiredWidth))
+      : 0;
   const maxHeight = Math.max(lineHeight + TEXT_DRAFT_PAD_Y * 2, safeH - top);
   return {
     left,
@@ -208,9 +333,11 @@ export function computeTextBoxLayout(options: {
     minWidth,
     maxWidth,
     maxHeight,
+    maxLineWidth,
     lineHeight,
     rows,
     textX: left + TEXT_DRAFT_PAD_X,
     textY: top + TEXT_DRAFT_PAD_Y,
+    wrappedLines,
   };
 }

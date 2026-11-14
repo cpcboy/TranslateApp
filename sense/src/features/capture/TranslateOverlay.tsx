@@ -18,8 +18,10 @@ import {
   clampPoint,
   computeArrowHeadPoints,
   computeTextBoxLayout,
+  estimateTextLineWidth,
   isMeaningfulAnnotation,
   normalizeRect,
+  wrapAnnotationText,
   type Annotation,
   type AnnotationSize,
   type AnnotationTool,
@@ -29,6 +31,32 @@ import { CaptureToolbar, type ToolbarPopover } from "./CaptureToolbar";
 import { OVERLAY_FONT, createCanvasMeasure, plainPlan, planOverlay, sanitizeBlocks, type BlockPlan } from "./overlayLayout";
 
 const STAGE_ORDER: Record<CaptureStage, number> = { ocr: 0, translating: 1, done: 2 };
+
+let cachedMeasureDoc: unknown;
+let cachedMeasureCtx: CanvasRenderingContext2D | null = null;
+
+function measureOverlayAnnotationText(line: string, fontSize: number): number {
+  if (!line) return 0;
+  const doc = typeof document !== "undefined" ? document : undefined;
+  if (doc && typeof doc.createElement === "function") {
+    if (doc !== cachedMeasureDoc) {
+      cachedMeasureDoc = doc;
+      try {
+        cachedMeasureCtx = doc.createElement("canvas")?.getContext?.("2d") ?? null;
+      } catch {
+        cachedMeasureCtx = null;
+      }
+    }
+    if (cachedMeasureCtx && typeof cachedMeasureCtx.measureText === "function") {
+      cachedMeasureCtx.font = `600 ${fontSize}px ${OVERLAY_FONT}`;
+      const w = cachedMeasureCtx.measureText(line)?.width;
+      if (typeof w === "number" && Number.isFinite(w) && w > 0) {
+        return w;
+      }
+    }
+  }
+  return estimateTextLineWidth(line, fontSize);
+}
 
 export function sanitizeBounds(raw: unknown): OverlayBounds | null {
   if (!raw || typeof raw !== "object") return null;
@@ -106,6 +134,7 @@ export function TranslateOverlay() {
     h: typeof window !== "undefined" ? window.innerHeight : 0,
   }));
   const [toolbarWidth, setToolbarWidth] = useState(560);
+  const [toolbarMainHeight, setToolbarMainHeight] = useState(40);
 
   const generationRef = useRef<number | undefined>(undefined);
   const revisionRef = useRef<number>(0);
@@ -442,13 +471,27 @@ export function TranslateOverlay() {
       fontSize: sizePresetRef.current.fontSize,
       stageWidth: stageRect.w,
       stageHeight: stageRect.h,
+      measureFn: measureOverlayAnnotationText,
     });
+    const committedLines = layout.wrappedLines;
+    const committedText = committedLines.join("\n");
+    const totalTextH = committedLines.length * layout.lineHeight;
+    const committedY =
+      stageRect.h > 0 && committedLines.length > layout.rows
+        ? Math.max(
+            TEXT_DRAFT_PAD_Y,
+            Math.min(
+              layout.textY,
+              Math.max(TEXT_DRAFT_PAD_Y, stageRect.h - totalTextH - TEXT_DRAFT_PAD_Y),
+            ),
+          )
+        : layout.textY;
     const nextItem: Annotation = {
       id: `ann-${Date.now()}-${annotationsRef.current.length}`,
       kind: "text",
       x: layout.textX,
-      y: layout.textY,
-      text: trimmed,
+      y: committedY,
+      text: committedText,
       color: activeColorRef.current,
       fontSize: sizePresetRef.current.fontSize,
     };
@@ -625,17 +668,19 @@ export function TranslateOverlay() {
     });
   }, []);
 
+  const effectiveBarH = Math.max(40, toolbarMainHeight);
+  const needToolbarSpace = effectiveBarH + 12;
   const spaceBelow = Math.max(0, viewH - (stageRect.y + stageRect.h));
   const spaceAbove = Math.max(0, stageRect.y);
   const toolbarDock =
-    spaceBelow >= 52 ? "bottom" : spaceAbove >= 52 ? "top" : "inside-bottom";
+    spaceBelow >= needToolbarSpace ? "bottom" : spaceAbove >= needToolbarSpace ? "top" : "inside-bottom";
   const toolbarTop =
     toolbarDock === "bottom"
       ? stageRect.y + stageRect.h + 8
       : toolbarDock === "top"
-        ? Math.max(4, stageRect.y - 46)
-        : Math.max(8, viewH - 52);
-  const spaceBelowBar = Math.max(0, viewH - (toolbarTop + 40));
+        ? Math.max(4, stageRect.y - (effectiveBarH + 6))
+        : Math.max(8, viewH - (effectiveBarH + 12));
+  const spaceBelowBar = Math.max(0, viewH - (toolbarTop + effectiveBarH));
   const spaceAboveBar = Math.max(0, toolbarTop);
   const popoverUp =
     toolbarDock === "inside-bottom" ||
@@ -662,7 +707,8 @@ export function TranslateOverlay() {
   const hasPendingText = Boolean(textDraft && textDraft.value.trim().length > 0);
   const effectiveAnnotationsCount = annotations.length + (hasPendingText ? 1 : 0);
   const effectiveViewW = viewW > 0 ? viewW : stageRect.x + stageRect.w;
-  const measuredBarW = Math.min(effectiveViewW, Math.max(240, toolbarWidth));
+  const toolbarMaxWidth = effectiveViewW > 0 ? Math.max(200, effectiveViewW - 8) : undefined;
+  const measuredBarW = Math.min(effectiveViewW, Math.max(200, toolbarWidth));
   const maxToolbarLeft = Math.max(0, effectiveViewW - measuredBarW - 4);
   const toolbarLeft = Math.max(
     Math.min(4, maxToolbarLeft),
@@ -672,18 +718,42 @@ export function TranslateOverlay() {
   useEffect(() => {
     const el = toolbarAnchorRef.current;
     if (!showToolbar || !el) return () => {};
+    const mainEl =
+      typeof el.querySelector === "function"
+        ? (el.querySelector("[data-testid='capture-toolbar-main']") as HTMLElement | null)
+        : null;
     const measure = () => {
-      const w = el.getBoundingClientRect?.().width || el.offsetWidth;
+      const target = mainEl ?? el;
+      const rect = target.getBoundingClientRect?.();
+      const w = rect?.width || target.offsetWidth;
+      const h = rect?.height || target.offsetHeight;
       if (w > 0 && Number.isFinite(w)) {
         setToolbarWidth((prev) => (Math.abs(prev - w) > 0.5 ? Math.round(w) : prev));
+      }
+      if (h > 0 && Number.isFinite(h)) {
+        const normalizedH = Math.max(40, Math.round(h));
+        setToolbarMainHeight((prev) =>
+          Math.abs(prev - normalizedH) > 0.5 ? normalizedH : prev,
+        );
       }
     };
     measure();
     if (typeof ResizeObserver === "undefined") return () => {};
     const observer = new ResizeObserver(measure);
     observer.observe(el);
+    if (mainEl && mainEl !== el) {
+      observer.observe(mainEl);
+    }
     return () => observer.disconnect();
-  }, [showToolbar, targetLang, activeTool, effectiveAnnotationsCount, saving, retranslating]);
+  }, [
+    showToolbar,
+    targetLang,
+    activeTool,
+    effectiveAnnotationsCount,
+    saving,
+    retranslating,
+    toolbarMaxWidth,
+  ]);
 
   const isDraggingAnnotation = draftAnnotation !== null;
   const isEditingText = textDraft !== null;
@@ -713,7 +783,7 @@ export function TranslateOverlay() {
           x: toolbarLeft,
           y: toolbarTop,
           w: measuredBarW,
-          h: activeTool !== "none" ? 84 : 44,
+          h: effectiveBarH + (activeTool !== "none" ? 40 : 4),
         });
       }
     }
@@ -725,6 +795,7 @@ export function TranslateOverlay() {
     activeTool,
     annotations.length,
     blocks,
+    effectiveBarH,
     error,
     actionError,
     isDraggingAnnotation,
@@ -824,9 +895,9 @@ export function TranslateOverlay() {
               }`}
             >
               {annotations.map((item) => (
-                <AnnotationShape key={item.id} item={item} />
+                <AnnotationShape key={item.id} item={item} stageWidth={stageRect.w} />
               ))}
-              {draftAnnotation && <AnnotationShape item={draftAnnotation} />}
+              {draftAnnotation && <AnnotationShape item={draftAnnotation} stageWidth={stageRect.w} />}
             </svg>
           )}
 
@@ -839,6 +910,7 @@ export function TranslateOverlay() {
               fontSize: sizePreset.fontSize,
               stageWidth: stageRect.w,
               stageHeight: stageRect.h,
+              measureFn: measureOverlayAnnotationText,
             });
             return (
               <>
@@ -850,7 +922,6 @@ export function TranslateOverlay() {
                   data-hit-rect="true"
                   aria-label="输入标注文字"
                   autoFocus
-                  wrap="off"
                   rows={box.rows}
                   value={textDraft.value}
                   onPointerDown={(e) => e.stopPropagation()}
@@ -915,7 +986,7 @@ export function TranslateOverlay() {
                       setIsComposingText(false);
                     }
                   }}
-                  className="absolute z-30 box-border resize-none overflow-hidden rounded border border-white/75 bg-black/55 font-semibold outline-none"
+                  className="absolute z-30 box-border resize-none overflow-x-hidden overflow-y-auto rounded border border-white/75 bg-black/55 font-semibold outline-none"
                   style={{
                     left: box.left,
                     top: box.top,
@@ -927,7 +998,9 @@ export function TranslateOverlay() {
                     lineHeight: `${box.lineHeight}px`,
                     color: activeColor,
                     fontSize: sizePreset.fontSize,
-                    whiteSpace: "pre",
+                    whiteSpace: "pre-wrap",
+                    overflowWrap: "break-word",
+                    wordBreak: "break-word",
                   }}
                 />
                 {!textDraft.value && !isComposingText && box.width > TEXT_DRAFT_PAD_X * 2 && (
@@ -1002,6 +1075,7 @@ export function TranslateOverlay() {
             popoverUp={popoverUp}
             subbarAbove={subbarAbove}
             popoverMaxHeight={popoverMaxHeight}
+            maxWidth={toolbarMaxWidth}
             onClose={handleClose}
           />
         </div>
@@ -1010,7 +1084,7 @@ export function TranslateOverlay() {
   );
 }
 
-function AnnotationShape({ item }: { item: Annotation }) {
+function AnnotationShape({ item, stageWidth }: { item: Annotation; stageWidth?: number }) {
   if (item.kind === "rect") {
     const r = normalizeRect(item.x1, item.y1, item.x2, item.y2);
     return (
@@ -1082,6 +1156,13 @@ function AnnotationShape({ item }: { item: Annotation }) {
   }
   if (item.kind !== "text") return null;
   const lineH = Math.round(item.fontSize * 1.25);
+  const maxLineW =
+    typeof stageWidth === "number" && stageWidth > 0
+      ? Math.max(1, stageWidth - item.x - TEXT_DRAFT_PAD_X)
+      : Infinity;
+  const lines = Number.isFinite(maxLineW)
+    ? wrapAnnotationText(item.text, item.fontSize, maxLineW, measureOverlayAnnotationText)
+    : item.text.split("\n");
   return (
     <text
       x={item.x}
@@ -1092,7 +1173,7 @@ function AnnotationShape({ item }: { item: Annotation }) {
       dominantBaseline="text-before-edge"
       style={{ textShadow: "0 1px 2px rgba(0,0,0,0.45)", whiteSpace: "pre" }}
     >
-      {item.text.split("\n").map((line, idx) => (
+      {lines.map((line, idx) => (
         <tspan key={idx} x={item.x} y={item.y + idx * lineH}>
           {line}
         </tspan>

@@ -64,7 +64,8 @@ const STATUS_MIN_WIDTH: f64 = 164.0;
 #[cfg(test)]
 const STATUS_MIN_HEIGHT: f64 = 40.0;
 /// 截屏后悬浮工具条（语种选择 / 原文结果切换 / 标注 / 保存 / 关闭）所需最小宽度与外边距预留。
-const TOOLBAR_MIN_WIDTH: f64 = 580.0;
+/// 四字语种（如「译为 繁体中文 ▾」）+「保存中…」单行实测约 601px，取 640px 留足两侧呼吸边距。
+const TOOLBAR_MIN_WIDTH: f64 = 640.0;
 const TOOLBAR_RESERVE: f64 = 56.0;
 const TOOLBAR_EXTRA_SMALL: f64 = 268.0;
 const TOOLBAR_EXTRA_NORMAL: f64 = 100.0;
@@ -1409,6 +1410,11 @@ fn compute_capture_window_frame(
     let win_x = centered_x.round().clamp(sx, max_x);
     let image_x = (sel_x - win_x).clamp(0.0, (win_w - image_w).max(0.0));
 
+    let toolbar_reserve = if win_w < 616.0 {
+        88.0
+    } else {
+        TOOLBAR_RESERVE
+    };
     let extra_needed = if image_h < 220.0 {
         TOOLBAR_EXTRA_SMALL
     } else {
@@ -1417,16 +1423,16 @@ fn compute_capture_window_frame(
     let space_below = ((sy + sh) - (sel_y + image_h)).max(0.0);
     let space_above = (sel_y - sy).max(0.0);
 
-    let (win_y, win_h, image_y) = if space_below >= TOOLBAR_RESERVE {
-        let bottom_pad = space_below.min(extra_needed).max(TOOLBAR_RESERVE);
+    let (win_y, win_h, image_y) = if space_below >= toolbar_reserve {
+        let bottom_pad = space_below.min(extra_needed).max(toolbar_reserve);
         (sel_y, image_h + bottom_pad, 0.0)
-    } else if space_above >= TOOLBAR_RESERVE {
-        let top_pad = space_above.min(extra_needed).max(TOOLBAR_RESERVE);
+    } else if space_above >= toolbar_reserve {
+        let top_pad = space_above.min(extra_needed).max(toolbar_reserve);
         let wy = (sel_y - top_pad).max(sy);
         (wy, (sel_y - wy) + image_h, sel_y - wy)
     } else {
         let wy = sel_y;
-        let wh = image_h.max(TOOLBAR_RESERVE).min(sh.max(image_h));
+        let wh = image_h.max(toolbar_reserve).min(sh.max(image_h));
         (wy, wh, 0.0)
     };
 
@@ -5392,13 +5398,20 @@ mod tests {
     fn compute_capture_window_frame_keeps_image_aligned_and_leaves_room_for_toolbar() {
         let bounds = Some((0.0, 0.0, 1440.0, 900.0));
 
-        // 1) 普通居中选区：工具条放下方，原图偏移 (0,0)
-        let normal = compute_capture_window_frame(200.0, 150.0, 600.0, 400.0, bounds);
+        // 1) 普通居中选区（宽于 TOOLBAR_MIN_WIDTH=640）：工具条放下方，原图偏移 (0,0)
+        let normal = compute_capture_window_frame(200.0, 150.0, 700.0, 400.0, bounds);
         assert_eq!(normal.win.win_x, 200.0);
         assert_eq!(normal.win.win_y, 150.0);
-        assert_eq!(normal.win.win_w, 600.0);
-        assert_eq!(normal.image, ImageRect { x: 0.0, y: 0.0, w: 600.0, h: 400.0 });
+        assert_eq!(normal.win.win_w, 700.0);
+        assert_eq!(normal.image, ImageRect { x: 0.0, y: 0.0, w: 700.0, h: 400.0 });
         assert!(normal.win.win_h >= 400.0 + TOOLBAR_RESERVE);
+
+        // 1b) 600×400 选区（介于 580 与 640 之间）：扩至 640 容纳四字语种工具条并左右各留 20px 对齐原图桌面坐标
+        let mid = compute_capture_window_frame(200.0, 150.0, 600.0, 400.0, bounds);
+        assert_eq!(mid.win.win_w, TOOLBAR_MIN_WIDTH);
+        assert_eq!(mid.win.win_x, 180.0);
+        assert_eq!(mid.image, ImageRect { x: 20.0, y: 0.0, w: 600.0, h: 400.0 });
+        assert_eq!(mid.win.win_x + mid.image.x, 200.0);
 
         // 2) 贴右且极窄的 200×30 选区：窗口扩至 TOOLBAR_MIN_WIDTH 且左移不冲出屏幕，原图在窗内偏移精确贴回桌面 x=1220
         let right_small = compute_capture_window_frame(1220.0, 200.0, 200.0, 30.0, bounds);
@@ -5410,9 +5423,15 @@ mod tests {
         // 2b) 居中且极窄的 200×80 选区：窗口水平居中包住选区，原图与窗口正中对齐、工具条可正对选区居中
         let center_small = compute_capture_window_frame(620.0, 200.0, 200.0, 80.0, bounds);
         assert_eq!(center_small.win.win_w, TOOLBAR_MIN_WIDTH);
-        assert_eq!(center_small.win.win_x, 430.0);
-        assert_eq!(center_small.image.x, 190.0);
+        assert_eq!(center_small.win.win_x, 400.0);
+        assert_eq!(center_small.image.x, 220.0);
         assert_eq!(center_small.win.win_x + center_small.image.x, 620.0);
+
+        // 2d) 窄屏幕（如宽 400px < TOOLBAR_MIN_WIDTH）下的窄选区：窗口宽度夹紧为屏幕宽 400px，绝不越出屏幕
+        let narrow_screen = compute_capture_window_frame(120.0, 100.0, 200.0, 80.0, Some((0.0, 0.0, 400.0, 700.0)));
+        assert_eq!(narrow_screen.win.win_w, 400.0);
+        assert_eq!(narrow_screen.win.win_x, 0.0);
+        assert_eq!(narrow_screen.image.x, 120.0);
 
         // 2c) 贴左的窄选区：win_x 夹在屏幕左缘 sx=0，不冲出左边界
         let left_small = compute_capture_window_frame(10.0, 200.0, 120.0, 40.0, bounds);

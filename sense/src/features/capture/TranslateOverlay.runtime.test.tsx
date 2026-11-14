@@ -1493,4 +1493,233 @@ describe("TranslateOverlay 运行时状态机与工具条回归测试", () => {
     expect(tbAfterPopover.popoverUp).toBe(true);
     expect((findElement(root, (el) => el.props["data-testid"] === "capture-toolbar-anchor")!.props.style as { top: number }).top).toBe(548);
   });
+
+  it("[FIX-TOOLBAR-NARROW-AND-RIGHT-WRAP] 640px 四字语种与 400px 窄屏工具条 flex-wrap 保活「存为图片/关闭」且不套 overflow-x 裁剪弹层；右侧超长文字提交自动折行", async () => {
+    windowState.innerWidth = 400;
+    windowState.innerHeight = 320;
+    ipcMock.captureBlocks.mockResolvedValue({
+      blocks: [sampleBlock()],
+      error: null,
+      notice: null,
+      stage: "done",
+      generation: 61,
+      revision: 1,
+      has_image: true,
+      scale: 2,
+      target_lang: "zh-Hant",
+      bounds: { w: 400, h: 320 },
+      image_rect: { x: 20, y: 0, w: 360, h: 190 },
+    });
+
+    let root = renderOverlay();
+    await flush();
+    root = renderOverlay();
+
+    // 1) 400px 窄视口下传出 maxWidth=392，主工具条采用 flex-wrap 且无 overflow-x-auto/hidden（避免裁剪绝对定位弹层），语言菜单自动右对齐防溢屏
+    const tbProps = findToolbarProps(root)!;
+    expect(tbProps.maxWidth).toBe(392);
+    expect(tbProps.targetLang).toBe("zh-Hant");
+    const narrowToolbar = CaptureToolbar({
+      ...(tbProps as Parameters<typeof CaptureToolbar>[0]),
+      openPopover: "lang",
+    }) as El;
+    const langBtn = findElement(narrowToolbar, (el) => el.props["data-testid"] === "capture-lang-btn")!;
+    expect(findElement(langBtn, (el) => el.props.children === "译为 繁体中文")).not.toBeNull();
+    const mainBar = findElement(narrowToolbar, (el) => el.props["data-testid"] === "capture-toolbar-main")!;
+    const mainTokens = String(mainBar.props.className).split(/\s+/);
+    expect(mainTokens).toContain("flex-col");
+    expect(mainTokens).not.toContain("flex-nowrap");
+    expect(String(mainBar.props.className)).not.toContain("overflow-x-");
+    expect(String(mainBar.props.className)).not.toContain("overflow-hidden");
+    expect((mainBar.props.style as { maxWidth?: number }).maxWidth).toBe(392);
+
+    // 窄视口 (<608px，含 392/480/572 全部双行折行区间) 语言下拉菜单统一用 right-0，避免两行居中或贴右时向右溢出视口（P1-1 回归守卫）
+    const langMenu = findElement(narrowToolbar, (el) => el.props.role === "menu")!;
+    expect(String(langMenu.props.className).split(/\s+/)).toContain("right-0");
+    // 导出与关闭同属一个不收缩组，折行时成对落在同一行
+    const actionGroup = findElement(narrowToolbar, (el) => el.props["aria-label"] === "导出与关闭")!;
+    expect(actionGroup).not.toBeNull();
+    expect(findElement(actionGroup, (el) => el.props["data-testid"] === "capture-save-btn")).not.toBeNull();
+    expect(findElement(actionGroup, (el) => el.props["data-testid"] === "capture-close-btn")).not.toBeNull();
+
+    // 480..599 过渡临界宽度（如 viewW=488 -> maxWidth=480、viewW=580 -> maxWidth=572）：同样为双行且语言下拉走 right-0，中间分隔线隐藏
+    for (const midMaxWidth of [480, 572]) {
+      const midToolbar = CaptureToolbar({
+        ...(tbProps as Parameters<typeof CaptureToolbar>[0]),
+        maxWidth: midMaxWidth,
+        openPopover: "lang",
+      }) as El;
+      const midMain = findElement(midToolbar, (el) => el.props["data-testid"] === "capture-toolbar-main")!;
+      expect(String(midMain.props.className).split(/\s+/)).toContain("flex-col");
+      expect(
+        String(findElement(midToolbar, (el) => el.props.role === "menu")!.props.className).split(/\s+/),
+      ).toContain("right-0");
+      const midDividers = findAllElements(
+        midMain,
+        (el) => el.type === "div" && String(el.props.className ?? "").includes("w-px"),
+      );
+      expect(midDividers).toHaveLength(2);
+    }
+
+    // 极窄视口 (<348px，如 viewW=320 -> maxWidth=312)：第二簇内部分隔线同步隐藏防悬空，语言菜单相对主条居中
+    const ultraToolbar = CaptureToolbar({
+      ...(tbProps as Parameters<typeof CaptureToolbar>[0]),
+      maxWidth: 312,
+      openPopover: "lang",
+    }) as El;
+    const ultraMain = findElement(ultraToolbar, (el) => el.props["data-testid"] === "capture-toolbar-main")!;
+    const ultraDividers = findAllElements(
+      ultraMain,
+      (el) => el.type === "div" && String(el.props.className ?? "").includes("w-px"),
+    );
+    expect(ultraDividers).toHaveLength(1);
+    expect(
+      String(findElement(ultraToolbar, (el) => el.props.role === "menu")!.props.className).split(/\s+/),
+    ).toContain("left-1/2");
+
+    // 640px 标准窗宽下（maxWidth=632 >= 608）单行展开、保留全部 3 道分隔线，语言下拉保持 left-0
+    const wideToolbar = CaptureToolbar({
+      ...(tbProps as Parameters<typeof CaptureToolbar>[0]),
+      maxWidth: 632,
+      openPopover: "lang",
+    }) as El;
+    const wideMain = findElement(wideToolbar, (el) => el.props["data-testid"] === "capture-toolbar-main")!;
+    expect(String(wideMain.props.className).split(/\s+/)).toContain("flex-wrap");
+    expect(
+      findAllElements(wideMain, (el) => el.type === "div" && String(el.props.className ?? "").includes("w-px")),
+    ).toHaveLength(3);
+    expect(
+      String(findElement(wideToolbar, (el) => el.props.role === "menu")!.props.className).split(/\s+/),
+    ).toContain("left-0");
+
+    // 2) 在 360px 宽舞台右侧边缘（无 DOM getBoundingClientRect 时 clientX 直接作为舞台局部坐标 x=245）输入超长中文并回车提交
+    (tbProps.onSelectTool as (tool: "text") => void)("text");
+    root = renderOverlay();
+    const svg = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svg.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 1,
+      clientX: 245,
+      clientY: 18,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+      currentTarget: {},
+    });
+    root = renderOverlay();
+
+    const longZh = "右侧边缘超长中文批注测试会不会被裁剪";
+    const ta = findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!;
+    expect(ta.props.wrap).toBeUndefined();
+    expect((ta.props.style as { whiteSpace: string }).whiteSpace).toBe("pre-wrap");
+    (ta.props.onChange as (e: unknown) => void)({ target: { value: longZh } });
+    root = renderOverlay();
+
+    const taWrapped = findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!;
+    expect(taWrapped.props.rows).toBeGreaterThanOrEqual(3);
+    (taWrapped.props.onKeyDown as (e: unknown) => void)({
+      key: "Enter",
+      shiftKey: false,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+
+    // 提交后的 SVG <text> 已按舞台右缘自动折成多行 <tspan>，0 字符丢失
+    const committedSvg = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    const shapeHost = findElement(committedSvg, (el) => typeof el.type === "function" && "item" in el.props)!;
+    const shapeEl = (shapeHost.type as (props: unknown) => El)(shapeHost.props);
+    const tspans = findAllElements(shapeEl, (el) => el.type === "tspan");
+    expect(tspans.length).toBeGreaterThanOrEqual(3);
+    expect(tspans.map((t) => String(t.props.children)).join("")).toBe(longZh);
+  });
+
+  it("[FIX-TOOLBAR-MAIN-HEIGHT-RESIZE-OBSERVER] ResizeObserver 实测双行工具条高度（72px）后，toolbarDock/toolbarTop 与穿透热区同步重算", async () => {
+    const prevRO = (globalThis as Record<string, unknown>).ResizeObserver;
+    let roCallback: (() => void) | null = null;
+    let measuredW = 560;
+    let measuredH = 40;
+
+    class MockResizeObserver {
+      constructor(cb: () => void) {
+        roCallback = cb;
+      }
+      observe() {}
+      disconnect() {}
+    }
+
+    try {
+      (globalThis as Record<string, unknown>).ResizeObserver = MockResizeObserver;
+      // spaceAbove = 100 (>= 84)，spaceBelow = 364 - (100 + 200) = 64（单行 52px 够放 bottom，双行 72+12=84px 不够放需切 top）
+      windowState.innerWidth = 480;
+      windowState.innerHeight = 364;
+      ipcMock.captureBlocks.mockResolvedValue({
+        blocks: [sampleBlock()],
+        error: null,
+        notice: null,
+        stage: "done",
+        generation: 62,
+        revision: 1,
+        has_image: true,
+        scale: 2,
+        target_lang: "zh-Hant",
+        bounds: { w: 480, h: 364 },
+        image_rect: { x: 60, y: 100, w: 360, h: 200 },
+      });
+
+      renderOverlay();
+      await flush();
+      let root = renderOverlay(false);
+
+      const anchor = findElement(root, (el) => el.props["data-testid"] === "capture-toolbar-anchor")!;
+      // 初始未折行测量前（toolbarMainHeight=40，needToolbarSpace=52 <= spaceBelow=64）：停靠在画布下方 top = 100 + 200 + 8 = 308
+      expect((anchor.props.style as { top: number }).top).toBe(308);
+
+      const anchorRef = (anchor.props.ref ?? (anchor as unknown as { ref?: unknown }).ref) as {
+        current: unknown;
+      };
+      const fakeMainBar = {
+        getBoundingClientRect: () => ({ width: measuredW, height: measuredH }),
+        offsetWidth: measuredW,
+        offsetHeight: measuredH,
+      };
+      anchorRef.current = {
+        querySelector: (sel: string) =>
+          sel.includes("capture-toolbar-main") ? fakeMainBar : null,
+        getBoundingClientRect: () => ({ width: measuredW, height: measuredH }),
+        offsetWidth: measuredW,
+        offsetHeight: measuredH,
+      };
+      for (const run of rt.queue.splice(0)) run();
+      expect(roCallback).not.toBeNull();
+
+      // 模拟窄窗下双行工具条测量完成（width=345, height=72 -> needToolbarSpace=84 > spaceBelow=64，切至上方 spaceAbove=100）
+      measuredW = 345;
+      measuredH = 72;
+      ipcMock.setCaptureHitRects.mockClear();
+      roCallback!();
+      root = renderOverlay();
+
+      const anchorAfter = findElement(root, (el) => el.props["data-testid"] === "capture-toolbar-anchor")!;
+      // toolbarDock="top" -> toolbarTop = Math.max(4, 100 - (72 + 6)) = 22；left 居中 = (480 - 345) / 2 = 67.5
+      expect((anchorAfter.props.style as { top: number; left: number }).top).toBe(22);
+      expect((anchorAfter.props.style as { top: number; left: number }).left).toBeCloseTo(67.5, 1);
+
+      // setCaptureHitRects 兜底分支同步收到双行高度 72 + 4 = 76
+      expect(ipcMock.setCaptureHitRects).toHaveBeenCalled();
+      const hitCalls = ipcMock.setCaptureHitRects.mock.calls;
+      const lastRects = hitCalls[hitCalls.length - 1]?.[0] as Array<{
+        x: number;
+        y: number;
+        w: number;
+        h: number;
+      }>;
+      expect(lastRects[1]).toMatchObject({ y: 22, w: 345, h: 76 });
+    } finally {
+      if (prevRO === undefined) {
+        delete (globalThis as Record<string, unknown>).ResizeObserver;
+      } else {
+        (globalThis as Record<string, unknown>).ResizeObserver = prevRO;
+      }
+    }
+  });
 });

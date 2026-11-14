@@ -1,6 +1,13 @@
 import type { OverlayBlock } from "../../lib/ipc";
 import { OVERLAY_FONT, type BlockPlan } from "./overlayLayout";
-import { computeArrowHeadPoints, normalizeRect, type Annotation } from "./captureAnnotations";
+import {
+  TEXT_DRAFT_PAD_X,
+  computeArrowHeadPoints,
+  estimateTextLineWidth,
+  normalizeRect,
+  wrapAnnotationText,
+  type Annotation,
+} from "./captureAnnotations";
 
 function loadImageElement(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
@@ -49,7 +56,11 @@ function drawBlocksToContext(
   }
 }
 
-function drawAnnotationsToContext(ctx: CanvasRenderingContext2D, annotations: Annotation[]) {
+function drawAnnotationsToContext(
+  ctx: CanvasRenderingContext2D,
+  annotations: Annotation[],
+  stageWidth: number,
+) {
   for (const item of annotations) {
     ctx.save();
     ctx.strokeStyle = item.color;
@@ -107,7 +118,19 @@ function drawAnnotationsToContext(ctx: CanvasRenderingContext2D, annotations: An
       ctx.shadowBlur = 2;
       ctx.shadowOffsetY = 1;
       const lineH = Math.round(item.fontSize * 1.25);
-      const lines = item.text.split("\n");
+      const maxLineW = stageWidth > 0 ? Math.max(1, stageWidth - item.x - TEXT_DRAFT_PAD_X) : Infinity;
+      const measureFn =
+        typeof ctx.measureText === "function"
+          ? (line: string, fs: number) => {
+              const measured = ctx.measureText(line)?.width;
+              return typeof measured === "number" && measured > 0
+                ? measured
+                : estimateTextLineWidth(line, fs);
+            }
+          : estimateTextLineWidth;
+      const lines = Number.isFinite(maxLineW)
+        ? wrapAnnotationText(item.text, item.fontSize, maxLineW, measureFn)
+        : item.text.split("\n");
       for (let i = 0; i < lines.length; i += 1) {
         ctx.fillText(lines[i], item.x, item.y + i * lineH);
       }
@@ -164,7 +187,7 @@ export async function renderCapturePngBase64(options: {
     drawBlocksToContext(ctx, blocks, plans, true);
   }
   if (annotations.length > 0) {
-    drawAnnotationsToContext(ctx, annotations);
+    drawAnnotationsToContext(ctx, annotations, stageWidth);
   }
 
   return canvas.toDataURL("image/png");

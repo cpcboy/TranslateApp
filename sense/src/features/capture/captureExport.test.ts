@@ -88,7 +88,7 @@ function createFakeEnvironment(imgMode: "ok" | "error" | "zero" = "ok", naturalW
     },
   };
 
-  return { ops, canvases };
+  return { ops, canvases, fakeCtx };
 }
 
 const samplePlan = (overrides: Partial<BlockPlan> = {}): BlockPlan => ({
@@ -266,5 +266,75 @@ describe("captureExport 导出画布合成", () => {
     expect(ops.filter((o) => o.op === "fillRect")).toHaveLength(0);
     expect(ops.filter((o) => o.op === "fillText")).toHaveLength(0);
     expect(ops.filter((o) => o.op === "strokeRect")).toHaveLength(1);
+  });
+
+  it("[FIX-RIGHT-EDGE-WRAP] 导出 PNG 时右侧边缘超长单行文字标注自动折行进舞台宽度内，不硬裁剪丢失", async () => {
+    const { ops } = createFakeEnvironment("ok", 720, 380);
+    const longZh = "右侧边缘超长中文批注测试会不会被裁剪";
+    await renderCapturePngBase64({
+      originalImageUrl: "data:image/png;base64,VALID",
+      stageWidth: 360,
+      stageHeight: 190,
+      scale: 2,
+      includeTranslation: false,
+      blocks: [],
+      plans: [],
+      annotations: [
+        {
+          id: "t-right",
+          kind: "text",
+          x: 251,
+          y: 21,
+          text: longZh,
+          color: "#ffcc00",
+          fontSize: 18,
+        },
+      ],
+    });
+
+    const textOps = ops.filter((o) => o.op === "fillText");
+    expect(textOps.length).toBeGreaterThanOrEqual(3);
+    expect(textOps.map((o) => String(o.args[0])).join("")).toBe(longZh);
+    for (let i = 0; i < textOps.length; i += 1) {
+      expect(textOps[i]!.args[1]).toBe(251);
+      expect(textOps[i]!.args[2]).toBe(21 + i * Math.round(18 * 1.25));
+      expect(String(textOps[i]!.args[0]).length).toBeLessThanOrEqual(6);
+    }
+  });
+
+  it("[FIX-RIGHT-EDGE-WRAP] 导出 PNG 优先调用 ctx.measureText 精确测宽折行，不退回估算值", async () => {
+    const { ops, fakeCtx } = createFakeEnvironment("ok", 720, 380);
+    const measureSpy = vi.fn((line: string) => ({
+      // 故意设为每字 26px（大于估算值 18px），使得 maxLineW = 360 - 251 - 6 = 103px 下每行最多容纳 3 个字（78px <= 103px < 104px）
+      width: Array.from(line).length * 26,
+    }));
+    (fakeCtx as Record<string, unknown>).measureText = measureSpy;
+
+    const text = "一二三四五六七";
+    await renderCapturePngBase64({
+      originalImageUrl: "data:image/png;base64,VALID",
+      stageWidth: 360,
+      stageHeight: 190,
+      scale: 2,
+      includeTranslation: false,
+      blocks: [],
+      plans: [],
+      annotations: [
+        {
+          id: "t-measure",
+          kind: "text",
+          x: 251,
+          y: 21,
+          text,
+          color: "#ffcc00",
+          fontSize: 18,
+        },
+      ],
+    });
+
+    expect(measureSpy).toHaveBeenCalled();
+    const textOps = ops.filter((o) => o.op === "fillText");
+    // 若误走 estimateTextLineWidth(18px/字) 则只会折成 2 行（5+2）；走 ctx.measureText(26px/字) 必折成 3 行（3+3+1）
+    expect(textOps.map((o) => String(o.args[0]))).toEqual(["一二三", "四五六", "七"]);
   });
 });
