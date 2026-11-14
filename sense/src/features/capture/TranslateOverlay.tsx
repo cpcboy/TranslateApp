@@ -364,18 +364,6 @@ export function TranslateOverlay() {
     void api.closeOverlay(generationRef.current);
   }, []);
 
-  const handleSelectLang = useCallback((code: string) => {
-    setActionError(null);
-    setShowOriginal(false);
-    setRetranslating(true);
-    void api
-      .retranslateCapture(code)
-      .catch((err) => {
-        setRetranslating(false);
-        setActionError(describeFailure(err));
-      });
-  }, []);
-
   const showToast = useCallback((msg: string) => {
     setSaveToast(msg);
     if (toastTimerRef.current !== undefined) {
@@ -422,6 +410,35 @@ export function TranslateOverlay() {
     setAnnotations(nextList);
     return nextList;
   }, [stageRect.h, stageRect.w]);
+
+  const handleSelectLang = useCallback(
+    (code: string) => {
+      if (textDraftRef.current) {
+        flushTextDraft();
+      }
+      setActionError(null);
+      setShowOriginal(false);
+      setRetranslating(true);
+      void api
+        .retranslateCapture(code)
+        .catch((err) => {
+          setRetranslating(false);
+          setActionError(describeFailure(err));
+        });
+    },
+    [flushTextDraft],
+  );
+
+  const handleTogglePopover = useCallback(
+    (next: "lang" | "save" | "none") => {
+      if (next !== "none" && textDraftRef.current) {
+        flushTextDraft();
+      }
+      openPopoverRef.current = next;
+      setOpenPopover(next);
+    },
+    [flushTextDraft],
+  );
 
   const handleSave = useCallback(
     async (kind: SaveImageKind) => {
@@ -474,6 +491,11 @@ export function TranslateOverlay() {
   );
 
   const handleUndo = useCallback(() => {
+    if (textDraftRef.current) {
+      textDraftRef.current = null;
+      setTextDraft(null);
+      return;
+    }
     const nextList = annotationsRef.current.slice(0, -1);
     annotationsRef.current = nextList;
     setAnnotations(nextList);
@@ -583,6 +605,8 @@ export function TranslateOverlay() {
   );
 
   const showToolbar = stage === "done" || retranslating;
+  const hasPendingText = Boolean(textDraft && textDraft.value.trim().length > 0);
+  const effectiveAnnotationsCount = annotations.length + (hasPendingText ? 1 : 0);
   const effectiveViewW = viewW > 0 ? viewW : stageRect.x + stageRect.w;
   const measuredBarW = Math.min(effectiveViewW, Math.max(240, toolbarWidth));
   const maxToolbarLeft = Math.max(0, effectiveViewW - measuredBarW - 4);
@@ -605,7 +629,7 @@ export function TranslateOverlay() {
     const observer = new ResizeObserver(measure);
     observer.observe(el);
     return () => observer.disconnect();
-  }, [showToolbar, targetLang, activeTool, annotations.length, saving, retranslating]);
+  }, [showToolbar, targetLang, activeTool, effectiveAnnotationsCount, saving, retranslating]);
 
   const isDraggingAnnotation = draftAnnotation !== null;
   const isEditingText = textDraft !== null;
@@ -833,16 +857,13 @@ export function TranslateOverlay() {
             onSelectColor={setActiveColor}
             activeSize={activeSize}
             onSelectSize={setActiveSize}
-            annotationsCount={annotations.length}
+            annotationsCount={effectiveAnnotationsCount}
             onUndo={handleUndo}
             onSave={handleSave}
             saving={saving}
             hasImage={hasImage || !!originalImageUrl}
             openPopover={openPopover}
-            onTogglePopover={(next) => {
-              openPopoverRef.current = next;
-              setOpenPopover(next);
-            }}
+            onTogglePopover={handleTogglePopover}
             popoverUp={popoverUp}
             subbarAbove={subbarAbove}
             popoverMaxHeight={popoverMaxHeight}

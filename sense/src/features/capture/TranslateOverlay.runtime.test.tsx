@@ -855,4 +855,113 @@ describe("TranslateOverlay 运行时状态机与工具条回归测试", () => {
     );
     expect(ipcMock.saveCaptureImage).toHaveBeenCalledWith("translated", "RAW_PNG_BASE64");
   });
+
+  it("[R4-P2-1] 未按回车输入文字标注后直接点「存为图片」或「撤销」，均保持一致性不丢字", async () => {
+    ipcMock.captureBlocks.mockResolvedValue({
+      blocks: [sampleBlock()],
+      error: null,
+      notice: null,
+      stage: "done",
+      generation: 18,
+      revision: 1,
+      has_image: true,
+      scale: 2,
+      bounds: { w: 500, h: 200 },
+      image_rect: { x: 0, y: 0, w: 500, h: 140 },
+    });
+
+    let root = renderOverlay();
+    await flush();
+    root = renderOverlay();
+
+    // 1) 点击文字工具输入文字但不按 Enter，也不触发 onBlur
+    (findToolbarProps(root)!.onSelectTool as (tool: "text") => void)("text");
+    root = renderOverlay();
+    const svg = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svg.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 1,
+      clientX: 40,
+      clientY: 30,
+      stopPropagation: () => {},
+      currentTarget: {},
+    });
+    root = renderOverlay();
+
+    const textarea = findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!;
+    (textarea.props.onChange as (e: { target: { value: string } }) => void)({
+      target: { value: "此处文案有误" },
+    });
+    root = renderOverlay();
+
+    // 尚未回车时「撤销」已可用（annotationsCount 含非空输入草稿）
+    expect(findToolbarProps(root)!.annotationsCount).toBe(1);
+    const liveToolbar = CaptureToolbar(findToolbarProps(root) as Parameters<typeof CaptureToolbar>[0]) as El;
+    expect(findElement(liveToolbar, (el) => el.props["aria-label"] === "撤销")!.props.disabled).toBe(false);
+
+    // 2) 直接点「存为图片」展开菜单：草稿自动落盘，保存菜单中可见「保存带标注原图」
+    (findToolbarProps(root)!.onTogglePopover as (next: "save" | "lang" | "none") => void)("save");
+    root = renderOverlay();
+    expect(findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")).toBeNull();
+    expect(findToolbarProps(root)!.annotationsCount).toBe(1);
+    const saveMenuToolbar = CaptureToolbar(findToolbarProps(root) as Parameters<typeof CaptureToolbar>[0]) as El;
+    const saveAnnotatedBtn = findElement(saveMenuToolbar, (el) => el.props.children === "保存带标注原图");
+    expect(saveAnnotatedBtn).not.toBeNull();
+    expect(saveAnnotatedBtn!.props.disabled).toBe(false);
+
+    await (findToolbarProps(root)!.onSave as (kind: SaveImageKind) => Promise<void>)("original_annotated");
+    root = renderOverlay();
+    expect(exportMock.renderCapturePngBase64).toHaveBeenCalledWith(
+      expect.objectContaining({
+        includeTranslation: false,
+        annotations: [expect.objectContaining({ kind: "text", text: "此处文案有误" })],
+      }),
+    );
+    expect(ipcMock.saveCaptureImage).toHaveBeenCalledWith("original_annotated", "RAW_PNG_BASE64");
+
+    // 3) 已有 1 条已提交标注时，新建第 2 条未回车文字草稿后点「撤销」，只撤掉未提交草稿而不误删第 1 条
+    const svg2 = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svg2.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 2,
+      clientX: 80,
+      clientY: 60,
+      stopPropagation: () => {},
+      currentTarget: {},
+    });
+    root = renderOverlay();
+    const textarea2 = findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!;
+    (textarea2.props.onChange as (e: { target: { value: string } }) => void)({
+      target: { value: "临时草稿" },
+    });
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.annotationsCount).toBe(2);
+
+    (findToolbarProps(root)!.onUndo as () => void)();
+    root = renderOverlay();
+    expect(findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")).toBeNull();
+    expect(findToolbarProps(root)!.annotationsCount).toBe(1);
+
+    // 4) [R5-P2-1] 处于空白文字草稿时点「撤销」，只关闭空白输入框而不连带删除上一条已提交标注
+    const svg3 = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svg3.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 3,
+      clientX: 120,
+      clientY: 70,
+      stopPropagation: () => {},
+      currentTarget: {},
+    });
+    root = renderOverlay();
+    expect(findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")).not.toBeNull();
+    (findToolbarProps(root)!.onUndo as () => void)();
+    root = renderOverlay();
+    expect(findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")).toBeNull();
+    expect(findToolbarProps(root)!.annotationsCount).toBe(1);
+
+    // 再次点「撤销」，此时才真正撤销上一条已提交标注
+    (findToolbarProps(root)!.onUndo as () => void)();
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.annotationsCount).toBe(0);
+  });
 });

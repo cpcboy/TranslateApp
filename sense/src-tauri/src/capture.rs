@@ -585,6 +585,20 @@ fn should_ignore_cursor_events(
     !inside_any
 }
 
+/// 只有在轮询代次仍匹配且坐标均为有限值时才把 AppKit 实际窗口左上角写回 `slot.win_origin`。
+fn apply_actual_win_origin(
+    slot: &mut CaptureSnapshot,
+    active_watcher_seq: u64,
+    expected_seq: u64,
+    actual: (f64, f64),
+) -> bool {
+    if active_watcher_seq != expected_seq || !actual.0.is_finite() || !actual.1.is_finite() {
+        return false;
+    }
+    slot.win_origin = Some(actual);
+    true
+}
+
 fn sync_overlay_passthrough(app: &AppHandle, state: &CaptureState) {
     let Some(overlay) = app.get_webview_window(OVERLAY_WINDOW) else {
         return;
@@ -601,7 +615,43 @@ fn sync_overlay_passthrough(app: &AppHandle, state: &CaptureState) {
     }
 }
 
-fn start_passthrough_watcher(app: AppHandle, state: &CaptureState) {
+fn sync_actual_win_origin_value(
+    app: &AppHandle,
+    state: &CaptureState,
+    expected_seq: u64,
+    generation: Option<u64>,
+    actual: Option<(f64, f64, f64, f64)>,
+) {
+    let Some((ax, ay, _, _)) = actual else {
+        return;
+    };
+    if generation.is_some_and(|g| !is_current(&state.generation, g)) {
+        return;
+    }
+    let updated = if let Ok(mut slot) = state.snapshot.lock() {
+        let cur_seq = state.watcher_seq.load(Ordering::SeqCst);
+        apply_actual_win_origin(&mut slot, cur_seq, expected_seq, (ax, ay))
+    } else {
+        false
+    };
+    if updated {
+        sync_overlay_passthrough(app, state);
+    }
+}
+
+async fn read_and_sync_overlay_frame(
+    app: &AppHandle,
+    state: &CaptureState,
+    overlay: &tauri::WebviewWindow,
+    generation: Option<u64>,
+) -> Option<(f64, f64, f64, f64)> {
+    let expected_seq = state.watcher_seq.load(Ordering::SeqCst);
+    let actual = read_overlay_logical_frame(overlay).await;
+    sync_actual_win_origin_value(app, state, expected_seq, generation, actual);
+    actual
+}
+
+fn start_passthrough_watcher(app: AppHandle, state: &CaptureState) -> u64 {
     let seq = state.watcher_seq.fetch_add(1, Ordering::SeqCst) + 1;
     let watcher_seq = Arc::clone(&state.watcher_seq);
     tauri::async_runtime::spawn(async move {
@@ -619,6 +669,7 @@ fn start_passthrough_watcher(app: AppHandle, state: &CaptureState) {
             sync_overlay_passthrough(&app, &cap_state);
         }
     });
+    seq
 }
 
 fn reset_capture_snapshot(state: &CaptureState) {
@@ -1277,7 +1328,14 @@ fn open_overlay_window_tracked(
     }
     state.passthrough_mode.store(1, Ordering::SeqCst);
     sync_overlay_passthrough(app, state);
-    start_passthrough_watcher(app.clone(), state);
+    let seq = start_passthrough_watcher(app.clone(), state);
+    let app_for_origin = app.clone();
+    let overlay_for_origin = overlay.clone();
+    tauri::async_runtime::spawn(async move {
+        let actual = read_overlay_logical_frame(&overlay_for_origin).await;
+        let cap_state = app_for_origin.state::<CaptureState>();
+        sync_actual_win_origin_value(&app_for_origin, &cap_state, seq, None, actual);
+    });
     Ok(overlay)
 }
 
@@ -1316,7 +1374,16 @@ fn compute_capture_window_frame(
     h: f64,
     screen_bounds: Option<(f64, f64, f64, f64)>,
 ) -> CaptureWindowFrame {
-    let (sx, sy, sw, sh) = screen_bounds.unwrap_or((x - 500.0, y - 500.0, w + 1000.0, h + 1000.0));
+    let (left, top, right, bottom) = screen_bounds.unwrap_or((
+        x - 500.0,
+        y - 500.0,
+        x + w.max(1.0) + 500.0,
+        y + h.max(1.0) + 500.0,
+    ));
+    let sx = left;
+    let sy = top;
+    let sw = (right - left).max(1.0);
+    let sh = (bottom - top).max(1.0);
     let image_w = w.max(1.0).min(sw.max(1.0));
     let image_h = h.max(1.0).min(sh.max(1.0));
     let sel_x = x.clamp(sx, (sx + sw - image_w).max(sx));
@@ -1717,7 +1784,7 @@ async fn finish_capture_blocks(
                     },
                 );
                 let _ = overlay.set_focus();
-                let actual = read_overlay_logical_frame(&overlay).await;
+                let actual = read_and_sync_overlay_frame(app, state, &overlay, generation).await;
                 trace(
                     app,
                     format!(
@@ -1871,7 +1938,7 @@ async fn finish_capture_blocks(
         if let Some(overlay) = app.get_webview_window(OVERLAY_WINDOW) {
             publish_view(app, state, final_view);
             let _ = overlay.set_focus();
-            let actual = read_overlay_logical_frame(&overlay).await;
+            let actual = read_and_sync_overlay_frame(app, state, &overlay, generation).await;
             trace(app, format!("{done_summary} actual_win={actual:?}"));
             return Ok(blocks.len());
         }
@@ -1893,7 +1960,7 @@ async fn finish_capture_blocks(
         capture_frame.win.win_w,
         capture_frame.win.win_h,
     )?;
-    let actual = read_overlay_logical_frame(&overlay).await;
+    let actual = read_and_sync_overlay_frame(app, state, &overlay, generation).await;
     trace(app, format!("{done_summary} actual_win={actual:?}"));
 
     Ok(blocks.len())
@@ -5388,5 +5455,81 @@ mod tests {
         // 无 hit_rects 或取不到光标坐标时保守关闭穿透
         assert!(!should_ignore_cursor_events(&[], false, origin, Some((470.0, 240.0))));
         assert!(!should_ignore_cursor_events(&hits, false, origin, None));
+    }
+
+    #[test]
+    fn compute_capture_window_frame_supports_negative_and_offset_external_monitors() {
+        // [R4-P1-1] screen_bounds 统一遵循 (left, top, right, bottom) 契约：
+        // 1) 左侧负坐标副屏 (-1920, 0, 0, 1080)：right=0 不得被当成 sw=0 导致选区塌缩成 1px
+        let left_bounds = Some((-1920.0, 0.0, 0.0, 1080.0));
+        let left_center = compute_capture_window_frame(-1200.0, 200.0, 200.0, 80.0, left_bounds);
+        assert_eq!(left_center.image.w, 200.0);
+        assert_eq!(left_center.image.h, 80.0);
+        assert_eq!(left_center.win.win_w, TOOLBAR_MIN_WIDTH);
+        assert!(left_center.win.win_x >= -1920.0);
+        assert!(left_center.win.win_x + left_center.win.win_w <= 0.0);
+        assert_eq!(left_center.win.win_x + left_center.image.x, -1200.0);
+
+        let left_right_edge = compute_capture_window_frame(-150.0, 200.0, 120.0, 60.0, left_bounds);
+        assert_eq!(left_right_edge.win.win_x + left_right_edge.win.win_w, 0.0);
+        assert_eq!(left_right_edge.win.win_x + left_right_edge.image.x, -150.0);
+
+        // 2) 上方负坐标副屏 (0, -1440, 2560, 0)：bottom=0 不得把 sh 夹成 1px，贴底时工具条向上翻转
+        let top_bounds = Some((0.0, -1440.0, 2560.0, 0.0));
+        let top_bottom_edge = compute_capture_window_frame(400.0, -320.0, 500.0, 300.0, top_bounds);
+        assert_eq!(top_bottom_edge.image.w, 500.0);
+        assert_eq!(top_bottom_edge.image.h, 300.0);
+        assert!(top_bottom_edge.image.y >= TOOLBAR_RESERVE);
+        assert!(top_bottom_edge.win.win_y < -320.0);
+        assert_eq!(top_bottom_edge.win.win_y + top_bottom_edge.image.y, -320.0);
+        assert!(top_bottom_edge.win.win_y + top_bottom_edge.win.win_h <= 0.0);
+
+        // 3) 右侧正偏移副屏 (1440, 0, 3360, 1080)：右边界是 3360 而非 sx+sw=4800
+        let right_bounds = Some((1440.0, 0.0, 3360.0, 1080.0));
+        let right_edge = compute_capture_window_frame(3240.0, 200.0, 100.0, 80.0, right_bounds);
+        assert_eq!(right_edge.win.win_x + right_edge.win.win_w, 3360.0);
+        assert_eq!(right_edge.win.win_x + right_edge.image.x, 3240.0);
+
+        // 4) 下方正偏移副屏 (0, 900, 1920, 1980)：贴底选区工具条必须翻到上方且不超过 1980
+        let bottom_bounds = Some((0.0, 900.0, 1920.0, 1980.0));
+        let bottom_edge = compute_capture_window_frame(300.0, 1660.0, 400.0, 300.0, bottom_bounds);
+        assert!(bottom_edge.image.y >= TOOLBAR_RESERVE);
+        assert_eq!(bottom_edge.win.win_y + bottom_edge.image.y, 1660.0);
+        assert!(bottom_edge.win.win_y + bottom_edge.win.win_h <= 1980.0);
+
+        // 5) screen_bounds=None 兜底在正大坐标与负坐标下同样遵循 (left, top, right, bottom)
+        let none_bounds = compute_capture_window_frame(3200.0, -800.0, 240.0, 90.0, None);
+        assert_eq!(none_bounds.image.w, 240.0);
+        assert_eq!(none_bounds.image.h, 90.0);
+        assert_eq!(none_bounds.win.win_x + none_bounds.image.x, 3200.0);
+        assert_eq!(none_bounds.win.win_y + none_bounds.image.y, -800.0);
+    }
+
+    #[test]
+    fn actual_win_origin_sync_fixes_menu_bar_clamped_passthrough_and_rejects_stale_seq() {
+        // [R4-P2-2] 贴顶菜单栏下框选请求 y=8，AppKit 夹紧到菜单栏底边 y=30
+        let hits = vec![
+            HitRect { x: 190.0, y: 0.0, w: 200.0, h: 40.0 },
+            HitRect { x: 0.0, y: 48.0, w: 580.0, h: 44.0 },
+        ];
+        let mut slot = CaptureSnapshot {
+            win_origin: Some((200.0, 8.0)),
+            hit_rects: hits.clone(),
+            ..Default::default()
+        };
+
+        // 校准前使用请求坐标 (200, 8)：光标落在实际工具条下半部 (350, 112) 被误算成 ly=104 > 98 -> 错误穿透
+        assert!(should_ignore_cursor_events(&slot.hit_rects, false, slot.win_origin, Some((350.0, 112.0))));
+
+        // 同步真实窗口原点 (200, 30) 后：工具条实际位于全局 y=78..122，(350, 112) 精确命中，透明区 (240, 50) 仍穿透
+        assert!(apply_actual_win_origin(&mut slot, 5, 5, (200.0, 30.0)));
+        assert_eq!(slot.win_origin, Some((200.0, 30.0)));
+        assert!(!should_ignore_cursor_events(&slot.hit_rects, false, slot.win_origin, Some((350.0, 112.0))));
+        assert!(should_ignore_cursor_events(&slot.hit_rects, false, slot.win_origin, Some((240.0, 50.0))));
+
+        // 过期轮询代次或非有限坐标不得覆盖现有原点
+        assert!(!apply_actual_win_origin(&mut slot, 6, 5, (999.0, 999.0)));
+        assert!(!apply_actual_win_origin(&mut slot, 6, 6, (f64::NAN, 30.0)));
+        assert_eq!(slot.win_origin, Some((200.0, 30.0)));
     }
 }
