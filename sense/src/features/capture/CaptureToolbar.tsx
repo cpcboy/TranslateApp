@@ -104,12 +104,14 @@ export function CaptureToolbar({
     : "自动";
 
   const popoverPosClass = popoverUp ? "bottom-full mb-1.5" : "top-full mt-1.5";
-  const subbarOrderClass = subbarAbove ? "flex-col-reverse" : "flex-col";
+  const subbarPosClass = subbarAbove
+    ? "absolute bottom-full left-1/2 z-10 mb-1.5 -translate-x-1/2"
+    : "relative z-10";
 
   return (
     <div
       data-testid="capture-toolbar"
-      className={`pointer-events-auto flex ${subbarOrderClass} items-center gap-1.5 select-none`}
+      className="pointer-events-auto relative flex flex-col items-center gap-1.5 select-none"
       onClick={(e) => e.stopPropagation()}
       onMouseDown={(e) => e.preventDefault()}
       onPointerDown={(e) => e.stopPropagation()}
@@ -118,10 +120,10 @@ export function CaptureToolbar({
       <div
         data-testid="capture-toolbar-main"
         data-hit-rect="true"
-        className="relative flex flex-nowrap items-center gap-1 rounded-xl border border-white/15 bg-[rgba(22,23,28,0.94)] px-2 py-1 text-[12px] text-[#f4f2ec] shadow-[0_10px_28px_rgba(0,0,0,0.45)] backdrop-blur-md"
+        className="relative z-20 flex flex-nowrap items-center gap-1 rounded-xl border border-white/15 bg-[rgba(22,23,28,0.94)] px-2 py-1 text-[12px] text-[#f4f2ec] shadow-[0_10px_28px_rgba(0,0,0,0.45)] backdrop-blur-md"
       >
         {/* 显示原文 / 显示结果 */}
-        <div role="group" aria-label="视图切换" className="flex items-center rounded-lg bg-white/8 p-0.5">
+        <div role="group" aria-label="视图切换" className="flex shrink-0 items-center rounded-lg bg-white/8 p-0.5">
           <button
             type="button"
             aria-pressed={showOriginal}
@@ -150,10 +152,10 @@ export function CaptureToolbar({
           </button>
         </div>
 
-        <div className="mx-0.5 h-4 w-px bg-white/15" />
+        <div className="mx-0.5 h-4 w-px shrink-0 bg-white/15" />
 
         {/* 翻译目标语言选择 */}
-        <div className="relative">
+        <div className="relative shrink-0">
           <button
             type="button"
             data-testid="capture-lang-btn"
@@ -218,10 +220,10 @@ export function CaptureToolbar({
           )}
         </div>
 
-        <div className="mx-0.5 h-4 w-px bg-white/15" />
+        <div className="mx-0.5 h-4 w-px shrink-0 bg-white/15" />
 
         {/* 钉钉风格标注工具 */}
-        <div role="group" aria-label="图片编辑工具" className="flex items-center gap-0.5">
+        <div role="group" aria-label="图片编辑工具" className="flex shrink-0 items-center gap-0.5">
           {TOOL_ITEMS.map(({ id, label }) => {
             const active = activeTool === id;
             return (
@@ -233,7 +235,7 @@ export function CaptureToolbar({
                 aria-pressed={active}
                 onMouseDown={(e) => e.preventDefault()}
                 onClick={() => onSelectTool(active ? "none" : id)}
-                className={`flex h-7 w-7 items-center justify-center rounded-lg transition-colors ${
+                className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-lg transition-colors ${
                   active
                     ? "bg-[#2f7cf6] text-white"
                     : "text-[#d2cec5] hover:bg-white/12 hover:text-white"
@@ -250,16 +252,16 @@ export function CaptureToolbar({
             disabled={annotationsCount === 0}
             onMouseDown={(e) => e.preventDefault()}
             onClick={onUndo}
-            className="flex h-7 items-center justify-center rounded-lg px-2 text-[11.5px] text-[#d2cec5] transition-colors hover:bg-white/12 hover:text-white disabled:cursor-not-allowed disabled:opacity-35"
+            className="flex h-7 shrink-0 items-center justify-center whitespace-nowrap rounded-lg px-2 text-[11.5px] text-[#d2cec5] transition-colors hover:bg-white/12 hover:text-white disabled:cursor-not-allowed disabled:opacity-35"
           >
             撤销
           </button>
         </div>
 
-        <div className="mx-0.5 h-4 w-px bg-white/15" />
+        <div className="mx-0.5 h-4 w-px shrink-0 bg-white/15" />
 
         {/* 存为图片 */}
-        <div className="relative">
+        <div className="relative shrink-0">
           <button
             type="button"
             data-testid="capture-save-btn"
@@ -278,7 +280,8 @@ export function CaptureToolbar({
               role="menu"
               data-hit-rect="true"
               aria-label="保存图片选项"
-              className={`absolute right-0 ${popoverPosClass} z-30 min-w-[156px] rounded-xl border border-white/15 bg-[rgba(24,25,31,0.98)] p-1 shadow-[0_12px_32px_rgba(0,0,0,0.55)]`}
+              style={popoverMaxHeight ? { maxHeight: popoverMaxHeight } : undefined}
+              className={`absolute right-0 ${popoverPosClass} z-30 min-w-[156px] overflow-y-auto rounded-xl border border-white/15 bg-[rgba(24,25,31,0.98)] p-1 shadow-[0_12px_32px_rgba(0,0,0,0.55)]`}
             >
               <button
                 type="button"
@@ -289,7 +292,7 @@ export function CaptureToolbar({
                   onTogglePopover("none");
                   onSave("original");
                 }}
-                className="flex w-full items-center rounded-lg px-2.5 py-1.5 text-left text-[11.5px] text-[#e7e4dc] hover:bg-white/12 disabled:cursor-not-allowed disabled:opacity-40"
+                className="flex w-full items-center whitespace-nowrap rounded-lg px-2.5 py-1.5 text-left text-[11.5px] text-[#e7e4dc] hover:bg-white/12 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 保存未翻译原图
               </button>
@@ -303,7 +306,7 @@ export function CaptureToolbar({
                     onTogglePopover("none");
                     onSave("original_annotated");
                   }}
-                  className="flex w-full items-center rounded-lg px-2.5 py-1.5 text-left text-[11.5px] text-[#e7e4dc] hover:bg-white/12 disabled:cursor-not-allowed disabled:opacity-40"
+                  className="flex w-full items-center whitespace-nowrap rounded-lg px-2.5 py-1.5 text-left text-[11.5px] text-[#e7e4dc] hover:bg-white/12 disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   保存带标注原图
                 </button>
@@ -317,7 +320,7 @@ export function CaptureToolbar({
                   onTogglePopover("none");
                   onSave("translated");
                 }}
-                className="flex w-full items-center rounded-lg px-2.5 py-1.5 text-left text-[11.5px] text-[#e7e4dc] hover:bg-white/12 disabled:cursor-not-allowed disabled:opacity-40"
+                className="flex w-full items-center whitespace-nowrap rounded-lg px-2.5 py-1.5 text-left text-[11.5px] text-[#e7e4dc] hover:bg-white/12 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 保存翻译后图片
               </button>
@@ -332,7 +335,7 @@ export function CaptureToolbar({
           aria-label="关闭"
           onMouseDown={(e) => e.preventDefault()}
           onClick={onClose}
-          className="ml-0.5 whitespace-nowrap rounded-lg bg-[#e5484d]/90 px-2.5 py-1 text-[11.5px] font-medium text-white transition-colors hover:bg-[#e5484d]"
+          className="ml-0.5 shrink-0 whitespace-nowrap rounded-lg bg-[#e5484d]/90 px-2.5 py-1 text-[11.5px] font-medium text-white transition-colors hover:bg-[#e5484d]"
         >
           关闭
         </button>
@@ -343,9 +346,9 @@ export function CaptureToolbar({
         <div
           data-testid="capture-subbar"
           data-hit-rect="true"
-          className="flex items-center gap-2 rounded-xl border border-white/15 bg-[rgba(22,23,28,0.92)] px-2.5 py-1 text-[11px] text-[#dcd8cf] shadow-[0_6px_18px_rgba(0,0,0,0.4)] backdrop-blur-md"
+          className={`${subbarPosClass} flex items-center gap-2 rounded-xl border border-white/15 bg-[rgba(22,23,28,0.92)] px-2.5 py-1 text-[11px] text-[#dcd8cf] shadow-[0_6px_18px_rgba(0,0,0,0.4)] backdrop-blur-md`}
         >
-          <div role="group" aria-label="标注颜色" className="flex items-center gap-1.5">
+          <div role="group" aria-label="标注颜色" className="flex shrink-0 items-center gap-1.5">
             {ANNOTATION_COLORS.map((c) => {
               const selected = activeColor === c.hex;
               return (
@@ -357,7 +360,7 @@ export function CaptureToolbar({
                   aria-pressed={selected}
                   onMouseDown={(e) => e.preventDefault()}
                   onClick={() => onSelectColor(c.hex)}
-                  className={`h-4 w-4 rounded-full border transition-transform ${
+                  className={`h-4 w-4 shrink-0 rounded-full border transition-transform ${
                     selected ? "scale-110 border-white ring-2 ring-[#2f7cf6]" : "border-white/30 hover:scale-105"
                   }`}
                   style={{ backgroundColor: c.hex }}
@@ -365,8 +368,8 @@ export function CaptureToolbar({
               );
             })}
           </div>
-          <div className="h-3.5 w-px bg-white/15" />
-          <div role="group" aria-label="线条粗细" className="flex items-center gap-1">
+          <div className="h-3.5 w-px shrink-0 bg-white/15" />
+          <div role="group" aria-label="线条粗细" className="flex shrink-0 items-center gap-1">
             {ANNOTATION_SIZES.map((s) => {
               const selected = activeSize === s.id;
               return (
@@ -377,7 +380,7 @@ export function CaptureToolbar({
                   aria-pressed={selected}
                   onMouseDown={(e) => e.preventDefault()}
                   onClick={() => onSelectSize(s.id)}
-                  className={`rounded-md px-1.5 py-0.5 transition-colors ${
+                  className={`shrink-0 whitespace-nowrap rounded-md px-1.5 py-0.5 transition-colors ${
                     selected ? "bg-white/22 text-white font-medium" : "text-[#bdb8af] hover:bg-white/10"
                   }`}
                 >

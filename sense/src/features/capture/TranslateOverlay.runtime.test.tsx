@@ -221,6 +221,18 @@ function findElement(node: unknown, predicate: (el: El) => boolean): El | null {
   return null;
 }
 
+function findAllElements(node: unknown, predicate: (el: El) => boolean, out: El[] = []): El[] {
+  if (!node || typeof node !== "object") return out;
+  if (Array.isArray(node)) {
+    for (const child of node) findAllElements(child, predicate, out);
+    return out;
+  }
+  const el = node as El;
+  if ("type" in el && predicate(el)) out.push(el);
+  if (el.props && "children" in el.props) findAllElements(el.props.children, predicate, out);
+  return out;
+}
+
 function findOverlayViewProps(root: El): {
   blocks: OverlayBlock[] | null;
   error: string | null;
@@ -1349,5 +1361,136 @@ describe("TranslateOverlay 运行时状态机与工具条回归测试", () => {
     });
     root = renderOverlay();
     expect(findElement(root, (el) => el.props["data-testid"] === "annotation-text-placeholder")).not.toBeNull();
+  });
+
+  it("[FIX-TOOLBAR-ZINDEX] 标注属性条在全部4种展开组合下均保持主条/菜单高于属性条且不反向顶出底边", () => {
+    const zOf = (cls: unknown): number => {
+      const m = String(cls ?? "").match(/\bz-(\d+)\b/);
+      return m ? Number(m[1]) : 0;
+    };
+    for (const openPopover of ["save", "lang"] as const) {
+      for (const popoverUp of [false, true]) {
+        for (const subbarAbove of [false, true]) {
+          const toolbar = CaptureToolbar({
+            targetLang: null,
+            retranslating: false,
+            showOriginal: false,
+            onToggleOriginal: () => {},
+            onSelectLang: () => {},
+            activeTool: "text",
+            onSelectTool: () => {},
+            activeColor: "#ff3b30",
+            onSelectColor: () => {},
+            activeSize: "md",
+            onSelectSize: () => {},
+            annotationsCount: 1,
+            onUndo: () => {},
+            onSave: () => {},
+            saving: false,
+            hasImage: true,
+            openPopover,
+            onTogglePopover: () => {},
+            popoverUp,
+            subbarAbove,
+            popoverMaxHeight: 180,
+            onClose: () => {},
+          }) as El;
+
+          const rootCls = String(toolbar.props.className).split(/\s+/);
+          expect(rootCls).toContain("relative");
+          expect(rootCls).not.toContain("flex-col-reverse");
+
+          const mainBar = findElement(toolbar, (el) => el.props["data-testid"] === "capture-toolbar-main")!;
+          const subbar = findElement(toolbar, (el) => el.props["data-testid"] === "capture-subbar")!;
+          const menu = findElement(toolbar, (el) => el.props.role === "menu")!;
+          const undoBtn = findElement(toolbar, (el) => el.props["aria-label"] === "撤销")!;
+          const closeBtn = findElement(toolbar, (el) => el.props["data-testid"] === "capture-close-btn")!;
+          const sizeBtns = findAllElements(subbar, (el) => String(el.props["aria-label"] ?? "").startsWith("粗细"));
+
+          expect(String(mainBar.props.className)).not.toContain("overflow-hidden");
+          expect(String(mainBar.props.className).split(/\s+/)).toContain("relative");
+          expect(zOf(mainBar.props.className)).toBeGreaterThan(zOf(subbar.props.className));
+          expect(zOf(menu.props.className)).toBeGreaterThan(0);
+          expect((menu.props.style as { maxHeight?: number } | undefined)?.maxHeight).toBe(180);
+          expect(String(menu.props.className).split(/\s+/)).toContain(popoverUp ? "bottom-full" : "top-full");
+
+          const subTokens = String(subbar.props.className).split(/\s+/);
+          if (subbarAbove) {
+            expect(subTokens).toEqual(expect.arrayContaining(["absolute", "bottom-full"]));
+          } else {
+            expect(subTokens).toContain("relative");
+            expect(subTokens).not.toContain("absolute");
+          }
+
+          expect(String(undoBtn.props.className).split(/\s+/)).toEqual(
+            expect.arrayContaining(["whitespace-nowrap", "shrink-0"]),
+          );
+          expect(String(closeBtn.props.className).split(/\s+/)).toEqual(
+            expect.arrayContaining(["whitespace-nowrap", "shrink-0"]),
+          );
+          expect(sizeBtns.length).toBe(3);
+          for (const sb of sizeBtns) {
+            expect(String(sb.props.className).split(/\s+/)).toEqual(
+              expect.arrayContaining(["whitespace-nowrap", "shrink-0"]),
+            );
+          }
+          if (openPopover === "save") {
+            const items = findAllElements(menu, (el) => el.props.role === "menuitem");
+            expect(items.length).toBe(3);
+            for (const item of items) {
+              expect(String(item.props.className).split(/\s+/)).toContain("whitespace-nowrap");
+            }
+          }
+        }
+      }
+    }
+  });
+
+  it("[FIX-TOOLBAR-INSIDE-BOTTOM] 全屏 inside-bottom 下切换标注工具时，主工具条坐标固定不下移、属性条上浮且菜单限高", async () => {
+    windowState.innerWidth = 800;
+    windowState.innerHeight = 600;
+    const fullView: CaptureView = {
+      blocks: [sampleBlock()],
+      error: null,
+      notice: null,
+      stage: "done",
+      generation: 51,
+      revision: 1,
+      has_image: true,
+      scale: 2,
+      bounds: { w: 800, h: 600 },
+      image_rect: { x: 0, y: 0, w: 800, h: 600 },
+    };
+    ipcMock.captureBlocks.mockResolvedValue(fullView);
+
+    let root = renderOverlay();
+    await flush();
+    for (const h of ipcMock.updateHandlers) h(fullView);
+    root = renderOverlay();
+
+    const anchorBefore = findElement(root, (el) => el.props["data-testid"] === "capture-toolbar-anchor")!;
+    const topBefore = (anchorBefore.props.style as { top: number }).top;
+    expect(topBefore).toBe(548);
+
+    const tbBefore = findToolbarProps(root)!;
+    expect(tbBefore.subbarAbove).toBe(true);
+    expect(tbBefore.popoverUp).toBe(true);
+    expect(tbBefore.popoverMaxHeight as number).toBeGreaterThanOrEqual(108);
+    expect(tbBefore.popoverMaxHeight as number).toBeLessThanOrEqual(220);
+
+    // 激活「文字」工具后，anchor 的 top 必须保持 548，绝不被 subbar 向下顶出 600px 底边
+    (tbBefore.onSelectTool as (tool: "text") => void)("text");
+    root = renderOverlay();
+    const anchorAfterTool = findElement(root, (el) => el.props["data-testid"] === "capture-toolbar-anchor")!;
+    expect((anchorAfterTool.props.style as { top: number }).top).toBe(topBefore);
+
+    // 打开保存菜单时，工具保持激活且主条位置不变
+    (findToolbarProps(root)!.onTogglePopover as (p: "save") => void)("save");
+    root = renderOverlay();
+    const tbAfterPopover = findToolbarProps(root)!;
+    expect(tbAfterPopover.openPopover).toBe("save");
+    expect(tbAfterPopover.subbarAbove).toBe(true);
+    expect(tbAfterPopover.popoverUp).toBe(true);
+    expect((findElement(root, (el) => el.props["data-testid"] === "capture-toolbar-anchor")!.props.style as { top: number }).top).toBe(548);
   });
 });
