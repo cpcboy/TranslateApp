@@ -64,11 +64,12 @@ const STATUS_MIN_WIDTH: f64 = 164.0;
 #[cfg(test)]
 const STATUS_MIN_HEIGHT: f64 = 40.0;
 /// 截屏后悬浮工具条（语种选择 / 原文结果切换 / 标注 / 保存 / 关闭）所需最小宽度与外边距预留。
-/// 四字语种（如「译为 繁体中文 ▾」）+「保存中…」单行实测约 601px，取 640px 留足两侧呼吸边距。
+/// 四字语种（如「译为 繁体中文 ▾」）+「保存中…」单行实测约 601px，取 640px 留足两侧呼吸边距；
+/// 纵向预留 96pt（窄屏双行预留 128pt）确保贴近屏幕底部框选矮截图并展开二级颜色/粗细属性条时绝不被窗口底边裁切。
 const TOOLBAR_MIN_WIDTH: f64 = 640.0;
-const TOOLBAR_RESERVE: f64 = 56.0;
+const TOOLBAR_RESERVE: f64 = 96.0;
 const TOOLBAR_EXTRA_SMALL: f64 = 268.0;
-const TOOLBAR_EXTRA_NORMAL: f64 = 100.0;
+const TOOLBAR_EXTRA_NORMAL: f64 = 104.0;
 
 /// 选区阶段最久等这么久（sidecar 内部在 115 秒会自动取消，这里留 5 秒余量兜底）。
 const SELECT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -532,19 +533,21 @@ fn default_hit_rects(
             let view_h = bounds.map(|b| b.h).unwrap_or(img.y + img.h);
             let bar_w = TOOLBAR_MIN_WIDTH.min(view_w.max(img.w));
             let bar_x = ((img.x + img.w / 2.0) - bar_w / 2.0).clamp(0.0, (view_w - bar_w).max(0.0));
+            let bar_h = if view_w < 616.0 { 76.0 } else { 44.0 };
+            let need_space = bar_h + 8.0;
             let space_below = (view_h - (img.y + img.h)).max(0.0);
-            let bar_y = if space_below >= 52.0 {
+            let bar_y = if space_below >= need_space {
                 img.y + img.h + 6.0
-            } else if img.y >= 52.0 {
-                (img.y - 46.0).max(4.0)
+            } else if img.y >= need_space {
+                (img.y - (bar_h + 2.0)).max(4.0)
             } else {
-                (view_h - 52.0).max(4.0)
+                (view_h - need_space).max(4.0)
             };
             rects.push(HitRect {
                 x: bar_x,
                 y: bar_y,
                 w: bar_w,
-                h: 44.0,
+                h: bar_h,
             });
         }
     } else if let Some(b) = bounds {
@@ -1411,7 +1414,7 @@ fn compute_capture_window_frame(
     let image_x = (sel_x - win_x).clamp(0.0, (win_w - image_w).max(0.0));
 
     let toolbar_reserve = if win_w < 616.0 {
-        88.0
+        128.0
     } else {
         TOOLBAR_RESERVE
     };
@@ -4348,6 +4351,30 @@ mod tests {
         assert!((placement.w - crop_w).abs() <= 1.5 && (placement.h - crop_h).abs() <= 1.5);
         let lines = pending.wait_ocr(OCR_TIMEOUT, || false).expect("Vision OCR");
         assert!(!lines.is_empty(), "裁剪框内应当读出文字");
+
+        // 窗口预选单击确认测试：Dock 全屏容器 (layer=20) 被过滤，命中上层软件窗口并转为选定区域输出 OCR
+        let win_w = (logical_w * 0.8).max(40.0).min(logical_w);
+        let win_h = (logical_h * 0.8).max(40.0).min(logical_h);
+        let windows_json = format!(
+            r#"[
+              {{"kCGWindowNumber":1,"kCGWindowOwnerPID":11,"kCGWindowOwnerName":"Dock","kCGWindowLayer":20,"kCGWindowAlpha":1.0,"kCGWindowBounds":{{"X":0,"Y":0,"Width":{logical_w},"Height":{logical_h}}}}},
+              {{"kCGWindowNumber":2,"kCGWindowOwnerPID":22,"kCGWindowOwnerName":"Safari","kCGWindowLayer":0,"kCGWindowAlpha":1.0,"kCGWindowBounds":{{"X":4,"Y":6,"Width":{win_w:.1},"Height":{win_h:.1}}}}}
+            ]"#
+        );
+        let mut pre_cmd = Command::new(&binary);
+        pre_cmd.arg("--capture");
+        pre_cmd.env("SENSE_OCR_TEST_CAPTURE_PNG", &png);
+        pre_cmd.env("SENSE_OCR_TEST_CAPTURE_SCALE", "2");
+        pre_cmd.env("SENSE_OCR_TEST_WINDOWS_JSON", windows_json);
+        pre_cmd.env("SENSE_OCR_TEST_CLICK_POINT", "24,24");
+        let (pre_place, pre_screen, pre_pending) = run_capture_select_with(pre_cmd, Duration::from_secs(10))
+            .expect("preselected window")
+            .expect("单击命中预选窗口");
+        assert_eq!(pre_screen.scale, 2.0);
+        assert!((pre_place.x - 4.0).abs() <= 1.0 && (pre_place.y - 6.0).abs() <= 1.0);
+        assert!((pre_place.w - win_w).abs() <= 1.5 && (pre_place.h - win_h).abs() <= 1.5);
+        let pre_lines = pre_pending.wait_ocr(OCR_TIMEOUT, || false).expect("预选窗口 Vision OCR");
+        assert!(!pre_lines.is_empty(), "预选窗口裁剪区域内应当读出文字");
     }
 
     #[test]
@@ -5444,6 +5471,20 @@ mod tests {
         assert!(bottom_edge.image.y >= TOOLBAR_RESERVE);
         assert_eq!(bottom_edge.win.win_y + bottom_edge.image.y, 480.0);
         assert!(bottom_edge.win.win_y + bottom_edge.win.win_h <= 900.0);
+
+        // 3b) 贴近屏幕底部的单行矮选区（如 y=810, h=30，底部仅剩 60pt < TOOLBAR_RESERVE=96pt）：
+        //     必须借用屏幕上方充足空间走 top 停靠（image.y >= 96），避免生成 640×90 矮窗把二级属性条裁切在底边外
+        let bottom_single_line = compute_capture_window_frame(200.0, 810.0, 200.0, 30.0, bounds);
+        assert!(bottom_single_line.image.y >= TOOLBAR_RESERVE);
+        assert_eq!(bottom_single_line.win.win_y + bottom_single_line.image.y, 810.0);
+        assert!(bottom_single_line.win.win_h >= 30.0 + TOOLBAR_RESERVE);
+        assert!(bottom_single_line.win.win_y + bottom_single_line.win.win_h <= 900.0);
+
+        // 3c) 窄屏幕（宽 400px < 616px，双行主工具条 + 属性条需 128pt）贴底单行选区（底部剩 90pt < 128pt）：同样翻到上方
+        let narrow_bottom_line = compute_capture_window_frame(100.0, 580.0, 200.0, 30.0, Some((0.0, 0.0, 400.0, 700.0)));
+        assert!(narrow_bottom_line.image.y >= 128.0);
+        assert_eq!(narrow_bottom_line.win.win_y + narrow_bottom_line.image.y, 580.0);
+        assert!(narrow_bottom_line.win.win_y + narrow_bottom_line.win.win_h <= 700.0);
 
         // 4) 全屏选区：窗口不超出屏幕
         let full = compute_capture_window_frame(0.0, 0.0, 1440.0, 900.0, bounds);

@@ -685,8 +685,13 @@ export function TranslateOverlay() {
   const popoverUp =
     toolbarDock === "inside-bottom" ||
     (spaceBelowBar < 190 && spaceAboveBar >= spaceBelowBar);
+  const subbarNeedSpace = 37;
   const subbarAbove =
-    toolbarDock === "inside-bottom" || (spaceBelowBar < 40 && spaceAboveBar >= 40);
+    toolbarDock === "inside-bottom"
+      ? spaceAboveBar >= subbarNeedSpace || spaceAboveBar >= spaceBelowBar
+      : toolbarDock === "top"
+        ? spaceAboveBar >= subbarNeedSpace
+        : spaceBelowBar < subbarNeedSpace && spaceAboveBar >= subbarNeedSpace;
   const popoverMaxHeight = Math.max(
     108,
     Math.min(220, (popoverUp ? spaceAboveBar : spaceBelowBar) - 10),
@@ -781,7 +786,7 @@ export function TranslateOverlay() {
       if (showToolbar) {
         rects.push({
           x: toolbarLeft,
-          y: toolbarTop,
+          y: subbarAbove && activeTool !== "none" ? Math.max(0, toolbarTop - subbarNeedSpace) : toolbarTop,
           w: measuredBarW,
           h: effectiveBarH + (activeTool !== "none" ? 40 : 4),
         });
@@ -819,6 +824,7 @@ export function TranslateOverlay() {
     textDraft?.y ?? null,
     toolbarLeft,
     toolbarTop,
+    subbarAbove,
   ]);
 
   return (
@@ -1174,7 +1180,12 @@ function AnnotationShape({ item, stageWidth }: { item: Annotation; stageWidth?: 
       style={{ textShadow: "0 1px 2px rgba(0,0,0,0.45)", whiteSpace: "pre" }}
     >
       {lines.map((line, idx) => (
-        <tspan key={idx} x={item.x} y={item.y + idx * lineH}>
+        <tspan
+          key={idx}
+          x={item.x}
+          y={item.y + idx * lineH}
+          dominantBaseline="text-before-edge"
+        >
           {line}
         </tspan>
       ))}

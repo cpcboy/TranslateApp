@@ -1631,6 +1631,9 @@ describe("TranslateOverlay 运行时状态机与工具条回归测试", () => {
     const tspans = findAllElements(shapeEl, (el) => el.type === "tspan");
     expect(tspans.length).toBeGreaterThanOrEqual(3);
     expect(tspans.map((t) => String(t.props.children)).join("")).toBe(longZh);
+    for (const tspan of tspans) {
+      expect(tspan.props.dominantBaseline).toBe("text-before-edge");
+    }
   });
 
   it("[FIX-TOOLBAR-MAIN-HEIGHT-RESIZE-OBSERVER] ResizeObserver 实测双行工具条高度（72px）后，toolbarDock/toolbarTop 与穿透热区同步重算", async () => {
@@ -1721,5 +1724,117 @@ describe("TranslateOverlay 运行时状态机与工具条回归测试", () => {
         (globalThis as Record<string, unknown>).ResizeObserver = prevRO;
       }
     }
+  });
+
+  it("[FIX-TSPAN-BASELINE-AND-BOTTOM-SUBBAR] 超 5 行底边钳位时每个 <tspan> 显式声明 text-before-edge 防削头，且贴底矮选区展开属性条自动上浮不裁切", async () => {
+    // 1) 360×190 画布右下角输入折成 >=6 行的中文并回车：committedY 钳位到 3px，每个 <tspan> 必须显式带 dominantBaseline="text-before-edge"
+    windowState.innerWidth = 640;
+    windowState.innerHeight = 320;
+    ipcMock.captureBlocks.mockResolvedValue({
+      blocks: [sampleBlock()],
+      error: null,
+      notice: null,
+      stage: "done",
+      generation: 71,
+      revision: 1,
+      has_image: true,
+      scale: 2,
+      target_lang: "zh",
+      bounds: { w: 640, h: 320 },
+      image_rect: { x: 140, y: 0, w: 360, h: 190 },
+    });
+
+    let root = renderOverlay();
+    await flush();
+    root = renderOverlay();
+
+    (findToolbarProps(root)!.onSelectTool as (tool: "text") => void)("text");
+    root = renderOverlay();
+    const svg = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svg.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 1,
+      clientX: 245,
+      clientY: 160,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+      currentTarget: {},
+    });
+    root = renderOverlay();
+
+    const eightLineZh = "底边右角超长六行中文批注测试看看超过五行以后会不会被底边截断或者导出不一致呢";
+    const ta = findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!;
+    (ta.props.onChange as (e: unknown) => void)({ target: { value: eightLineZh } });
+    root = renderOverlay();
+    const taAfter = findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!;
+    (taAfter.props.onKeyDown as (e: unknown) => void)({
+      key: "Enter",
+      shiftKey: false,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+
+    const committedSvg = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    const shapeHost = findElement(committedSvg, (el) => typeof el.type === "function" && "item" in el.props)!;
+    const shapeEl = (shapeHost.type as (props: unknown) => El)(shapeHost.props);
+    const tspans = findAllElements(shapeEl, (el) => el.type === "tspan");
+    expect(tspans.length).toBeGreaterThanOrEqual(6);
+    expect(tspans[0]!.props.y).toBe(3);
+    for (const ts of tspans) {
+      expect(ts.props.dominantBaseline).toBe("text-before-edge");
+    }
+
+    // 2) 贴底 30px 单行选区经 Rust 借上方空间生成 640×298 (image_rect.y=268, toolbarDock="top")：
+    //    点开「矩形」时 subbarAbove=true，属性条悬浮在主工具条上方，既不裁切也不遮挡下方 30px 截图区
+    windowState.innerWidth = 640;
+    windowState.innerHeight = 298;
+    const topDockedBottomView: CaptureView = {
+      blocks: [sampleBlock()],
+      error: null,
+      notice: null,
+      stage: "done",
+      generation: 72,
+      revision: 1,
+      has_image: true,
+      scale: 2,
+      target_lang: "zh",
+      bounds: { w: 640, h: 298 },
+      image_rect: { x: 220, y: 268, w: 200, h: 30 },
+    };
+    for (const h of ipcMock.updateHandlers) h(topDockedBottomView);
+    root = renderOverlay();
+
+    (findToolbarProps(root)!.onSelectTool as (tool: "rect") => void)("rect");
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.subbarAbove).toBe(true);
+
+    // 3) 极端紧凑 640×90 窗口 (image_rect.y=0, h=30, toolbarTop=38, spaceBelowBar=12, spaceAboveBar=38)：
+    //    下方仅剩 12px 放不下 31px 属性条，subbarAbove=true 将属性条翻至上方 y=1..32 完整落在 [0, 90] 窗内
+    windowState.innerWidth = 640;
+    windowState.innerHeight = 90;
+    const tightBottomView: CaptureView = {
+      blocks: [sampleBlock()],
+      error: null,
+      notice: null,
+      stage: "done",
+      generation: 73,
+      revision: 1,
+      has_image: true,
+      scale: 2,
+      target_lang: "zh",
+      bounds: { w: 640, h: 90 },
+      image_rect: { x: 220, y: 0, w: 200, h: 30 },
+    };
+    for (const h of ipcMock.updateHandlers) h(tightBottomView);
+    root = renderOverlay();
+
+    (findToolbarProps(root)!.onSelectTool as (tool: "rect") => void)("rect");
+    root = renderOverlay();
+    const tightTbProps = findToolbarProps(root)!;
+    expect(tightTbProps.subbarAbove).toBe(true);
+    const renderedSub = CaptureToolbar(tightTbProps as Parameters<typeof CaptureToolbar>[0]) as El;
+    const subEl = findElement(renderedSub, (el) => el.props["data-testid"] === "capture-subbar")!;
+    expect(String(subEl.props.className)).toContain("bottom-full");
   });
 });
