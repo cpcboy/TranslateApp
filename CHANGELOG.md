@@ -6,6 +6,24 @@
 
 ## [0.1.2] - 2026-11-14
 
+### 修复 · 2026-11-14 — 三次真机 QC 复核闭环：Dock 正上方矮选区下拉弹层防越窗截断、底边超 5 行文字批注零跳变
+
+**问题解决**
+
+1. **`[P1]` 在 macOS Dock 正上方截取单行/按钮矮选区（`space_below = 96..185pt`，窄屏 `128..217pt`）时，点开 `存为图片 ▾` 与 `译为 … ▾` 被 `NSWindow` 底边硬截断**：
+   - **根因**：此前 `compute_capture_window_frame` 只要 `space_below >= toolbar_reserve`（`96pt` / 窄屏 `128pt`）就固定取 `win_y = sel_y, image_y = 0, win_h = sel_h + bottom_pad`（如 `1440×900` 上 `y = 774, h = 30` 仅生成 `126px` 矮窗，上方 `774pt` 空白 `0pt` 不借）；同时 `TranslateOverlay.tsx` 中 `popoverUp` 因 `spaceAboveBar (38) < spaceBelowBar (48)` 保持 `false` 向下展开，且 `popoverMaxHeight` 硬锁死最小下限 `Math.max(108, ...)`，导致 2/3 项保存菜单（`保存翻译后图片`）与目标语种网格直接冲出 `NSWindow` 底边无法点击。
+   - **双层防裁切修复**：
+     - `sense/src-tauri/src/capture.rs` 新增 `POPOVER_COMFORT_SPACE = 196.0` 与 `POPOVER_ABOVE_TARGET = 202.0`（窄屏 `< 616px` `extra_small = 300.0`）：当 `space_below >= toolbar_reserve` 但下方余量不足以完整展开下拉菜单（`bottom_pad < bar_h_est + 8.0 + POPOVER_COMFORT_SPACE`）且 `image_h < 202.0` 时，自动向选区上方借用透明空间（带 `menu_bar_guard` 避开主屏顶部 `38pt` 菜单栏夹紧带）使 `image_y + image_h >= 202.0`——既保持 `win_y + image_y == sel_y` 桌面原位像素零偏移、主工具条与二级属性条仍在选区下方不遮挡截图、上方借用透明区默认 100% 鼠标穿透，又使点开 `存为图片 ▾` / `译为 … ▾` 时 `spaceAboveBar >= 210px` 自动触发 `popoverUp = true` 完整向上展开（高度 `>= 200px`）。
+     - `sense/src/features/capture/TranslateOverlay.tsx` 移除无视真实视口余量的 `Math.max(108, ...)` 硬下限，改为按真实边缘可用空间 `Math.max(24, Math.floor((popoverUp ? spaceAboveBar : spaceBelowBar) - 10))` 动态限高，确保极端矮物理屏幕（上方无可借空间）下菜单亦始终留在 `NSWindow` 内并通过 `overflow-y-auto` 内部滚动点选。
+2. **`[P3]` 画布底边输入超过 5 行文字批注时，输入态 `<textarea>` 与回车确认后 `<svg>` 存在约 `41px` 纵向跳变**：
+   - `sense/src/features/capture/captureAnnotations.ts` `computeTextBoxLayout` 将 `rows` 由硬封顶 `5` 行改为按舞台可容纳最大行数 `maxVisibleRows`（上限 `12` 行）动态展开，并按总文本高度 `Math.min(safeH, wrappedLines.length * lineHeight + TEXT_DRAFT_PAD_Y * 2)` 实时上推 `top`，使底边 `> 5` 行文字在输入期间即可完整浏览且与回车落盘后的 SVG `<tspan>` 首行 `y` 坐标严格相等（`0.0px` 跳变）。
+
+**验证与 QC 审查**
+
+- 独立软件产品 QC 代码审查员（`01300a53`）对抗审查：结论 **`P0 = 0, P1 = 0, P2 = 0, P3 = 0`**，并按测试覆面建议补齐窄屏 `400×332`（双行 `isCompact` + 向上借高）弹层渲染回归断言。
+- 全量自动化套件通过：`npm run typecheck`、Vitest **32 文件 / 662 用例**、`npm run build`、`cargo test --locked` **434 用例**；真机多视口 `NSWindow + WKWebView`（Dock 正上方 `space_below = 96pt` 宽屏 `640×298` 与窄屏 `400×332` 下 0/1 标注保存菜单与语言菜单完整上翻并实点导出/切语种、`640×126` 极限矮屏内部滚动零越窗、`360×190` 舞台底边 7 行中文批注输入与提交 `0.0px` 跳变）画面验收全通过。
+- **回滚方式**：`git revert 1cd324e` 并重装上一版备份 `~/cpcsoft/SENSE-app-backups/SENSE-before-above-dock-popover-fix.app`（无数据迁移）。
+
 ### 新增与修复 · 2026-11-14 — 截屏自动预选鼠标所在窗口 + 二次真机 QC 复核闭环（文字批注 `<tspan>` 基线对齐、贴底矮选区属性条防裁切）
 
 **新增功能**
