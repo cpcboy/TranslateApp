@@ -325,12 +325,19 @@ export function computeTextBoxLayout(options: {
   const safeH = Math.max(0, stageHeight);
   const lineHeight = Math.round(fontSize * 1.25);
   const rawLines = value.split("\n");
-  const maxBoxW = Math.min(110, safeW);
+  const naturalFourCharBoxW =
+    fontSize > 24
+      ? Math.ceil(measureFn("输入文字", fontSize)) + TEXT_DRAFT_PAD_X * 2 + 12
+      : 110;
+  const maxBoxW = Math.min(Math.max(110, naturalFourCharBoxW), safeW);
   const left = Math.max(0, Math.min(x, Math.max(0, safeW - maxBoxW)));
   const availableW = Math.max(0, safeW - left);
   const minFloor = safeW > 0 ? Math.min(40, safeW) : 0;
   const maxWidth = safeW > 0 ? Math.max(minFloor, availableW) : 0;
-  const minWidth = safeW > 0 ? Math.min(96, maxWidth) : 0;
+  const minWidth =
+    safeW > 0
+      ? Math.min(Math.max(96, Math.ceil(fontSize * 2) + TEXT_DRAFT_PAD_X * 2), maxWidth)
+      : 0;
   const maxLineWidth = safeW > 0 ? Math.max(1, maxWidth - TEXT_DRAFT_PAD_X * 2) : 0;
   const wrappedLines =
     safeW > 0 ? wrapAnnotationText(value, fontSize, maxLineWidth, measureFn) : rawLines;
@@ -571,7 +578,8 @@ export function applyTextAnnotationFontSize(
   stageHeight: number,
   measureFn: MeasureAnnotationTextFn = estimateTextLineWidth,
 ): Extract<Annotation, { kind: "text" }> {
-  const nextFontSize = clampTextFontSize(rawFontSize);
+  const currentFontSize = clampTextFontSize(item.fontSize);
+  const requestedFontSize = clampTextFontSize(rawFontSize);
   const safeW = Math.max(0, stageWidth);
   const safeH = Math.max(0, stageHeight);
 
@@ -579,31 +587,48 @@ export function applyTextAnnotationFontSize(
   const prevBounds = computeTextAnnotationBounds(item, safeW, measureFn);
   const wasSoftWrapped = prevBounds.lines.length > rawLines.length;
 
-  let nextX = item.x;
-  if (safeW > 0) {
-    const minCharW = Math.min(
-      Math.ceil(nextFontSize * 1.05),
-      Math.max(0, safeW - TEXT_DRAFT_PAD_X * 2),
-    );
-    const desiredW = wasSoftWrapped
-      ? minCharW
-      : Math.min(
-          Math.ceil(rawLines.reduce((acc, line) => Math.max(acc, measureFn(line, nextFontSize)), 0)),
-          Math.max(0, safeW - TEXT_DRAFT_PAD_X * 2),
-        );
-    const minX = Math.min(TEXT_DRAFT_PAD_X, Math.max(0, safeW - desiredW));
-    const maxAllowedX = Math.max(minX, safeW - desiredW - TEXT_DRAFT_PAD_X);
-    if (nextX > maxAllowedX) {
-      nextX = maxAllowedX;
+  const buildAtFontSize = (fs: number) => {
+    let nextX = item.x;
+    if (safeW > 0) {
+      const minCharW = Math.min(
+        Math.ceil(fs * 1.05),
+        Math.max(0, safeW - TEXT_DRAFT_PAD_X * 2),
+      );
+      const desiredW = wasSoftWrapped
+        ? minCharW
+        : Math.min(
+            Math.ceil(rawLines.reduce((acc, line) => Math.max(acc, measureFn(line, fs)), 0)),
+            Math.max(0, safeW - TEXT_DRAFT_PAD_X * 2),
+          );
+      const minX = Math.min(TEXT_DRAFT_PAD_X, Math.max(0, safeW - desiredW));
+      const maxAllowedX = Math.max(minX, safeW - desiredW - TEXT_DRAFT_PAD_X);
+      if (nextX > maxAllowedX) {
+        nextX = maxAllowedX;
+      }
     }
+    const candidate = {
+      ...item,
+      x: roundCoord(nextX),
+      fontSize: fs,
+    };
+    const nextBounds = computeTextAnnotationBounds(candidate, safeW, measureFn);
+    return { candidate, nextBounds };
+  };
+
+  let chosen = buildAtFontSize(requestedFontSize);
+  if (safeH > 0 && requestedFontSize > currentFontSize && chosen.nextBounds.h > safeH) {
+    let fitted: ReturnType<typeof buildAtFontSize> | null = null;
+    for (let fs = requestedFontSize - 1; fs >= currentFontSize; fs -= 1) {
+      const trial = buildAtFontSize(fs);
+      if (trial.nextBounds.h <= safeH) {
+        fitted = trial;
+        break;
+      }
+    }
+    chosen = fitted ?? buildAtFontSize(currentFontSize);
   }
 
-  const candidate = {
-    ...item,
-    x: roundCoord(nextX),
-    fontSize: nextFontSize,
-  };
-  const nextBounds = computeTextAnnotationBounds(candidate, safeW, measureFn);
+  const { candidate, nextBounds } = chosen;
   let nextY = candidate.y;
   if (safeH > 0) {
     const minY = Math.min(TEXT_DRAFT_PAD_Y, Math.max(0, safeH - nextBounds.h));
@@ -631,6 +656,7 @@ export function resizeTextAnnotationFontSize(
 ): Extract<Annotation, { kind: "text" }> {
   const safeW = Math.max(0, stageWidth);
   const safeH = Math.max(0, stageHeight);
+  const currentFontSize = clampTextFontSize(item.fontSize);
   const startBounds = computeTextAnnotationBounds(item, safeW, measureFn);
   const signX = handle === "ne" || handle === "se" ? 1 : -1;
   const signY = handle === "sw" || handle === "se" ? 1 : -1;
@@ -645,43 +671,60 @@ export function resizeTextAnnotationFontSize(
     return applyTextAnnotationFontSize(item, nextFontSize, safeW, safeH, measureFn);
   }
 
-  const unanchored = applyTextAnnotationFontSize(
-    { ...item, x: TEXT_DRAFT_PAD_X, y: TEXT_DRAFT_PAD_Y },
-    nextFontSize,
-    safeW,
-    safeH,
-    measureFn,
-  );
   const rawLines = item.text.split("\n");
-  const unanchoredW =
-    startBounds.lines.length > rawLines.length
-      ? Math.round(startBounds.w * (nextFontSize / Math.max(1, item.fontSize)))
-      : unanchored.fontSize > 0
-        ? computeTextAnnotationBounds(unanchored, safeW, measureFn).w
-        : startBounds.w;
-
   const anchorRight = startBounds.x + startBounds.w;
   const anchorBottom = startBounds.y + startBounds.h;
 
-  let targetX = handle === "nw" || handle === "sw" ? anchorRight - unanchoredW : item.x;
-  if (safeW > 0) {
-    const rigidW = Math.min(unanchoredW, Math.max(0, safeW - TEXT_DRAFT_PAD_X * 2));
-    const minX = Math.min(TEXT_DRAFT_PAD_X, Math.max(0, safeW - rigidW));
-    const maxX = Math.max(minX, safeW - rigidW - TEXT_DRAFT_PAD_X);
-    targetX = Math.min(Math.max(minX, targetX), maxX);
-  }
+  const buildAnchoredAt = (fs: number) => {
+    const unanchored = applyTextAnnotationFontSize(
+      { ...item, x: TEXT_DRAFT_PAD_X, y: TEXT_DRAFT_PAD_Y },
+      fs,
+      safeW,
+      safeH,
+      measureFn,
+    );
+    const effFs = unanchored.fontSize;
+    const unanchoredW =
+      startBounds.lines.length > rawLines.length
+        ? Math.round(startBounds.w * (effFs / Math.max(1, currentFontSize)))
+        : effFs > 0
+          ? computeTextAnnotationBounds(unanchored, safeW, measureFn).w
+          : startBounds.w;
 
-  const withX = {
-    ...item,
-    x: roundCoord(targetX),
-    fontSize: nextFontSize,
+    let targetX = handle === "nw" || handle === "sw" ? anchorRight - unanchoredW : item.x;
+    if (safeW > 0) {
+      const rigidW = Math.min(unanchoredW, Math.max(0, safeW - TEXT_DRAFT_PAD_X * 2));
+      const minX = Math.min(TEXT_DRAFT_PAD_X, Math.max(0, safeW - rigidW));
+      const maxX = Math.max(minX, safeW - rigidW - TEXT_DRAFT_PAD_X);
+      targetX = Math.min(Math.max(minX, targetX), maxX);
+    }
+
+    const withX = {
+      ...item,
+      x: roundCoord(targetX),
+      fontSize: effFs,
+    };
+    const nextBounds = computeTextAnnotationBounds(withX, safeW, measureFn);
+    let targetY = handle === "nw" || handle === "ne" ? anchorBottom - nextBounds.h : item.y;
+    if (safeH > 0) {
+      const minY = Math.min(TEXT_DRAFT_PAD_Y, Math.max(0, safeH - nextBounds.h));
+      const maxY = Math.max(minY, safeH - nextBounds.h - TEXT_DRAFT_PAD_Y);
+      targetY = Math.min(Math.max(minY, targetY), maxY);
+    }
+    return { result: { ...withX, y: roundCoord(targetY) }, nextBounds };
   };
-  const nextBounds = computeTextAnnotationBounds(withX, safeW, measureFn);
-  let targetY = handle === "nw" || handle === "ne" ? anchorBottom - nextBounds.h : item.y;
-  if (safeH > 0) {
-    const minY = Math.min(TEXT_DRAFT_PAD_Y, Math.max(0, safeH - nextBounds.h));
-    const maxY = Math.max(minY, safeH - nextBounds.h - TEXT_DRAFT_PAD_Y);
-    targetY = Math.min(Math.max(minY, targetY), maxY);
+
+  let chosen = buildAnchoredAt(nextFontSize);
+  if (safeH > 0 && nextFontSize > currentFontSize && chosen.nextBounds.h > safeH) {
+    let fitted: ReturnType<typeof buildAnchoredAt> | null = null;
+    for (let fs = Math.min(nextFontSize, chosen.result.fontSize) - 1; fs >= currentFontSize; fs -= 1) {
+      const trial = buildAnchoredAt(fs);
+      if (trial.nextBounds.h <= safeH) {
+        fitted = trial;
+        break;
+      }
+    }
+    chosen = fitted ?? buildAnchoredAt(currentFontSize);
   }
-  return { ...withX, y: roundCoord(targetY) };
+  return chosen.result;
 }

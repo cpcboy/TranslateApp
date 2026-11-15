@@ -69,7 +69,6 @@ type ActiveTransform =
       startRaw: AnnotationPoint;
       startAnnotation: Extract<Annotation, { kind: "text" }>;
       beforeList: Annotation[];
-      beforeTextFontSize: number;
     };
 
 function isEditableAnnotation(item: Annotation | undefined | null): item is EditableAnnotation {
@@ -299,10 +298,6 @@ export function TranslateOverlay() {
     activePointerIdRef.current = null;
     annotationsRef.current = tf.beforeList;
     setAnnotations(tf.beforeList);
-    if (tf.mode === "resize-text") {
-      textFontSizeRef.current = tf.beforeTextFontSize;
-      setTextFontSize(tf.beforeTextFontSize);
-    }
     setIsTransforming(false);
     return true;
   }, []);
@@ -650,8 +645,6 @@ export function TranslateOverlay() {
       const nextList = [...annotationsRef.current, nextItem];
       annotationsRef.current = nextList;
       setAnnotations(nextList);
-      selectedAnnotationIdRef.current = nextItem.id;
-      setSelectedAnnotationId(nextItem.id);
       setTransformRevision((r) => r + 1);
       return nextList;
     },
@@ -740,7 +733,7 @@ export function TranslateOverlay() {
       if (tool !== "text" && textDraftRef.current) {
         flushTextDraft();
       }
-      if ((tool !== "none" && tool !== activeTool) || tool === "arrow" || tool === "pen") {
+      if (tool !== activeTool || tool === "none" || tool === "arrow" || tool === "pen") {
         selectedAnnotationIdRef.current = null;
         setSelectedAnnotationId(null);
       }
@@ -754,19 +747,22 @@ export function TranslateOverlay() {
 
   const handleSelectColor = useCallback(
     (hex: string) => {
-      activeColorRef.current = hex;
-      setActiveColor(hex);
       const selId = selectedAnnotationIdRef.current;
       if (selId && !textDraftRef.current) {
         const prev = annotationsRef.current;
         const idx = prev.findIndex((item) => item.id === selId && isEditableAnnotation(item));
-        if (idx >= 0 && prev[idx]!.color !== hex) {
-          pushUndoSnapshot(prev);
-          const next = prev.map((item, i) => (i === idx ? { ...item, color: hex } : item));
-          annotationsRef.current = next;
-          setAnnotations(next);
+        if (idx >= 0) {
+          if (prev[idx]!.color !== hex) {
+            pushUndoSnapshot(prev);
+            const next = prev.map((item, i) => (i === idx ? { ...item, color: hex } : item));
+            annotationsRef.current = next;
+            setAnnotations(next);
+          }
+          return;
         }
       }
+      activeColorRef.current = hex;
+      setActiveColor(hex);
     },
     [pushUndoSnapshot],
   );
@@ -781,16 +777,6 @@ export function TranslateOverlay() {
           ? prev.findIndex((item) => item.id === selId && isEditableAnnotation(item))
           : -1;
       const target = idx >= 0 ? (prev[idx] as EditableAnnotation) : null;
-      const inTextContext =
-        target?.kind === "text" || (!target && activeToolRef.current === "text");
-
-      if (inTextContext) {
-        textFontSizeRef.current = preset.fontSize;
-        setTextFontSize(preset.fontSize);
-      } else {
-        sizePresetRef.current = preset;
-        setActiveSize(sizeId);
-      }
 
       if (target) {
         const updated: EditableAnnotation =
@@ -810,6 +796,15 @@ export function TranslateOverlay() {
           setAnnotations(next);
           setTransformRevision((r) => r + 1);
         }
+        return;
+      }
+
+      if (activeToolRef.current === "text") {
+        textFontSizeRef.current = preset.fontSize;
+        setTextFontSize(preset.fontSize);
+      } else {
+        sizePresetRef.current = preset;
+        setActiveSize(sizeId);
       }
     },
     [pushUndoSnapshot, stageRect.h, stageRect.w],
@@ -827,9 +822,6 @@ export function TranslateOverlay() {
       const baseFs = selText ? selText.fontSize : textFontSizeRef.current;
       const nextFs = clampTextFontSize(baseFs + delta);
 
-      textFontSizeRef.current = nextFs;
-      setTextFontSize(nextFs);
-
       if (selText) {
         const updated = applyTextAnnotationFontSize(
           selText,
@@ -845,7 +837,11 @@ export function TranslateOverlay() {
           setAnnotations(next);
           setTransformRevision((r) => r + 1);
         }
+        return;
       }
+
+      textFontSizeRef.current = nextFs;
+      setTextFontSize(nextFs);
     },
     [pushUndoSnapshot, stageRect.h, stageRect.w],
   );
@@ -891,14 +887,18 @@ export function TranslateOverlay() {
     return typeof pid === "number" && pid !== activeId;
   }, []);
 
+  const isAcceptedTransformButton = useCallback((button: number, ctrlKey = false) => {
+    return (button === 0 && !ctrlKey) || button === 2;
+  }, []);
+
   const handleTransformMouseDown = useCallback(
     (event: { button: number; ctrlKey?: boolean; preventDefault: () => void; stopPropagation?: () => void }) => {
-      if (event.button === 0 && !event.ctrlKey) {
+      event.stopPropagation?.();
+      if (isAcceptedTransformButton(event.button, Boolean(event.ctrlKey)) || event.ctrlKey) {
         event.preventDefault();
-        event.stopPropagation?.();
       }
     },
-    [],
+    [isAcceptedTransformButton],
   );
 
   const beginAnnotationTransform = useCallback(
@@ -906,9 +906,13 @@ export function TranslateOverlay() {
       event: ReactPointerEvent<Element>,
       buildTransform: (baseList: Annotation[], startRaw: AnnotationPoint) => ActiveTransform | null,
     ) => {
-      if (event.button !== 0 || event.ctrlKey || draftAnnotationRef.current) return;
-      event.preventDefault?.();
       event.stopPropagation();
+      if (isAcceptedTransformButton(event.button, Boolean(event.ctrlKey)) || event.ctrlKey) {
+        event.preventDefault?.();
+      }
+      if (!isAcceptedTransformButton(event.button, Boolean(event.ctrlKey)) || draftAnnotationRef.current) {
+        return;
+      }
       if (openPopoverRef.current !== "none") {
         openPopoverRef.current = "none";
         setOpenPopover("none");
@@ -930,7 +934,7 @@ export function TranslateOverlay() {
       activeTransformRef.current = tf;
       setIsTransforming(true);
     },
-    [ensureOverlayWindowFocused, flushTextDraft, rawStagePoint],
+    [ensureOverlayWindowFocused, flushTextDraft, isAcceptedTransformButton, rawStagePoint],
   );
 
   const startMoveAnnotation = useCallback(
@@ -986,7 +990,6 @@ export function TranslateOverlay() {
           startRaw,
           startAnnotation: target,
           beforeList: baseList,
-          beforeTextFontSize: textFontSizeRef.current,
         };
       });
     },
@@ -1039,10 +1042,6 @@ export function TranslateOverlay() {
         const nextList = currentList.map((item, i) => (i === idx ? updated : item));
         annotationsRef.current = nextList;
         setAnnotations(nextList);
-        if (tf.mode === "resize-text" && updated.kind === "text") {
-          textFontSizeRef.current = updated.fontSize;
-          setTextFontSize(updated.fontSize);
-        }
       }
     },
     [rawStagePoint, stageRect.h, stageRect.w],
@@ -1233,11 +1232,7 @@ export function TranslateOverlay() {
         const nextList = [...annotationsRef.current, current];
         annotationsRef.current = nextList;
         setAnnotations(nextList);
-        if (current.kind === "rect" || current.kind === "ellipse") {
-          selectedAnnotationIdRef.current = current.id;
-          setSelectedAnnotationId(current.id);
-          setTransformRevision((r) => r + 1);
-        }
+        setTransformRevision((r) => r + 1);
       }
       setDraftAnnotation(null);
     },
@@ -1657,10 +1652,17 @@ export function TranslateOverlay() {
                     : "cursor-crosshair"
               }`}
             >
-              {annotations.map((item) => (
-                <AnnotationShape key={item.id} item={item} stageWidth={stageRect.w} />
-              ))}
-              {draftAnnotation && <AnnotationShape item={draftAnnotation} stageWidth={stageRect.w} />}
+              <defs>
+                <clipPath id="capture-stage-clip">
+                  <rect x={0} y={0} width={stageRect.w} height={stageRect.h} />
+                </clipPath>
+              </defs>
+              <g data-testid="capture-annotations-clipped" clipPath="url(#capture-stage-clip)">
+                {annotations.map((item) => (
+                  <AnnotationShape key={item.id} item={item} stageWidth={stageRect.w} />
+                ))}
+                {draftAnnotation && <AnnotationShape item={draftAnnotation} stageWidth={stageRect.w} />}
+              </g>
 
               {canInteractAnnotations &&
                 annotations.map((ann) => {
@@ -1736,6 +1738,22 @@ export function TranslateOverlay() {
               {canInteractAnnotations &&
                 selectedAnnotation &&
                 (() => {
+                  const clampGizmoHandleCenter = (hx: number, hy: number) => {
+                    let cx = hx;
+                    let cy = hy;
+                    if (effectiveViewW >= 8) {
+                      const minX = 4 - stageRect.x;
+                      const maxX = Math.max(minX, effectiveViewW - 4 - stageRect.x);
+                      cx = Math.min(Math.max(minX, cx), maxX);
+                    }
+                    if (viewH >= 8) {
+                      const minY = 4 - stageRect.y;
+                      const maxY = Math.max(minY, viewH - 4 - stageRect.y);
+                      cy = Math.min(Math.max(minY, cy), maxY);
+                    }
+                    return { x: cx, y: cy };
+                  };
+
                   if (selectedAnnotation.kind !== "text") {
                     const r = normalizeRect(
                       selectedAnnotation.x1,
@@ -1763,27 +1781,30 @@ export function TranslateOverlay() {
                           pointerEvents="none"
                           style={{ pointerEvents: "none" }}
                         />
-                        {orderedHandles.map((h) => (
-                          <rect
-                            key={h.handle}
-                            data-testid={`annotation-handle-${h.handle}`}
-                            data-hit-rect="true"
-                            x={h.x - 4}
-                            y={h.y - 4}
-                            width={8}
-                            height={8}
-                            rx={1.5}
-                            fill="#ffffff"
-                            stroke="#2f7cf6"
-                            strokeWidth={1.5}
-                            pointerEvents="all"
-                            style={{ pointerEvents: "all", cursor: h.cursor }}
-                            onMouseDown={handleTransformMouseDown}
-                            onPointerDown={(e) =>
-                              startResizeShapeAnnotation(selectedAnnotation.id, h.handle, e)
-                            }
-                          />
-                        ))}
+                        {orderedHandles.map((h) => {
+                          const hc = clampGizmoHandleCenter(h.x, h.y);
+                          return (
+                            <rect
+                              key={h.handle}
+                              data-testid={`annotation-handle-${h.handle}`}
+                              data-hit-rect="true"
+                              x={hc.x - 4}
+                              y={hc.y - 4}
+                              width={8}
+                              height={8}
+                              rx={1.5}
+                              fill="#ffffff"
+                              stroke="#2f7cf6"
+                              strokeWidth={1.5}
+                              pointerEvents="all"
+                              style={{ pointerEvents: "all", cursor: h.cursor }}
+                              onMouseDown={handleTransformMouseDown}
+                              onPointerDown={(e) =>
+                                startResizeShapeAnnotation(selectedAnnotation.id, h.handle, e)
+                              }
+                            />
+                          );
+                        })}
                       </g>
                     );
                   }
@@ -1811,27 +1832,30 @@ export function TranslateOverlay() {
                         pointerEvents="none"
                         style={{ pointerEvents: "none" }}
                       />
-                      {handles.map((h) => (
-                        <rect
-                          key={h.handle}
-                          data-testid={`annotation-handle-${h.handle}`}
-                          data-hit-rect="true"
-                          x={h.x - 4}
-                          y={h.y - 4}
-                          width={8}
-                          height={8}
-                          rx={1.5}
-                          fill="#ffffff"
-                          stroke="#2f7cf6"
-                          strokeWidth={1.5}
-                          pointerEvents="all"
-                          style={{ pointerEvents: "all", cursor: h.cursor }}
-                          onMouseDown={handleTransformMouseDown}
-                          onPointerDown={(e) =>
-                            startResizeTextAnnotation(selectedAnnotation.id, h.handle, e)
-                          }
-                        />
-                      ))}
+                      {handles.map((h) => {
+                        const hc = clampGizmoHandleCenter(h.x, h.y);
+                        return (
+                          <rect
+                            key={h.handle}
+                            data-testid={`annotation-handle-${h.handle}`}
+                            data-hit-rect="true"
+                            x={hc.x - 4}
+                            y={hc.y - 4}
+                            width={8}
+                            height={8}
+                            rx={1.5}
+                            fill="#ffffff"
+                            stroke="#2f7cf6"
+                            strokeWidth={1.5}
+                            pointerEvents="all"
+                            style={{ pointerEvents: "all", cursor: h.cursor }}
+                            onMouseDown={handleTransformMouseDown}
+                            onPointerDown={(e) =>
+                              startResizeTextAnnotation(selectedAnnotation.id, h.handle, e)
+                            }
+                          />
+                        );
+                      })}
                     </g>
                   );
                 })()}

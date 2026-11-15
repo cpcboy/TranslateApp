@@ -2412,7 +2412,7 @@ describe("TranslateOverlay 运行时状态机与工具条回归测试", () => {
       getBoundingClientRect: () => ({ left: 100, top: 20, width: 440, height: 260 }),
     };
 
-    // 1) 画一个矩形 (40, 30) -> (160, 110)，松手后自动进入选中态并渲染 8 个缩放控制柄
+    // 1) 画一个矩形 (40, 30) -> (160, 110)：方案 A 下松手不自动置为选中态；点击描边命中区后进入选中态并渲染 8 个缩放控制柄
     (findToolbarProps(root)!.onSelectTool as (tool: "rect") => void)("rect");
     root = renderOverlay();
 
@@ -2431,6 +2431,30 @@ describe("TranslateOverlay 运行时状态机与工具条回归测试", () => {
     }
     for (const fn of windowState.listeners.get("pointerup") ?? []) {
       fn({ pointerId: 21, clientX: 260, clientY: 130 });
+    }
+    root = renderOverlay();
+
+    expect(findElement(root, (el) => el.props["data-testid"] === "annotation-selection-gizmo")).toBeNull();
+
+    const getRenderedShapes = (tree: El) => {
+      const svg = findElement(tree, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+      return findAllElements(svg, (el) => typeof el.type === "function" && "item" in el.props);
+    };
+    const firstRectId = (getRenderedShapes(root)[0]!.props.item as { id: string }).id;
+    const firstRectHit = findElement(
+      root,
+      (el) => el.props["data-testid"] === `annotation-hit-${firstRectId}`,
+    )!;
+    (firstRectHit.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 210,
+      clientX: 140,
+      clientY: 50,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    for (const fn of windowState.listeners.get("pointerup") ?? []) {
+      fn({ pointerId: 210, clientX: 140, clientY: 50 });
     }
     root = renderOverlay();
 
@@ -2465,10 +2489,6 @@ describe("TranslateOverlay 运行时状态机与工具条回归测试", () => {
     }
     root = renderOverlay();
 
-    const getRenderedShapes = (tree: El) => {
-      const svg = findElement(tree, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
-      return findAllElements(svg, (el) => typeof el.type === "function" && "item" in el.props);
-    };
     let shapes = getRenderedShapes(root);
     expect(shapes).toHaveLength(1);
     const rectItemAfterResize = shapes[0]!.props.item as { id: string; x1: number; y1: number; x2: number; y2: number };
@@ -2499,7 +2519,7 @@ describe("TranslateOverlay 运行时状态机与工具条回归测试", () => {
     shapes = getRenderedShapes(root);
     expect(shapes[0]!.props.item).toMatchObject({ x1: 60, y1: 45, x2: 250, y2: 175 });
 
-    // 4) 画一个椭圆并用右中边 e 控制柄调宽边框
+    // 4) 画一个椭圆，点选描边后用右中边 e 控制柄调宽边框
     (findToolbarProps(root)!.onSelectTool as (tool: "ellipse") => void)("ellipse");
     root = renderOverlay();
     const svgEllipse = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
@@ -2514,6 +2534,24 @@ describe("TranslateOverlay 运行时状态机与工具条回归测试", () => {
     root = renderOverlay();
     for (const fn of windowState.listeners.get("pointerup") ?? []) {
       fn({ pointerId: 24, clientX: 450, clientY: 130 }); // x=350, y=110
+    }
+    root = renderOverlay();
+    expect(findElement(root, (el) => el.props["data-testid"] === "annotation-selection-gizmo")).toBeNull();
+    const ellipseId = (getRenderedShapes(root)[1]!.props.item as { id: string }).id;
+    const ellipseHit = findElement(
+      root,
+      (el) => el.props["data-testid"] === `annotation-hit-${ellipseId}`,
+    )!;
+    (ellipseHit.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 240,
+      clientX: 450,
+      clientY: 95,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    for (const fn of windowState.listeners.get("pointerup") ?? []) {
+      fn({ pointerId: 240, clientX: 450, clientY: 95 });
     }
     root = renderOverlay();
     const eHandle = findElement(root, (el) => el.props["data-testid"] === "annotation-handle-e")!;
@@ -2581,9 +2619,10 @@ describe("TranslateOverlay 运行时状态机与工具条回归测试", () => {
       fontSize: number;
     };
     expect(committedText0).toMatchObject({ kind: "text", x: 126, y: 93, fontSize: 20 });
-    expect(findToolbarProps(root)!.selectedAnnotationKind).toBe("text");
+    // 方案 A：回车提交后不自动置为选中态，方便直接换色/换字号写下一处；拖拽文字热区即一步选中并平移
+    expect(findToolbarProps(root)!.selectedAnnotationKind).toBeNull();
 
-    // 6) 拖拽已提交文字平移 (+40, +30) -> (166, 123)
+    // 6) 拖拽已提交文字平移 (+40, +30) -> (166, 123) 并置为选中态
     const textHit = findElement(
       root,
       (el) => el.props["data-testid"] === `annotation-hit-${committedText0.id}`,
@@ -2597,6 +2636,7 @@ describe("TranslateOverlay 运行时状态机与工具条回归测试", () => {
       stopPropagation: () => {},
     });
     root = renderOverlay();
+    expect(findToolbarProps(root)!.selectedAnnotationKind).toBe("text");
     for (const fn of windowState.listeners.get("pointermove") ?? []) {
       fn({ pointerId: 27, clientX: 280, clientY: 150 });
     }
@@ -2671,8 +2711,27 @@ describe("TranslateOverlay 运行时状态机与工具条回归测试", () => {
     root = renderOverlay();
     expect(getRenderedShapes(root)[2]!.props.item).toMatchObject({ x: 126, y: 93, fontSize: 20 });
 
-    // 10) 关闭激活工具 (none) 后仍可点选已有标注调样式，点空白画布取消选中且收起二级属性条
+    // 10) [P1-1a] 主动关闭激活工具 (onSelectTool("none")) 时立即清空残留选中框与属性条；在 none 模式下仍可点选已有标注，点空白画布再收起
     (findToolbarProps(root)!.onSelectTool as (tool: "none") => void)("none");
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.selectedAnnotationKind).toBeNull();
+    expect(findElement(root, (el) => el.props["data-testid"] === "annotation-selection-gizmo")).toBeNull();
+
+    const textHitInNone = findElement(
+      root,
+      (el) => el.props["data-testid"] === `annotation-hit-${committedText0.id}`,
+    )!;
+    (textHitInNone.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 295,
+      clientX: 230,
+      clientY: 120,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    for (const fn of windowState.listeners.get("pointerup") ?? []) {
+      fn({ pointerId: 295, clientX: 230, clientY: 120 });
+    }
     root = renderOverlay();
     expect(findToolbarProps(root)!.selectedAnnotationKind).toBe("text");
 
@@ -2682,16 +2741,22 @@ describe("TranslateOverlay 运行时状态机与工具条回归测试", () => {
     expect(findToolbarProps(root)!.selectedAnnotationKind).toBeNull();
     expect(findElement(root, (el) => el.props["data-testid"] === "annotation-selection-gizmo")).toBeNull();
 
-    // 11) [QC-P2 回归] 形状线宽 (activeSize) 与新建文字默认字号 (textFontSize) 互不串扰；点选/平移旧文字不污染全局默认字号
+    // 11) [QC-P2 回归] 形状线宽 (activeSize) 与新建文字默认字号 (textFontSize) 互不串扰；点选并修改旧对象不污染全局默认参数
+    (findToolbarProps(root)!.onSelectTool as (tool: "rect") => void)("rect");
+    root = renderOverlay();
+    (findToolbarProps(root)!.onSelectSize as (s: "lg") => void)("lg");
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.activeSize).toBe("lg");
+
     (findToolbarProps(root)!.onSelectTool as (tool: "text") => void)("text");
     root = renderOverlay();
-    // 将新建文字默认字号设为 36px
-    const currentDefaultFs = Number(findToolbarProps(root)!.currentFontSize ?? 18);
-    (findToolbarProps(root)!.onAdjustFontSize as (delta: number) => void)(36 - currentDefaultFs);
+    // 将新建文字默认字号设为 36px（因此前缩放单个文字未污染全局默认字号，基础仍为 20px）
+    expect(findToolbarProps(root)!.currentFontSize).toBe(20);
+    (findToolbarProps(root)!.onAdjustFontSize as (delta: number) => void)(16);
     root = renderOverlay();
     expect(findToolbarProps(root)!.currentFontSize).toBe(36);
 
-    // 点选并改粗已有矩形 (lg -> strokeWidth=6)，不得把全局新建文字默认字号 36px 重置成 24px
+    // 点选并改细已有矩形 (sm -> strokeWidth=2)，仅改该矩形，不污染全局默认线宽 lg 与文字默认字号 36px
     const rectHitSelect = findElement(
       root,
       (el) => el.props["data-testid"] === `annotation-hit-${rectItemAfterResize.id}`,
@@ -2709,9 +2774,9 @@ describe("TranslateOverlay 运行时状态机与工具条回归测试", () => {
     }
     root = renderOverlay();
     expect(findToolbarProps(root)!.selectedAnnotationKind).toBe("rect");
-    (findToolbarProps(root)!.onSelectSize as (s: "lg") => void)("lg");
+    (findToolbarProps(root)!.onSelectSize as (s: "sm") => void)("sm");
     root = renderOverlay();
-    expect((getRenderedShapes(root)[0]!.props.item as { strokeWidth: number }).strokeWidth).toBe(6);
+    expect((getRenderedShapes(root)[0]!.props.item as { strokeWidth: number }).strokeWidth).toBe(2);
 
     // [QC-P3-1 回归] 选中态按第 1 次 Escape 仅取消选中，不关闭覆盖窗；取消选中后新建文字字号仍保持 36px！
     ipcMock.closeOverlay.mockClear();
@@ -2748,7 +2813,7 @@ describe("TranslateOverlay 运行时状态机与工具条回归测试", () => {
     root = renderOverlay();
     expect(findToolbarProps(root)!.currentFontSize).toBe(36);
 
-    // 将新建文字字号点到 14px，切回矩形工具时 activeSize 仍为 "lg"（不被篡改为 "sm"）
+    // 将新建文字字号点到 14px，切回矩形工具时 activeSize 仍为 "lg"（不被选中矩形临时调细 sm 或文字调字号篡改）
     (findToolbarProps(root)!.onAdjustFontSize as (delta: number) => void)(-22);
     root = renderOverlay();
     expect(findToolbarProps(root)!.currentFontSize).toBe(14);
@@ -2790,5 +2855,256 @@ describe("TranslateOverlay 运行时状态机与工具条回归测试", () => {
       (el) => el.type === "div" && String(el.props.className ?? "").includes("w-px"),
     );
     expect(subbarDividers).toHaveLength(1);
+  });
+
+  it("[FIX-QC-ANNOTATION-INTERACTION] 连续多色多粗细批注不篡改前项、关工具清选中、副键拖手柄不衍生新框、SVG 画布裁剪与贴顶边手柄防削半", async () => {
+    windowState.innerWidth = 640;
+    windowState.innerHeight = 262;
+    ipcMock.captureBlocks.mockResolvedValue({
+      blocks: [sampleBlock()],
+      error: null,
+      notice: null,
+      stage: "done",
+      generation: 120,
+      revision: 1,
+      has_image: true,
+      scale: 2,
+      target_lang: "zh",
+      bounds: { w: 640, h: 262 },
+      image_rect: { x: 80, y: 0, w: 480, h: 190 },
+    });
+
+    let root = renderOverlay();
+    await flush();
+    root = renderOverlay();
+
+    const stageDiv = findElement(root, (el) => el.props["data-testid"] === "capture-stage")!;
+    const stageRefObj = (stageDiv.props.ref ?? (stageDiv as unknown as { ref?: unknown }).ref) as {
+      current: unknown;
+    };
+    stageRefObj.current = {
+      getBoundingClientRect: () => ({ left: 80, top: 0, width: 480, height: 190 }),
+    };
+
+    const getRenderedShapes = (tree: El) => {
+      const svg = findElement(tree, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+      return findAllElements(svg, (el) => typeof el.type === "function" && "item" in el.props);
+    };
+
+    // 1) [P1-1b] 同工具连续画红细框 + 黄粗框：第 1 个红框绝不被后续换色/换粗细篡改
+    (findToolbarProps(root)!.onSelectTool as (tool: "rect") => void)("rect");
+    root = renderOverlay();
+
+    const svgDraw1 = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svgDraw1.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 401,
+      clientX: 100, // stage x=20
+      clientY: 0, // stage y=0（贴窗口顶边）
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+    for (const fn of windowState.listeners.get("pointerup") ?? []) {
+      fn({ pointerId: 401, clientX: 200, clientY: 60 }); // stage (120, 60)
+    }
+    root = renderOverlay();
+
+    (findToolbarProps(root)!.onSelectColor as (hex: string) => void)("#ffcc00");
+    (findToolbarProps(root)!.onSelectSize as (s: "lg") => void)("lg");
+    root = renderOverlay();
+
+    const svgDraw2 = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svgDraw2.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 402,
+      clientX: 240, // stage x=160
+      clientY: 20,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+    for (const fn of windowState.listeners.get("pointerup") ?? []) {
+      fn({ pointerId: 402, clientX: 340, clientY: 80 }); // stage (260, 80)
+    }
+    root = renderOverlay();
+
+    let shapes = getRenderedShapes(root);
+    expect(shapes).toHaveLength(2);
+    const rect1 = shapes[0]!.props.item as { id: string; color: string; strokeWidth: number; x2: number; y2: number };
+    const rect2 = shapes[1]!.props.item as { id: string; color: string; strokeWidth: number };
+    expect(rect1).toMatchObject({ color: "#ff3b30", strokeWidth: 4 });
+    expect(rect2).toMatchObject({ color: "#ffcc00", strokeWidth: 6 });
+
+    // 2) [P1-3] SVG 使用 <clipPath id="capture-stage-clip"> 包裹批注渲染层，但选中控制柄位于裁剪组之外
+    const svgRoot = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    const clipEl = findElement(svgRoot, (el) => el.type === "clipPath" && el.props.id === "capture-stage-clip")!;
+    expect(clipEl).not.toBeNull();
+    const clipRect = findElement(clipEl, (el) => el.type === "rect")!;
+    expect(clipRect.props).toMatchObject({ x: 0, y: 0, width: 480, height: 190 });
+    const clippedGroup = findElement(
+      svgRoot,
+      (el) => el.props["data-testid"] === "capture-annotations-clipped",
+    )!;
+    expect(clippedGroup.props.clipPath).toBe("url(#capture-stage-clip)");
+
+    // 3) [P2-2] 点选贴顶边 (y=0) 的第 1 个矩形：顶部 nw/n/ne 8×8 控制柄 y 钳在 >= 0，不被窗口顶边裁掉一半
+    const rect1Hit = findElement(root, (el) => el.props["data-testid"] === `annotation-hit-${rect1.id}`)!;
+    (rect1Hit.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 403,
+      clientX: 100,
+      clientY: 20,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    for (const fn of windowState.listeners.get("pointerup") ?? []) {
+      fn({ pointerId: 403, clientX: 100, clientY: 20 });
+    }
+    root = renderOverlay();
+    expect(
+      findElement(
+        findElement(root, (el) => el.props["data-testid"] === "capture-annotations-clipped")!,
+        (el) => el.props["data-testid"] === "annotation-selection-gizmo",
+      ),
+    ).toBeNull();
+    const gizmo = findElement(root, (el) => el.props["data-testid"] === "annotation-selection-gizmo")!;
+    for (const topDir of ["nw", "n", "ne"]) {
+      const hEl = findElement(gizmo, (el) => el.props["data-testid"] === `annotation-handle-${topDir}`)!;
+      expect(Number(hEl.props.y)).toBeGreaterThanOrEqual(0);
+    }
+
+    // 4) [P1-2] Magic Mouse / 触控板副键 (button=2) 拖拽右下角 se 控制点：正常缩放边框且拦截冒泡，绝不衍生重叠新框
+    const seHandle = findElement(gizmo, (el) => el.props["data-testid"] === "annotation-handle-se")!;
+    let stoppedProp = false;
+    (seHandle.props.onPointerDown as (e: unknown) => void)({
+      button: 2,
+      ctrlKey: false,
+      pointerId: 404,
+      clientX: 200,
+      clientY: 60,
+      preventDefault: () => {},
+      stopPropagation: () => {
+        stoppedProp = true;
+      },
+    });
+    expect(stoppedProp).toBe(true);
+    root = renderOverlay();
+    for (const fn of windowState.listeners.get("pointermove") ?? []) {
+      fn({ pointerId: 404, clientX: 230, clientY: 95 });
+    }
+    for (const fn of windowState.listeners.get("pointerup") ?? []) {
+      fn({ pointerId: 404, clientX: 230, clientY: 95 });
+    }
+    root = renderOverlay();
+    shapes = getRenderedShapes(root);
+    expect(shapes).toHaveLength(2);
+    expect(shapes[0]!.props.item).toMatchObject({ x1: 20, y1: 0, x2: 150, y2: 95 });
+
+    // 拒绝分支 (button=0, ctrlKey=true) 同样必须拦截冒泡
+    let ctrlStopped = false;
+    const seHandleCtrl = findElement(root, (el) => el.props["data-testid"] === "annotation-handle-se")!;
+    (seHandleCtrl.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      ctrlKey: true,
+      pointerId: 405,
+      clientX: 230,
+      clientY: 95,
+      preventDefault: () => {},
+      stopPropagation: () => {
+        ctrlStopped = true;
+      },
+    });
+    expect(ctrlStopped).toBe(true);
+
+    // 5) [P1-1a] 再次点击当前高亮的「矩形」按钮退出工具 (onSelectTool("none")) 时，控制柄与二级属性条立即消失
+    const expandedBarBeforeOff = (() => {
+      const anchor = findElement(root, (el) => el.props["data-testid"] === "capture-toolbar-anchor")!;
+      const comp = findElement(anchor, (el) => typeof el.type === "function")!;
+      return (comp.type as (props: unknown) => El)(comp.props);
+    })();
+    const rectBtn = findElement(expandedBarBeforeOff, (el) => el.props["aria-label"] === "矩形")!;
+    expect(rectBtn.props["aria-pressed"]).toBe(true);
+    (rectBtn.props.onClick as () => void)();
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.activeTool).toBe("none");
+    expect(findToolbarProps(root)!.selectedAnnotationKind).toBeNull();
+    expect(findElement(root, (el) => el.props["data-testid"] === "annotation-selection-gizmo")).toBeNull();
+    const expandedBarAfterOff = (() => {
+      const anchor = findElement(root, (el) => el.props["data-testid"] === "capture-toolbar-anchor")!;
+      const comp = findElement(anchor, (el) => typeof el.type === "function")!;
+      return (comp.type as (props: unknown) => El)(comp.props);
+    })();
+    expect(findElement(expandedBarAfterOff, (el) => el.props["data-testid"] === "capture-subbar")).toBeNull();
+
+    // 6) 文字工具连续两处不同颜色+不同字号批注互不篡改
+    (findToolbarProps(root)!.onSelectTool as (tool: "text") => void)("text");
+    (findToolbarProps(root)!.onSelectColor as (hex: string) => void)("#ff3b30");
+    root = renderOverlay();
+    const svgText1 = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svgText1.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 406,
+      clientX: 120,
+      clientY: 120,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+    (findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!.props.onChange as (
+      e: unknown,
+    ) => void)({ target: { value: "第一处红字" } });
+    root = renderOverlay();
+    (findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!.props.onKeyDown as (
+      e: unknown,
+    ) => void)({
+      key: "Enter",
+      shiftKey: false,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+
+    (findToolbarProps(root)!.onSelectColor as (hex: string) => void)("#007aff");
+    (findToolbarProps(root)!.onAdjustFontSize as (delta: number) => void)(8); // 18 -> 26
+    root = renderOverlay();
+    const svgText2 = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svgText2.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 407,
+      clientX: 280,
+      clientY: 120,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+    (findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!.props.onChange as (
+      e: unknown,
+    ) => void)({ target: { value: "第二处蓝大字" } });
+    root = renderOverlay();
+    (findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!.props.onKeyDown as (
+      e: unknown,
+    ) => void)({
+      key: "Enter",
+      shiftKey: false,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+
+    shapes = getRenderedShapes(root);
+    expect(shapes).toHaveLength(4);
+    expect(shapes[2]!.props.item).toMatchObject({
+      kind: "text",
+      text: "第一处红字",
+      color: "#ff3b30",
+      fontSize: 18,
+    });
+    expect(shapes[3]!.props.item).toMatchObject({
+      kind: "text",
+      text: "第二处蓝大字",
+      color: "#007aff",
+      fontSize: 26,
+    });
   });
 });

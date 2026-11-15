@@ -463,4 +463,65 @@ describe("captureAnnotations 工具函数", () => {
     expect(grownNw.x).toBeLessThan(midText.x);
     expect(grownNw.y).toBeLessThan(midText.y);
   });
+
+  it("[FIX-QC-TEXT-BOUNDARY] 多行文字放大受画布高度封顶防顶底同溢，且大字号在右侧起笔自适应向左扩宽防单字竖列", () => {
+    // [P1-3] 190px 高画布中 3 行文字拖大至 72px 时自动封顶在可完整容纳的最大字号（50px -> 3 * 63 = 189 <= 190）
+    const threeLineText: Extract<Annotation, { kind: "text" }> = {
+      id: "t-3lines",
+      kind: "text",
+      x: 24,
+      y: 20,
+      text: "第一行重要说明\n第二行补充细节\n第三行底部不溢出",
+      color: "#ff3b30",
+      fontSize: 18,
+    };
+    const cappedByApply = applyTextAnnotationFontSize(threeLineText, 72, 480, 190);
+    const cappedBounds = computeTextAnnotationBounds(cappedByApply, 480);
+    expect(cappedByApply.fontSize).toBe(50);
+    expect(cappedBounds.h).toBeLessThanOrEqual(190);
+    expect(cappedByApply.y).toBeGreaterThanOrEqual(0);
+    expect(cappedByApply.y + cappedBounds.h).toBeLessThanOrEqual(190);
+
+    // 四角缩放（含 nw / ne / sw / se）同样严格遵守画布高度封顶，且缩小字号始终放行
+    const cappedBySe = resizeTextAnnotationFontSize(threeLineText, "se", 600, 400, 480, 190);
+    expect(cappedBySe.fontSize).toBe(50);
+    expect(computeTextAnnotationBounds(cappedBySe, 480).h).toBeLessThanOrEqual(190);
+
+    const cappedByNw = resizeTextAnnotationFontSize(
+      { ...threeLineText, x: 160, y: 80 },
+      "nw",
+      -600,
+      -400,
+      480,
+      190,
+    );
+    expect(cappedByNw.fontSize).toBe(50);
+    expect(computeTextAnnotationBounds(cappedByNw, 480).h).toBeLessThanOrEqual(190);
+
+    // 若初始多行在 18px 已超超高（如 10 行 230px > 190px），点 A+ 不会反常缩小，点 A- 仍可正常缩小到 12px
+    const tenLines: Extract<Annotation, { kind: "text" }> = {
+      id: "t-10lines",
+      kind: "text",
+      x: 12,
+      y: 3,
+      text: "1\n2\n3\n4\n5\n6\n7\n8\n9\n10",
+      color: "#ffffff",
+      fontSize: 18,
+    };
+    expect(applyTextAnnotationFontSize(tenLines, 22, 480, 190).fontSize).toBe(18);
+    expect(applyTextAnnotationFontSize(tenLines, 14, 480, 190).fontSize).toBe(14);
+
+    // [P2-1] 62px 大字号在 480px 画布右侧 x=400 起笔输入「重点关注」，自动向左借宽保持单行横排，绝不挤成 4 行单字竖列
+    const largeRightDraft = computeTextBoxLayout({
+      x: 400,
+      y: 30,
+      value: "重点关注",
+      fontSize: 62,
+      stageWidth: 480,
+      stageHeight: 190,
+    });
+    expect(largeRightDraft.wrappedLines).toEqual(["重点关注"]);
+    expect(largeRightDraft.rows).toBe(1);
+    expect(largeRightDraft.left + largeRightDraft.width).toBeLessThanOrEqual(480);
+  });
 });
