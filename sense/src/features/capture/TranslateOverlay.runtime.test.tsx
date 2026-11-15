@@ -1837,4 +1837,176 @@ describe("TranslateOverlay 运行时状态机与工具条回归测试", () => {
     const subEl = findElement(renderedSub, (el) => el.props["data-testid"] === "capture-subbar")!;
     expect(String(subEl.props.className)).toContain("bottom-full");
   });
+
+  it("[FIX-ABOVE-DOCK-POPOVER-AND-GT5LINE-ZERO-JUMP] Dock 正上方矮选区向上借高后保存/语言弹层完整上翻不裁切，极端矮屏限高内滚，且 >5 行底边批注输入与提交零跳移", async () => {
+    // 1) Dock 正上方单行矮选区（1440×900 上 y=774, h=30, space_below=96pt）：
+    //    Rust 向上借高 172pt 生成 640×298 (image_rect.y=172, h=30)：
+    //    主工具条仍停在画布下方 (toolbarTop=210)，二级属性条也在下方 (subbarAbove=false) 不遮图，
+    //    而点开「存为图片 ▾」（2 项 / 3 项）与「译为 中文 ▾」时自动上翻 (popoverUp=true) 并获 >=200px 充足高度
+    windowState.innerWidth = 640;
+    windowState.innerHeight = 298;
+    ipcMock.captureBlocks.mockResolvedValue({
+      blocks: [sampleBlock()],
+      error: null,
+      notice: null,
+      stage: "done",
+      generation: 81,
+      revision: 1,
+      has_image: true,
+      scale: 2,
+      target_lang: "zh",
+      bounds: { w: 640, h: 298 },
+      image_rect: { x: 220, y: 172, w: 200, h: 30 },
+    });
+
+    let root = renderOverlay();
+    await flush();
+    root = renderOverlay();
+
+    const anchor = findElement(root, (el) => el.props["data-testid"] === "capture-toolbar-anchor")!;
+    expect((anchor.props.style as { top: number }).top).toBe(210);
+
+    const dockTb0 = findToolbarProps(root)!;
+    expect(dockTb0.popoverUp).toBe(true);
+    expect(dockTb0.subbarAbove).toBe(false);
+    expect(dockTb0.popoverMaxHeight as number).toBeGreaterThanOrEqual(200);
+
+    // 0 标注（2 项保存菜单）与语言菜单均向上展开且底部余量充足
+    for (const pop of ["save", "lang"] as const) {
+      const rendered = CaptureToolbar({
+        ...(dockTb0 as Parameters<typeof CaptureToolbar>[0]),
+        openPopover: pop,
+      }) as El;
+      const menu = findElement(rendered, (el) => el.props.role === "menu")!;
+      expect(String(menu.props.className).split(/\s+/)).toContain("bottom-full");
+      const maxH = (menu.props.style as { maxHeight: number }).maxHeight;
+      expect(maxH).toBeGreaterThanOrEqual(200);
+      expect(210 - 6 - maxH).toBeGreaterThanOrEqual(0);
+    }
+
+    // 1b) 窄屏 400×332 (isCompact 双行模式 maxWidth=392 < 608 + top_borrow=172, image_rect.y=172, h=30)：
+    //     Row 1 语言菜单 (right-0) 与 Row 2 保存菜单均向上展开且完整落在窗口内
+    windowState.innerWidth = 400;
+    windowState.innerHeight = 332;
+    const narrowDockView: CaptureView = {
+      blocks: [sampleBlock()],
+      error: null,
+      notice: null,
+      stage: "done",
+      generation: 82,
+      revision: 1,
+      has_image: true,
+      scale: 2,
+      target_lang: "zh",
+      bounds: { w: 400, h: 332 },
+      image_rect: { x: 100, y: 172, w: 200, h: 30 },
+    };
+    for (const h of ipcMock.updateHandlers) h(narrowDockView);
+    root = renderOverlay();
+    const narrowDockTb = findToolbarProps(root)!;
+    expect(narrowDockTb.popoverUp).toBe(true);
+    expect(narrowDockTb.maxWidth).toBe(392);
+    expect(narrowDockTb.popoverMaxHeight as number).toBeGreaterThanOrEqual(200);
+    for (const pop of ["save", "lang"] as const) {
+      const rendered = CaptureToolbar({
+        ...(narrowDockTb as Parameters<typeof CaptureToolbar>[0]),
+        annotationsCount: 1,
+        openPopover: pop,
+      }) as El;
+      const mainBar = findElement(rendered, (el) => el.props["data-testid"] === "capture-toolbar-main")!;
+      expect(String(mainBar.props.className).split(/\s+/)).toContain("flex-col");
+      const menu = findElement(rendered, (el) => el.props.role === "menu")!;
+      expect(String(menu.props.className).split(/\s+/)).toContain("bottom-full");
+      expect(String(menu.props.className).split(/\s+/)).toContain("right-0");
+    }
+
+    // 2) 极端矮屏幕（如整个物理视口仅 640×126，上方无任何可借空间，image_rect.y=0, h=30）：
+    //    去掉 108px 硬下限后 popoverMaxHeight 收敛至 38px（84 + 38 = 122 <= 126，留 4px 底边安全余量），靠内部 overflow-y-auto 滚动绝不冲出 NSWindow 底边
+    windowState.innerWidth = 640;
+    windowState.innerHeight = 126;
+    const tinyScreenView: CaptureView = {
+      blocks: [sampleBlock()],
+      error: null,
+      notice: null,
+      stage: "done",
+      generation: 83,
+      revision: 1,
+      has_image: true,
+      scale: 2,
+      target_lang: "zh",
+      bounds: { w: 640, h: 126 },
+      image_rect: { x: 220, y: 0, w: 200, h: 30 },
+    };
+    for (const h of ipcMock.updateHandlers) h(tinyScreenView);
+    root = renderOverlay();
+
+    const tinyTb = findToolbarProps(root)!;
+    expect(tinyTb.popoverUp).toBe(false);
+    expect(tinyTb.popoverMaxHeight).toBe(38);
+    const tinySaveToolbar = CaptureToolbar({
+      ...(tinyTb as Parameters<typeof CaptureToolbar>[0]),
+      annotationsCount: 1,
+      openPopover: "save",
+    }) as El;
+    const tinyMenu = findElement(tinySaveToolbar, (el) => el.props.role === "menu")!;
+    expect(String(tinyMenu.props.className).split(/\s+/)).toContain("overflow-y-auto");
+    expect(38 + 40 + 6 + (tinyMenu.props.style as { maxHeight: number }).maxHeight).toBeLessThanOrEqual(126);
+
+    // 3) 360×190 舞台在 (245, 66) 输入 31 字 7 行中文批注：输入态 <textarea> 文本顶边与回车提交后 <svg> 首行 <tspan> y 严格相等（0px 跳变）
+    windowState.innerWidth = 640;
+    windowState.innerHeight = 320;
+    const stageView: CaptureView = {
+      blocks: [sampleBlock()],
+      error: null,
+      notice: null,
+      stage: "done",
+      generation: 84,
+      revision: 1,
+      has_image: true,
+      scale: 2,
+      target_lang: "zh",
+      bounds: { w: 640, h: 320 },
+      image_rect: { x: 140, y: 0, w: 360, h: 190 },
+    };
+    for (const h of ipcMock.updateHandlers) h(stageView);
+    root = renderOverlay();
+
+    (findToolbarProps(root)!.onSelectTool as (tool: "text") => void)("text");
+    root = renderOverlay();
+    const svg = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svg.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 1,
+      clientX: 245,
+      clientY: 66,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+      currentTarget: {},
+    });
+    root = renderOverlay();
+
+    const sevenLineText = "底边右角七行中文批注测试看看输入态和提交态会不会发生纵向跳移呢";
+    const ta = findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!;
+    (ta.props.onChange as (e: unknown) => void)({ target: { value: sevenLineText } });
+    root = renderOverlay();
+
+    const taTyping = findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!;
+    const typingTextTop = (taTyping.props.style as { top: number }).top + 3;
+    expect(taTyping.props.rows).toBeGreaterThanOrEqual(6);
+
+    (taTyping.props.onKeyDown as (e: unknown) => void)({
+      key: "Enter",
+      shiftKey: false,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+
+    const committedSvg = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    const shapeHost = findElement(committedSvg, (el) => typeof el.type === "function" && "item" in el.props)!;
+    const shapeEl = (shapeHost.type as (props: unknown) => El)(shapeHost.props);
+    const tspans = findAllElements(shapeEl, (el) => el.type === "tspan");
+    expect(tspans.length).toBe(taTyping.props.rows);
+    expect(tspans[0]!.props.y).toBe(typingTextTop);
+  });
 });

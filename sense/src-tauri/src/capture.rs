@@ -70,6 +70,11 @@ const TOOLBAR_MIN_WIDTH: f64 = 640.0;
 const TOOLBAR_RESERVE: f64 = 96.0;
 const TOOLBAR_EXTRA_SMALL: f64 = 268.0;
 const TOOLBAR_EXTRA_NORMAL: f64 = 104.0;
+/// 工具条下拉弹层（「存为图片 ▾」3 项 /「译为 … ▾」多语种网格）舒适展开所需的最小净空；
+/// 当 Dock 正上方矮选区下方空间虽够放工具条（`>= TOOLBAR_RESERVE`）但不足以向下展开弹层时，
+/// 向上借用桌面透明区使 `image_y + image_h >= POPOVER_ABOVE_TARGET`，让弹层自动上翻且保持原图桌面坐标零偏移、借用区鼠标穿透。
+const POPOVER_COMFORT_SPACE: f64 = 196.0;
+const POPOVER_ABOVE_TARGET: f64 = 202.0;
 
 /// 选区阶段最久等这么久（sidecar 内部在 115 秒会自动取消，这里留 5 秒余量兜底）。
 const SELECT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1418,8 +1423,14 @@ fn compute_capture_window_frame(
     } else {
         TOOLBAR_RESERVE
     };
-    let extra_needed = if image_h < 220.0 {
+    let bar_h_est = if win_w < 616.0 { 76.0 } else { 44.0 };
+    let extra_small = if win_w < 616.0 {
+        300.0
+    } else {
         TOOLBAR_EXTRA_SMALL
+    };
+    let extra_needed = if image_h < 220.0 {
+        extra_small
     } else {
         TOOLBAR_EXTRA_NORMAL
     };
@@ -1428,7 +1439,22 @@ fn compute_capture_window_frame(
 
     let (win_y, win_h, image_y) = if space_below >= toolbar_reserve {
         let bottom_pad = space_below.min(extra_needed).max(toolbar_reserve);
-        (sel_y, image_h + bottom_pad, 0.0)
+        let top_borrow = if bottom_pad < bar_h_est + 8.0 + POPOVER_COMFORT_SPACE {
+            let need_above = (POPOVER_ABOVE_TARGET - image_h).max(0.0);
+            let menu_bar_guard = if sh >= 400.0 && sel_y >= sy + 38.0 {
+                sy + 38.0
+            } else {
+                sy
+            };
+            need_above.min((sel_y - menu_bar_guard).max(0.0))
+        } else {
+            0.0
+        };
+        (
+            sel_y - top_borrow,
+            top_borrow + image_h + bottom_pad,
+            top_borrow,
+        )
     } else if space_above >= toolbar_reserve {
         let top_pad = space_above.min(extra_needed).max(toolbar_reserve);
         let wy = (sel_y - top_pad).max(sy);
@@ -5485,6 +5511,48 @@ mod tests {
         assert!(narrow_bottom_line.image.y >= 128.0);
         assert_eq!(narrow_bottom_line.win.win_y + narrow_bottom_line.image.y, 580.0);
         assert!(narrow_bottom_line.win.win_y + narrow_bottom_line.win.win_h <= 700.0);
+
+        // 3d) Dock 正上方单行矮选区（如 1440×900 上 y=774, h=30，space_below=96pt >= TOOLBAR_RESERVE，或 y=710, space_below=160pt）：
+        //     下方虽够放工具条与属性条，但不够向下展开下拉菜单；必须向上借用透明空间使 image.y + image.h >= POPOVER_ABOVE_TARGET，
+        //     保证原位桌面坐标零偏移、借用区默认鼠标穿透，同时点开「存为图片 ▾」/「译为 … ▾」自动向上完整展开不越出 NSWindow
+        for &(sel_y, screen) in &[
+            (774.0, Some((0.0, 0.0, 1440.0, 900.0))),
+            (710.0, Some((0.0, 0.0, 1440.0, 900.0))),
+            (954.0, Some((0.0, 0.0, 1920.0, 1080.0))),
+        ] {
+            let s_bottom = screen.unwrap().3;
+            let above_dock = compute_capture_window_frame(200.0, sel_y, 200.0, 30.0, screen);
+            assert_eq!(above_dock.win.win_y + above_dock.image.y, sel_y);
+            assert!(above_dock.image.y > 0.0);
+            assert!(above_dock.image.y + above_dock.image.h >= POPOVER_ABOVE_TARGET);
+            assert!(above_dock.win.win_h - (above_dock.image.y + above_dock.image.h) >= TOOLBAR_RESERVE);
+            assert!(above_dock.win.win_y >= 38.0);
+            assert!(above_dock.win.win_y + above_dock.win.win_h <= s_bottom);
+            let dock_hits = default_hit_rects(
+                CaptureStage::Done,
+                Some(above_dock.image),
+                Some(OverlayBounds {
+                    w: above_dock.win.win_w,
+                    h: above_dock.win.win_h,
+                }),
+                false,
+            );
+            let dock_origin = Some((above_dock.win.win_x, above_dock.win.win_y));
+            // 上方借用的透明区域在未展开菜单时必须穿透回底层桌面窗口
+            assert!(should_ignore_cursor_events(
+                &dock_hits,
+                false,
+                dock_origin,
+                Some((above_dock.win.win_x + 300.0, above_dock.win.win_y + 40.0)),
+            ));
+        }
+
+        // 3e) 窄屏（400×700，双行工具条高 76pt）Dock 正上方矮选区（y=540, h=30, space_below=130pt）：同样向上借高防裁切
+        let narrow_above_dock = compute_capture_window_frame(100.0, 540.0, 200.0, 30.0, Some((0.0, 0.0, 400.0, 700.0)));
+        assert_eq!(narrow_above_dock.win.win_y + narrow_above_dock.image.y, 540.0);
+        assert!(narrow_above_dock.image.y + narrow_above_dock.image.h >= POPOVER_ABOVE_TARGET);
+        assert!(narrow_above_dock.win.win_h - (narrow_above_dock.image.y + narrow_above_dock.image.h) >= 128.0);
+        assert!(narrow_above_dock.win.win_y + narrow_above_dock.win.win_h <= 700.0);
 
         // 4) 全屏选区：窗口不超出屏幕
         let full = compute_capture_window_frame(0.0, 0.0, 1440.0, 900.0, bounds);

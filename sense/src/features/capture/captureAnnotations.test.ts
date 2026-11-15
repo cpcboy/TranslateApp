@@ -198,7 +198,7 @@ describe("captureAnnotations 工具函数", () => {
     expect(flatStrip.top).toBe(0);
     expect(flatStrip.maxHeight).toBeGreaterThanOrEqual(flatStrip.lineHeight + TEXT_DRAFT_PAD_Y * 2);
 
-    // 7) 超过 5 行文本时 rows 封顶为 5；宽大写字母不超出画布
+    // 7) 舞台高度充足时多行文本按实际行数展开（上限 12 行），超出舞台可容纳行数时按舞台容量封顶且与提交态零跳变
     const sixLines = computeTextBoxLayout({
       x: 10,
       y: 10,
@@ -207,7 +207,45 @@ describe("captureAnnotations 工具函数", () => {
       stageWidth: 500,
       stageHeight: 400,
     });
-    expect(sixLines.rows).toBe(5);
+    expect(sixLines.rows).toBe(6);
+
+    const fifteenLines = computeTextBoxLayout({
+      x: 10,
+      y: 320,
+      value: Array.from({ length: 15 }, (_, idx) => `L${idx + 1}`).join("\n"),
+      fontSize: 18,
+      stageWidth: 500,
+      stageHeight: 400,
+    });
+    expect(fifteenLines.rows).toBe(12);
+    const fullFifteenTextH = 15 * fifteenLines.lineHeight;
+    const expectedCommittedFifteenY = Math.max(
+      TEXT_DRAFT_PAD_Y,
+      Math.min(fifteenLines.textY, Math.max(TEXT_DRAFT_PAD_Y, 400 - fullFifteenTextH - TEXT_DRAFT_PAD_Y)),
+    );
+    expect(fifteenLines.textY).toBe(expectedCommittedFifteenY);
+
+    // 8) 360×190 画布底边偏下 (x=245, y=66) 输入折成 7 行的中文批注：输入态直接显示 7 行并实时上推 top，与回车提交态 Y 零跳变
+    const sevenLineBottom = computeTextBoxLayout({
+      x: 245,
+      y: 66,
+      value: "底边右角七行中文批注测试看看输入态和提交态会不会发生纵向跳移呢",
+      fontSize: 18,
+      stageWidth: 360,
+      stageHeight: 190,
+    });
+    expect(sevenLineBottom.wrappedLines.length).toBeGreaterThanOrEqual(6);
+    expect(sevenLineBottom.rows).toBe(sevenLineBottom.wrappedLines.length);
+    const totalBottomTextH = sevenLineBottom.wrappedLines.length * sevenLineBottom.lineHeight;
+    const committedBottomY = Math.max(
+      TEXT_DRAFT_PAD_Y,
+      Math.min(
+        sevenLineBottom.textY,
+        Math.max(TEXT_DRAFT_PAD_Y, 190 - totalBottomTextH - TEXT_DRAFT_PAD_Y),
+      ),
+    );
+    expect(sevenLineBottom.textY).toBe(committedBottomY);
+    expect(sevenLineBottom.top + sevenLineBottom.rows * sevenLineBottom.lineHeight + TEXT_DRAFT_PAD_Y * 2).toBeLessThanOrEqual(190);
 
     const wideCaps = computeTextBoxLayout({
       x: 20,

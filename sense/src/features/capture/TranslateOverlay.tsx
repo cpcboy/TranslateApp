@@ -692,10 +692,11 @@ export function TranslateOverlay() {
       : toolbarDock === "top"
         ? spaceAboveBar >= subbarNeedSpace
         : spaceBelowBar < subbarNeedSpace && spaceAboveBar >= subbarNeedSpace;
-  const popoverMaxHeight = Math.max(
-    108,
-    Math.min(220, (popoverUp ? spaceAboveBar : spaceBelowBar) - 10),
+  const maxEdgeHeight = Math.max(
+    24,
+    Math.floor((popoverUp ? spaceAboveBar : spaceBelowBar) - 10),
   );
+  const popoverMaxHeight = viewH > 0 ? Math.min(220, maxEdgeHeight) : 180;
 
   const chromeMinW = Math.max(stageRect.w, 300);
   const chromeWidth = Math.min(viewW > 0 ? viewW : chromeMinW, chromeMinW);

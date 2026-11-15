@@ -311,9 +311,15 @@ export function computeTextBoxLayout(options: {
   const wrappedLines =
     safeW > 0 ? wrapAnnotationText(value, fontSize, maxLineWidth, measureFn) : rawLines;
   const didSoftWrap = wrappedLines.length > rawLines.length;
-  const rows = Math.min(5, Math.max(1, wrappedLines.length));
-  const boxHeight = rows * lineHeight + TEXT_DRAFT_PAD_Y * 2;
-  const top = Math.max(0, Math.min(y, Math.max(0, safeH - boxHeight)));
+  const maxVisibleRows =
+    safeH > 0
+      ? Math.min(12, Math.max(1, Math.floor((safeH - TEXT_DRAFT_PAD_Y * 2) / lineHeight)))
+      : 8;
+  const rows = Math.min(maxVisibleRows, Math.max(1, wrappedLines.length));
+  const fullHeight = wrappedLines.length * lineHeight + TEXT_DRAFT_PAD_Y * 2;
+  const clampHeight =
+    safeH > 0 ? Math.min(safeH, fullHeight) : rows * lineHeight + TEXT_DRAFT_PAD_Y * 2;
+  const top = Math.max(0, Math.min(y, Math.max(0, safeH - clampHeight)));
   const contentLineWidth = Math.max(
     measureFn("输入文字", fontSize),
     ...wrappedLines.map((line) => measureFn(line, fontSize)),
