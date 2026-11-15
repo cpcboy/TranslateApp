@@ -6,6 +6,25 @@
 
 ## [0.1.2] - 2026-11-14
 
+### 新增与修复 · 2026-11-14 — 截屏自动预选鼠标所在窗口 + 二次真机 QC 复核闭环（文字批注 `<tspan>` 基线对齐、贴底矮选区属性条防裁切）
+
+**新增功能**
+
+1. **截屏自动预选当前窗口（`sense/src-tauri/tools/ocr.swift`）**：
+   - 按下截屏快捷键（`⌃⌥⌘X`）瞬间，无需先移动鼠标，即在创建全屏冻屏窗口前采集 `CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)` 窗口 Z 序快照（过滤 `< 0` 桌面小组件、`>= 20` `Dock` 全屏容器/系统菜单栏/状态栏、系统桌面宿主、透明幽灵窗、`< 24pt` 微型条以及本进程与宿主 `SENSE` PID），自动高亮预选当前鼠标所在的顶层软件窗口（框内 100% 原亮度，内缩 `#2E85FA` 蓝框 + 白色内框保证最大化贴边窗口四边可见，配尺寸气泡与防遮挡顶栏提示）。
+   - 鼠标在冻屏上移往另一软件窗口时自动跟随切换预选框（支持跨显示器局部裁剪；修复多屏下 `keyWindow` 越界 `.mouseMoved` 钳位抢焦 `[P1]`）。
+   - **单击左键（位移 `< 4pt`）**立即将当前预选窗口转为选定区域完成截图翻译；**按住左键拖动 `>= 4pt`** 立即无感切换为自由框选，完全不干扰自由选择任意截图区域（拖过 `4pt` 后若缩回 `< 12pt` 松手则留在冻屏重选而不会误截整窗；空白桌面无前置移动跳点按下时即时清空陈旧预选 `[P2]`）。
+
+**问题解决（外部二次真机 QC 复核闭环）**
+
+1. **`[P1]` SVG `<tspan>` 未显式声明 `dominantBaseline` 导致文字批注提交后上跳约 `17.41px`、顶边削头 80% 且与导出 PNG 错位**：W3C SVG 规范中 `dominant-baseline` 为非继承属性（`Inherited: no`），此前 `AnnotationShape` 仅在父级 `<text>` 上声明 `dominantBaseline="text-before-edge"`，导致子级 `<tspan x={...} y={...}>` 在 `WKWebView` 中退回 `alphabetic` 基线，整段文字画到 `item.y` 上方约 `17.41px`（超 5 行钳位至 `y = 3` 时首行落到 `-14.41px` 被画布顶边削掉 80%）。现为每个 `<tspan>` 显式设置 `dominantBaseline="text-before-edge"`，实测 `<textarea>`、终态 `<svg>` 与 Canvas Retina PNG（`ctx.textBaseline = "top"`）顶沿误差 `0.0px`。
+2. **`[P2]` 紧贴屏幕底部框选单行矮截图（如 `h = 30px`）展开二级属性条时被窗口底边裁切 80%**：`sense/src-tauri/src/capture.rs` 将 `TOOLBAR_RESERVE` 由 `56.0` 上调至 `96.0`（窄屏 `< 616px` 双行预留由 `88.0` 上调至 `128.0`，`TOOLBAR_EXTRA_NORMAL` `100.0 → 104.0`，并同步 `default_hit_rects` 窄屏高度），使贴底矮选区优先借用屏幕上方空间走 `top` 停靠；`sense/src/features/capture/TranslateOverlay.tsx` 将 `subbarAbove`（阈值 `37px`）扩展覆盖 `inside-bottom`、`top`（`spaceAboveBar >= 37` 时向上展开，避免属性条向下反盖住底部 `30px` 矮截图本体）与紧底 `bottom`（`spaceBelowBar < 37 && spaceAboveBar >= 37` 时向上展开），同步 `setCaptureHitRects` 兜底 `y` 与依赖数组。
+
+**验证与 QC 审查**
+
+- 独立软件产品 QC 代码审查员（`01300a53`）两轮对抗审查：首轮指出 **`P0 = 0, P1 = 1, P2 = 1`**（多显示器 `keyWindow` 越界 `.mouseMoved` 钳回主屏边缘冲掉副屏预选、`mouseDown` 空白桌面跳点经 `?? hoveredWindowRect` 误恢复陈旧窗口）；逐项修复并在 `ocr.swift --selftest` 补齐双屏越界移动与空白跳点回归自检后，二轮复核确认 **`P0 = 0, P1 = 0, P2 = 0`**。
+- 全量自动化套件通过：`swiftc`（`arm64`/`x86_64` `macos13.0`）+ `sense-ocr --selftest ok`、`npm run typecheck`、Vitest **32 文件 / 661 用例**、`npm run build`、`cargo test --locked` **434 用例**；原生 `SelectionWindow + FrozenSelectionView` 窗口预选/移窗切换/自由拖框覆盖及真机 `WKWebView`（`>5` 行钳位与顶边零跳变、贴底 `30px` `top` 停靠与 `640×90` 极限视口属性条零裁切）画面验收全通过。
+
 ### 版本升级 · 2026-11-14 — 升级版本号至 `0.1.2`
 
 - 鉴于 `v0.1.1` 已发布且应用内自动更新器遵循严格递增版本号比较，统一将 `sense/src-tauri/tauri.conf.json`、`sense/package.json`、`sense/package-lock.json`、`sense/src-tauri/Cargo.toml`、`sense/src-tauri/Cargo.lock` 五处版本号由 `0.1.1` 升级至 `0.1.2`（`f449661`；尚未推送远端或发布 GitHub Release，留待负责人授权）。
