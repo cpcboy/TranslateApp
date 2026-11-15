@@ -1787,6 +1787,188 @@ func runSelfTest() -> Never {
         }
     }
 
+    // 窗口自动预选：候选过滤、Z 序顶层命中、跨屏裁剪、单击确认与自由拖框互不干扰自检
+    let rawWindows: [[String: Any]] = [
+        // 0: MenuBar / Control Center 高层级应过滤
+        ["kCGWindowNumber": 100, "kCGWindowOwnerPID": 10, "kCGWindowOwnerName": "Control Center", "kCGWindowLayer": 25, "kCGWindowAlpha": 1.0, "kCGWindowBounds": ["X": 0.0, "Y": 0.0, "Width": 1440.0, "Height": 30.0]],
+        // 1: Dock 全屏容器 layer=20 必须过滤，否则会吞掉整块桌面
+        ["kCGWindowNumber": 101, "kCGWindowOwnerPID": 11, "kCGWindowOwnerName": "Dock", "kCGWindowLayer": 20, "kCGWindowAlpha": 1.0, "kCGWindowBounds": ["X": 0.0, "Y": 0.0, "Width": 1440.0, "Height": 900.0]],
+        // 2: 自身或父进程 SENSE 隐藏中的窗口必须排除
+        ["kCGWindowNumber": 102, "kCGWindowOwnerPID": 999, "kCGWindowOwnerName": "SENSE", "kCGWindowLayer": 0, "kCGWindowAlpha": 1.0, "kCGWindowBounds": ["X": 100.0, "Y": 100.0, "Width": 680.0, "Height": 520.0]],
+        // 3: 透明幽灵窗 alpha=0 必须过滤
+        ["kCGWindowNumber": 103, "kCGWindowOwnerPID": 12, "kCGWindowOwnerName": "GhostApp", "kCGWindowLayer": 0, "kCGWindowAlpha": 0.0, "kCGWindowBounds": ["X": 0.0, "Y": 0.0, "Width": 1440.0, "Height": 900.0]],
+        // 4: 极小悬浮条 (<24pt) 过滤
+        ["kCGWindowNumber": 104, "kCGWindowOwnerPID": 13, "kCGWindowOwnerName": "TinyHelper", "kCGWindowLayer": 3, "kCGWindowAlpha": 1.0, "kCGWindowBounds": ["X": 300.0, "Y": 200.0, "Width": 16.0, "Height": 16.0]],
+        // 5: 上层软件窗口 A (DingTalk)
+        ["kCGWindowNumber": 105, "kCGWindowOwnerPID": 20, "kCGWindowOwnerName": "DingTalk", "kCGWindowLayer": 0, "kCGWindowAlpha": 1.0, "kCGWindowBounds": ["X": 200.0, "Y": 120.0, "Width": 500.0, "Height": 400.0]],
+        // 6: 下层软件窗口 B (Chrome，与 A 部分重叠，右侧 700..1100 露在外面)
+        ["kCGWindowNumber": 106, "kCGWindowOwnerPID": 21, "kCGWindowOwnerName": "Google Chrome", "kCGWindowLayer": 0, "kCGWindowAlpha": 1.0, "kCGWindowBounds": ["X": 350.0, "Y": 80.0, "Width": 750.0, "Height": 600.0]],
+        // 7: 跨主副屏的窗口 C (x=-300..250，落在左副屏与主屏交界)
+        ["kCGWindowNumber": 107, "kCGWindowOwnerPID": 22, "kCGWindowOwnerName": "Terminal", "kCGWindowLayer": 0, "kCGWindowAlpha": 1.0, "kCGWindowBounds": ["X": -300.0, "Y": 600.0, "Width": 550.0, "Height": 240.0]],
+        // 8: 桌面小组件 layer < 0 必须过滤
+        ["kCGWindowNumber": 108, "kCGWindowOwnerPID": 23, "kCGWindowOwnerName": "Notification Center", "kCGWindowLayer": -2147483601, "kCGWindowAlpha": 1.0, "kCGWindowBounds": ["X": 20.0, "Y": 40.0, "Width": 360.0, "Height": 180.0]],
+    ]
+    let candidates = parseCandidateWindows(from: rawWindows, excludingPIDs: [999])
+    check(candidates.map(\.windowID) == [105, 106, 107],
+          "parseCandidateWindows：应仅保留有效软件窗口 Z 序 [105,106,107]，实际 \(candidates.map(\.windowID))")
+    check(pickHoveredWindowRect(globalPoint: CGPoint(x: 400, y: 250), candidates: candidates, screenTopLeft: primaryScreen)
+          == CGRect(x: 200, y: 120, width: 500, height: 400),
+          "pickHoveredWindowRect：重叠区域应命中上层窗口 A")
+    check(pickHoveredWindowRect(globalPoint: CGPoint(x: 850, y: 250), candidates: candidates, screenTopLeft: primaryScreen)
+          == CGRect(x: 350, y: 80, width: 750, height: 600),
+          "pickHoveredWindowRect：移到未遮挡区域应切换预选到窗口 B")
+    check(pickHoveredWindowRect(globalPoint: CGPoint(x: 60, y: 60), candidates: candidates, screenTopLeft: primaryScreen) == nil,
+          "pickHoveredWindowRect：桌面空白或小组件区域不预选窗口")
+    check(pickHoveredWindowRect(globalPoint: CGPoint(x: 100, y: 700), candidates: candidates, screenTopLeft: primaryScreen)
+          == CGRect(x: 0, y: 600, width: 250, height: 240),
+          "pickHoveredWindowRect：跨屏窗口在主屏侧应裁剪为当前屏可见局部矩形 (0,600,250,240)")
+    let leftSecondary = CGRect(x: -1440, y: 0, width: 1440, height: 900)
+    check(pickHoveredWindowRect(globalPoint: CGPoint(x: -100, y: 700), candidates: candidates, screenTopLeft: leftSecondary)
+          == CGRect(x: 1140, y: 600, width: 300, height: 240),
+          "pickHoveredWindowRect：跨屏窗口在左副屏侧应换算为副屏局部矩形 (1140,600,300,240)")
+    check(cocoaPointToTopLeft(CGPoint(x: 320, y: 650), primaryHeight: 900) == CGPoint(x: 320, y: 250),
+          "cocoaPointToTopLeft：主屏左下坐标应精确转为顶左坐标")
+
+    let winARect = CGRect(x: 200, y: 120, width: 500, height: 400)
+    check(resolvePointerRelease(
+        start: CGPoint(x: 300, y: 220),
+        end: CGPoint(x: 302, y: 221.5),
+        exceededDragSlop: false,
+        lockedHoverRect: winARect
+    ) == .selectPreselected(winARect),
+    "resolvePointerRelease：单击（含 <4pt 手抖）应将预选窗口转为选定状态")
+    check(resolvePointerRelease(
+        start: CGPoint(x: 300, y: 220),
+        end: CGPoint(x: 420, y: 310),
+        exceededDragSlop: true,
+        lockedHoverRect: winARect
+    ) == .selectCustom(start: CGPoint(x: 300, y: 220), end: CGPoint(x: 420, y: 310)),
+    "resolvePointerRelease：按下拖动 >=4pt 应走自由框选，不受窗口预选影响")
+    check(resolvePointerRelease(
+        start: CGPoint(x: 300, y: 220),
+        end: CGPoint(x: 301, y: 221),
+        exceededDragSlop: true,
+        lockedHoverRect: winARect
+    ) == .selectCustom(start: CGPoint(x: 300, y: 220), end: CGPoint(x: 301, y: 221)),
+    "resolvePointerRelease：曾拖出阈值又拖回原点的放弃手势不得误变成选中整扇窗口")
+    check(resolvePointerRelease(
+        start: CGPoint(x: 50, y: 50),
+        end: CGPoint(x: 50, y: 50),
+        exceededDragSlop: false,
+        lockedHoverRect: nil
+    ) == .stayInSelection,
+    "resolvePointerRelease：桌面空白处单击应留在截图态继续预选/框选")
+
+    // FrozenSelectionView 预选窗口高亮绘制自检：预选框内保持 100% 原图亮度，框外压暗
+    if let spacePre = CGColorSpace(name: CGColorSpace.sRGB),
+       let ctxPre = CGContext(
+        data: nil, width: 200, height: 200, bitsPerComponent: 8, bytesPerRow: 0, space: spacePre,
+        bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+       ) {
+        ctxPre.setFillColor(red: 0.9, green: 0.9, blue: 0.9, alpha: 1)
+        ctxPre.fill(CGRect(x: 0, y: 0, width: 200, height: 200))
+        if let whiteCG = ctxPre.makeImage() {
+            let coord = CaptureCoordinator(environment: [:])
+            let view = FrozenSelectionView(
+                frame: NSRect(x: 0, y: 0, width: 200, height: 200),
+                cgImage: whiteCG,
+                screenTopLeft: CGRect(x: 0, y: 0, width: 200, height: 200),
+                coordinator: coord
+            )
+            view.setHoveredWindowRect(CGRect(x: 40, y: 40, width: 120, height: 100))
+            if let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+                view.cacheDisplay(in: view.bounds, to: rep)
+                if let rendered = rep.cgImage, let r = Raster(cgImage: rendered) {
+                    let (inR, inG, inB) = r.rgb(100, 90)
+                    let (outR, outG, outB) = r.rgb(10, 180)
+                    check(inR > 215 && inG > 215 && inB > 215 && outR < 170 && outG < 170 && outB < 170,
+                          "FrozenSelectionView 窗口预选渲染：窗内应保持高亮 (>215)、窗外应压暗 (<170)，实际 in=(\(inR),\(inG),\(inB)) out=(\(outR),\(outG),\(outB))")
+                } else {
+                    check(false, "FrozenSelectionView 预选渲染无法读回位图")
+                }
+            }
+
+            // [P1/P2 回归自检] 多显示器 keyWindow 越界 mouseMoved 不得冲掉副屏预选；无 mouseMoved 直接点空白桌面不得误用陈旧窗口
+            let primaryWin = SelectionWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 200, height: 200),
+                styleMask: [.borderless],
+                backing: .buffered,
+                defer: true
+            )
+            primaryWin.contentView = view
+            let secondaryWin = SelectionWindow(
+                contentRect: NSRect(x: -200, y: 0, width: 200, height: 200),
+                styleMask: [.borderless],
+                backing: .buffered,
+                defer: true
+            )
+            let secondaryView = FrozenSelectionView(
+                frame: NSRect(x: 0, y: 0, width: 200, height: 200),
+                cgImage: whiteCG,
+                screenTopLeft: CGRect(x: -200, y: 0, width: 200, height: 200),
+                coordinator: coord
+            )
+            secondaryWin.contentView = secondaryView
+            coord.windows = [primaryWin, secondaryWin]
+            coord.views = [view, secondaryView]
+            coord.candidateWindows = [
+                CandidateWindow(windowID: 1, ownerPID: 50, layer: 0, alpha: 1.0, bounds: CGRect(x: 0, y: 20, width: 120, height: 100)),
+                CandidateWindow(windowID: 2, ownerPID: 51, layer: 0, alpha: 1.0, bounds: CGRect(x: -160, y: 30, width: 120, height: 100)),
+            ]
+            coord.updateHover(globalPoint: CGPoint(x: -100, y: 60))
+            check(secondaryView.hoveredWindowRect == CGRect(x: 40, y: 30, width: 120, height: 100) && view.hoveredWindowRect == nil,
+                  "多屏预选初态：左副屏窗口应被预选，主屏应为 nil")
+            if let outOfBoundsMove = NSEvent.mouseEvent(
+                with: .mouseMoved,
+                location: NSPoint(x: -100, y: 140),
+                modifierFlags: [],
+                timestamp: 0,
+                windowNumber: primaryWin.windowNumber,
+                context: nil,
+                eventNumber: 1,
+                clickCount: 0,
+                pressure: 0
+            ) {
+                view.mouseMoved(with: outOfBoundsMove)
+            }
+            check(secondaryView.hoveredWindowRect == CGRect(x: 40, y: 30, width: 120, height: 100) && view.hoveredWindowRect == nil,
+                  "[P1] keyWindow 收到越界 mouseMoved 时不得钳回主屏贴边抢走副屏预选")
+
+            coord.updateHover(globalPoint: CGPoint(x: 60, y: 60))
+            check(view.hoveredWindowRect == CGRect(x: 0, y: 20, width: 120, height: 100),
+                  "主屏预选：移回主屏窗口应命中 (0,20,120,100)")
+            // 不经过 mouseMoved 直接在空白桌面点按 (170, 170)（AppKit winY = 200 - 170 = 30）
+            if let jumpDown = NSEvent.mouseEvent(
+                with: .leftMouseDown,
+                location: NSPoint(x: 170, y: 30),
+                modifierFlags: [],
+                timestamp: 0,
+                windowNumber: primaryWin.windowNumber,
+                context: nil,
+                eventNumber: 2,
+                clickCount: 1,
+                pressure: 1.0
+            ), let jumpUp = NSEvent.mouseEvent(
+                with: .leftMouseUp,
+                location: NSPoint(x: 170, y: 30),
+                modifierFlags: [],
+                timestamp: 0.01,
+                windowNumber: primaryWin.windowNumber,
+                context: nil,
+                eventNumber: 3,
+                clickCount: 1,
+                pressure: 0
+            ) {
+                view.mouseDown(with: jumpDown)
+                check(view.hoveredWindowRect == nil,
+                      "[P2] 空白桌面跳点 mouseDown 应立即清空陈旧 hoveredWindowRect，不得回退旧窗口")
+                view.mouseUp(with: jumpUp)
+                check(view.hoveredWindowRect == nil,
+                      "[P2] 空白桌面跳点松手后应留在截图态且预选为 nil")
+            }
+        }
+    }
+
     if failures.isEmpty {
         print("selftest ok")
         exit(0)
@@ -1805,6 +1987,184 @@ func cocoaToTopLeftRect(_ cocoaRect: CGRect, primaryHeight: CGFloat) -> CGRect {
         width: cocoaRect.size.width,
         height: cocoaRect.size.height
     )
+}
+
+/// 把 AppKit 全局点坐标（原点在主屏左下，y 朝上）转成顶左全局点坐标（原点在主屏左上，y 朝下）。
+func cocoaPointToTopLeft(_ cocoaPoint: CGPoint, primaryHeight: CGFloat) -> CGPoint {
+    CGPoint(x: cocoaPoint.x, y: primaryHeight - cocoaPoint.y)
+}
+
+/// 桌面候选窗口快照（全局顶左逻辑坐标，按 WindowServer 从前到后的 Z 序排列）。
+struct CandidateWindow: Equatable {
+    var windowID: UInt32
+    var ownerPID: Int32
+    var layer: Int
+    var alpha: Double
+    var bounds: CGRect
+}
+
+/// 需要排除的系统桌面/背景/状态栏宿主进程（即便偶发出现 layer == 0 也不作为用户软件窗口预选）。
+private let excludedWindowOwnerNames: Set<String> = [
+    "Window Server",
+    "WindowManager",
+    "Dock",
+    "Wallpaper",
+    "WallpaperAgent",
+    "Control Center",
+    "SystemUIServer",
+    "Notification Center",
+]
+
+private func numericCGFloat(_ raw: Any?) -> CGFloat? {
+    if let d = raw as? Double, d.isFinite { return CGFloat(d) }
+    if let f = raw as? CGFloat, f.isFinite { return f }
+    if let i = raw as? Int { return CGFloat(i) }
+    if let n = raw as? NSNumber {
+        let d = n.doubleValue
+        if d.isFinite { return CGFloat(d) }
+    }
+    return nil
+}
+
+/// 从 `CGWindowListCopyWindowInfo` 字典数组筛选出可自动预选的用户软件窗口，保持从前到后的 Z 序。
+func parseCandidateWindows(from rawList: [[String: Any]], excludingPIDs: Set<Int32>) -> [CandidateWindow] {
+    var out: [CandidateWindow] = []
+    out.reserveCapacity(rawList.count)
+    for entry in rawList {
+        let isOnscreen = (entry[kCGWindowIsOnscreen as String] as? Bool) ?? true
+        if !isOnscreen { continue }
+
+        let pid: Int32
+        if let p32 = entry[kCGWindowOwnerPID as String] as? Int32 {
+            pid = p32
+        } else if let pInt = entry[kCGWindowOwnerPID as String] as? Int {
+            pid = Int32(pInt)
+        } else if let num = entry[kCGWindowOwnerPID as String] as? NSNumber {
+            pid = num.int32Value
+        } else {
+            continue
+        }
+        if excludingPIDs.contains(pid) { continue }
+
+        if let ownerName = entry[kCGWindowOwnerName as String] as? String,
+           excludedWindowOwnerNames.contains(ownerName) {
+            continue
+        }
+
+        let layer: Int
+        if let l = entry[kCGWindowLayer as String] as? Int {
+            layer = l
+        } else if let num = entry[kCGWindowLayer as String] as? NSNumber {
+            layer = num.intValue
+        } else {
+            continue
+        }
+        // 仅保留正常软件窗口（layer=0）与软件内悬浮工具面板/模态框（0..<20），
+        // 严格过滤桌面/小组件（<0）、Dock 全屏容器（20）、系统菜单栏（24）、状态栏（25）及输入法浮层
+        guard layer >= 0 && layer < 20 else { continue }
+
+        let alpha = Double(numericCGFloat(entry[kCGWindowAlpha as String]) ?? 1.0)
+        guard alpha > 0.01 else { continue }
+
+        guard let boundsDict = entry[kCGWindowBounds as String] as? [String: Any] else { continue }
+        let rect: CGRect
+        if let cgRect = CGRect(dictionaryRepresentation: boundsDict as CFDictionary) {
+            rect = cgRect
+        } else if let x = numericCGFloat(boundsDict["X"]),
+                  let y = numericCGFloat(boundsDict["Y"]),
+                  let w = numericCGFloat(boundsDict["Width"]),
+                  let h = numericCGFloat(boundsDict["Height"]) {
+            rect = CGRect(x: x, y: y, width: w, height: h)
+        } else {
+            continue
+        }
+        guard rect.width.isFinite, rect.height.isFinite, rect.width >= 24, rect.height >= 24 else {
+            continue
+        }
+
+        let winID: UInt32
+        if let u = entry[kCGWindowNumber as String] as? UInt32 {
+            winID = u
+        } else if let i = entry[kCGWindowNumber as String] as? Int, i >= 0 {
+            winID = UInt32(i)
+        } else if let num = entry[kCGWindowNumber as String] as? NSNumber {
+            winID = num.uint32Value
+        } else {
+            winID = 0
+        }
+
+        out.append(CandidateWindow(windowID: winID, ownerPID: pid, layer: layer, alpha: alpha, bounds: rect))
+    }
+    return out
+}
+
+func collectOnScreenCandidateWindows(excludingPIDs: Set<Int32>) -> [CandidateWindow] {
+    let raw = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+    return parseCandidateWindows(from: raw, excludingPIDs: excludingPIDs)
+}
+
+func screenContainsGlobalPoint(_ screenTopLeft: CGRect, _ point: CGPoint, strict: Bool) -> Bool {
+    guard screenTopLeft.width > 0, screenTopLeft.height > 0 else { return false }
+    if strict {
+        return screenTopLeft.contains(point)
+    }
+    return point.x >= screenTopLeft.minX && point.x <= screenTopLeft.maxX
+        && point.y >= screenTopLeft.minY && point.y <= screenTopLeft.maxY
+}
+
+/// 在指定显示器 `screenTopLeft` 上查找光标 `globalPoint` 正下方的最上层候选窗口，返回该显示器局部顶左矩形。
+func pickHoveredWindowRect(
+    globalPoint: CGPoint,
+    candidates: [CandidateWindow],
+    screenTopLeft: CGRect
+) -> CGRect? {
+    guard screenContainsGlobalPoint(screenTopLeft, globalPoint, strict: false) else { return nil }
+    let probe = CGPoint(
+        x: min(max(globalPoint.x, screenTopLeft.minX), max(screenTopLeft.minX, screenTopLeft.maxX - 0.01)),
+        y: min(max(globalPoint.y, screenTopLeft.minY), max(screenTopLeft.minY, screenTopLeft.maxY - 0.01))
+    )
+    guard let hit = candidates.first(where: { $0.bounds.contains(probe) }) else {
+        return nil
+    }
+    let clipped = hit.bounds.intersection(screenTopLeft)
+    guard !clipped.isNull, clipped.width >= 12, clipped.height >= 12 else {
+        return nil
+    }
+    return CGRect(
+        x: clipped.minX - screenTopLeft.minX,
+        y: clipped.minY - screenTopLeft.minY,
+        width: clipped.width,
+        height: clipped.height
+    )
+}
+
+enum PointerReleaseOutcome: Equatable {
+    case selectCustom(start: CGPoint, end: CGPoint)
+    case selectPreselected(CGRect)
+    case stayInSelection
+}
+
+let captureDragSlop: CGFloat = 4.0
+
+func hasPointerExceededDragSlop(start: CGPoint, current: CGPoint, slop: CGFloat = captureDragSlop) -> Bool {
+    hypot(current.x - start.x, current.y - start.y) >= slop
+}
+
+/// 判定鼠标左键松开时应走自由框选、确认预选窗口，还是留在冻屏继续选择。
+func resolvePointerRelease(
+    start: CGPoint,
+    end: CGPoint,
+    exceededDragSlop: Bool,
+    lockedHoverRect: CGRect?
+) -> PointerReleaseOutcome {
+    let didDrag = exceededDragSlop || hasPointerExceededDragSlop(start: start, current: end)
+    if didDrag {
+        return .selectCustom(start: start, end: end)
+    }
+    if let pre = lockedHoverRect, pre.width >= 12, pre.height >= 12 {
+        return .selectPreselected(pre)
+    }
+    return .stayInSelection
 }
 
 struct CaptureSelection: Equatable {
@@ -2146,12 +2506,18 @@ final class SelectionWindow: NSWindow {
 final class FrozenSelectionView: NSView {
     private var frozenImage: NSImage?
     private var cgImage: CGImage?
-    private let screenTopLeft: CGRect
+    let screenTopLeft: CGRect
     private let topSafeInset: CGFloat
     private weak var coordinator: CaptureCoordinator?
+    private(set) var hoveredWindowRect: CGRect?
+    private var lockedHoverRect: CGRect?
     private var dragStart: CGPoint?
     private var dragCurrent: CGPoint?
     private var isDragging = false
+    private var hasExceededDragSlop = false
+    private var trackingArea: NSTrackingArea?
+
+    var isCurrentlyDragging: Bool { isDragging }
 
     override var isFlipped: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -2180,28 +2546,53 @@ final class FrozenSelectionView: NSView {
         cgImage = nil
     }
 
+    func setHoveredWindowRect(_ rect: CGRect?) {
+        let normalized = rect?.standardized
+        guard hoveredWindowRect != normalized else { return }
+        hoveredWindowRect = normalized
+        needsDisplay = true
+    }
+
+    override func updateTrackingAreas() {
+        if let existing = trackingArea {
+            removeTrackingArea(existing)
+        }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingArea = area
+        super.updateTrackingAreas()
+    }
+
     override func resetCursorRects() {
         addCursorRect(bounds, cursor: .crosshair)
+    }
+
+    private func fillMaskOutside(_ sel: CGRect) {
+        NSColor(white: 0, alpha: 0.36).setFill()
+        NSRect(x: 0, y: 0, width: bounds.width, height: sel.minY).fill()
+        NSRect(x: 0, y: sel.maxY, width: bounds.width, height: bounds.height - sel.maxY).fill()
+        NSRect(x: 0, y: sel.minY, width: sel.minX, height: sel.height).fill()
+        NSRect(x: sel.maxX, y: sel.minY, width: bounds.width - sel.maxX, height: sel.height).fill()
     }
 
     override func draw(_ dirtyRect: NSRect) {
         guard let img = frozenImage else { return }
         img.draw(in: bounds, from: .zero, operation: .copy, fraction: 1.0, respectFlipped: true, hints: nil)
 
-        if let s = dragStart, let e = dragCurrent {
+        if isDragging && hasExceededDragSlop, let s = dragStart, let e = dragCurrent {
             let x = min(s.x, e.x)
             let y = min(s.y, e.y)
             let w = abs(e.x - s.x)
             let h = abs(e.y - s.y)
             let sel = CGRect(x: x, y: y, width: w, height: h).intersection(bounds)
 
-            // 选区外四块暗色遮罩，选区内部保持冻结原图 100% 原亮度
-            NSColor(white: 0, alpha: 0.36).setFill()
             if !sel.isNull && !sel.isEmpty {
-                NSRect(x: 0, y: 0, width: bounds.width, height: sel.minY).fill()
-                NSRect(x: 0, y: sel.maxY, width: bounds.width, height: bounds.height - sel.maxY).fill()
-                NSRect(x: 0, y: sel.minY, width: sel.minX, height: sel.height).fill()
-                NSRect(x: sel.maxX, y: sel.minY, width: bounds.width - sel.maxX, height: sel.height).fill()
+                fillMaskOutside(sel)
 
                 NSColor(white: 0, alpha: 0.55).setStroke()
                 let outer = NSBezierPath(rect: sel.insetBy(dx: -0.5, dy: -0.5))
@@ -2214,20 +2605,50 @@ final class FrozenSelectionView: NSView {
                 inner.stroke()
 
                 if sel.width >= 12 && sel.height >= 12 {
-                    drawPill("\(Int(sel.width.rounded())) × \(Int(sel.height.rounded()))", near: sel)
+                    _ = drawPill("\(Int(sel.width.rounded())) × \(Int(sel.height.rounded()))", near: sel)
                 }
             } else {
                 NSColor(white: 0, alpha: 0.22).setFill()
                 bounds.fill()
             }
-        } else {
-            NSColor(white: 0, alpha: 0.22).setFill()
-            bounds.fill()
-            drawBanner("拖动框选翻译 · Esc 取消")
+            return
         }
+
+        let activePre = (isDragging && !hasExceededDragSlop) ? lockedHoverRect : hoveredWindowRect
+        if let rawPre = activePre {
+            let pre = rawPre.intersection(bounds)
+            if !pre.isNull && pre.width >= 12 && pre.height >= 12 {
+                fillMaskOutside(pre)
+
+                // 钉钉式窗口自动预选高亮框：内缩绘制保证最大化贴边窗口四边均完整可见
+                NSColor(calibratedRed: 0.18, green: 0.52, blue: 0.98, alpha: 0.96).setStroke()
+                let outer = NSBezierPath(rect: pre.insetBy(dx: 1.0, dy: 1.0))
+                outer.lineWidth = 2.0
+                outer.stroke()
+
+                if pre.width > 8 && pre.height > 8 {
+                    NSColor.white.withAlphaComponent(0.90).setStroke()
+                    let inner = NSBezierPath(rect: pre.insetBy(dx: 2.5, dy: 2.5))
+                    inner.lineWidth = 1.0
+                    inner.stroke()
+                }
+
+                let pillRect = drawPill(
+                    "\(Int(pre.width.rounded())) × \(Int(pre.height.rounded())) · 单击选定窗口",
+                    near: pre
+                )
+                drawBanner("单击选定当前窗口 · 拖动自由框选 · Esc 取消", avoiding: pillRect)
+                return
+            }
+        }
+
+        NSColor(white: 0, alpha: 0.22).setFill()
+        bounds.fill()
+        drawBanner("移动预选窗口 · 拖动自由框选 · Esc 取消", avoiding: nil)
     }
 
-    private func drawPill(_ text: String, near sel: CGRect) {
+    @discardableResult
+    private func drawPill(_ text: String, near sel: CGRect) -> CGRect {
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium),
             .foregroundColor: NSColor.white,
@@ -2243,9 +2664,10 @@ final class FrozenSelectionView: NSView {
         NSColor(white: 0.08, alpha: 0.88).setFill()
         NSBezierPath(roundedRect: pill, xRadius: 5, yRadius: 5).fill()
         (text as NSString).draw(at: CGPoint(x: pill.minX + padX, y: pill.minY + padY), withAttributes: attrs)
+        return pill
     }
 
-    private func drawBanner(_ text: String) {
+    private func drawBanner(_ text: String, avoiding obstacle: CGRect?) {
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 12.5, weight: .medium),
             .foregroundColor: NSColor(white: 0.96, alpha: 1),
@@ -2256,50 +2678,111 @@ final class FrozenSelectionView: NSView {
         let pillW = size.width + padX * 2
         let pillH = size.height + padY * 2
         let pill = CGRect(x: (bounds.width - pillW) / 2, y: bannerTopY(topSafeInset: topSafeInset), width: pillW, height: pillH)
+        if let obs = obstacle, pill.insetBy(dx: -8, dy: -4).intersects(obs) {
+            return
+        }
         NSColor(white: 0.08, alpha: 0.86).setFill()
         NSBezierPath(roundedRect: pill, xRadius: pillH / 2, yRadius: pillH / 2).fill()
         (text as NSString).draw(at: CGPoint(x: pill.minX + padX, y: pill.minY + padY), withAttributes: attrs)
     }
 
-    private func clampedLocalPoint(_ event: NSEvent) -> CGPoint {
+    func clampedLocalPoint(_ event: NSEvent) -> CGPoint {
         let raw = convert(event.locationInWindow, from: nil)
         return CGPoint(x: min(max(raw.x, 0), bounds.width), y: min(max(raw.y, 0), bounds.height))
     }
 
+    override func mouseMoved(with event: NSEvent) {
+        guard !isDragging else { return }
+        // 多显示器下 keyWindow 仍会收到移往副屏的越界 mouseMoved，忽略本屏外的坐标防止钳回主屏边缘打乱副屏预选
+        let raw = convert(event.locationInWindow, from: nil)
+        guard bounds.contains(raw) else { return }
+        let globalPt = CGPoint(x: screenTopLeft.minX + raw.x, y: screenTopLeft.minY + raw.y)
+        coordinator?.updateHover(globalPoint: globalPt)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        guard !isDragging else { return }
+        let raw = convert(event.locationInWindow, from: nil)
+        guard bounds.contains(raw) else { return }
+        let globalPt = CGPoint(x: screenTopLeft.minX + raw.x, y: screenTopLeft.minY + raw.y)
+        coordinator?.updateHover(globalPoint: globalPt)
+    }
+
     override func mouseDown(with event: NSEvent) {
         let pt = clampedLocalPoint(event)
+        // 若 coordinator 存在则以其权威查表结果为准（落点在空白桌面返回 nil 时立即清空陈旧预选，不回退旧框）
+        let hoverAtDown = coordinator.map { $0.hoveredLocalRect(in: self, localPoint: pt) } ?? hoveredWindowRect
+        hoveredWindowRect = hoverAtDown
+        lockedHoverRect = hoverAtDown
         dragStart = pt
         dragCurrent = pt
         isDragging = true
+        hasExceededDragSlop = false
         NSCursor.crosshair.set()
         needsDisplay = true
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard isDragging else { return }
-        dragCurrent = clampedLocalPoint(event)
+        guard isDragging, let start = dragStart else { return }
+        let pt = clampedLocalPoint(event)
+        dragCurrent = pt
+        if !hasExceededDragSlop && hasPointerExceededDragSlop(start: start, current: pt) {
+            hasExceededDragSlop = true
+        }
         needsDisplay = true
     }
 
     override func mouseUp(with event: NSEvent) {
         guard isDragging, let start = dragStart else { return }
         let end = clampedLocalPoint(event)
+        let outcome = resolvePointerRelease(
+            start: start,
+            end: end,
+            exceededDragSlop: hasExceededDragSlop,
+            lockedHoverRect: lockedHoverRect
+        )
         isDragging = false
-        guard let cg = cgImage,
-              let sel = computeSelection(
-                  start: start,
-                  end: end,
-                  screenTopLeft: screenTopLeft,
-                  imageWidth: cg.width,
-                  imageHeight: cg.height
-              ) else {
-            // 误触单击 / 极小拖框：留在冻结屏幕重选，不截成大框
-            dragStart = nil
-            dragCurrent = nil
+        dragStart = nil
+        dragCurrent = nil
+        hasExceededDragSlop = false
+        lockedHoverRect = nil
+
+        switch outcome {
+        case .selectCustom(let s, let e):
+            guard let cg = cgImage,
+                  let sel = computeSelection(
+                      start: s,
+                      end: e,
+                      screenTopLeft: screenTopLeft,
+                      imageWidth: cg.width,
+                      imageHeight: cg.height
+                  ) else {
+                // 放弃的极小拖框：刷新松手点的窗口预选并留在冻结屏幕重选
+                hoveredWindowRect = coordinator?.hoveredLocalRect(in: self, localPoint: end)
+                needsDisplay = true
+                return
+            }
+            coordinator?.complete(selection: sel, screenImage: cg)
+
+        case .selectPreselected(let pre):
+            guard let cg = cgImage,
+                  let sel = computeSelection(
+                      start: pre.origin,
+                      end: CGPoint(x: pre.maxX, y: pre.maxY),
+                      screenTopLeft: screenTopLeft,
+                      imageWidth: cg.width,
+                      imageHeight: cg.height
+                  ) else {
+                hoveredWindowRect = coordinator?.hoveredLocalRect(in: self, localPoint: end)
+                needsDisplay = true
+                return
+            }
+            coordinator?.complete(selection: sel, screenImage: cg)
+
+        case .stayInSelection:
+            hoveredWindowRect = coordinator?.hoveredLocalRect(in: self, localPoint: end)
             needsDisplay = true
-            return
         }
-        coordinator?.complete(selection: sel, screenImage: cg)
     }
 
     override func rightMouseDown(with event: NSEvent) {
@@ -2319,8 +2802,10 @@ final class FrozenSelectionView: NSView {
 }
 
 final class CaptureCoordinator {
-    private var windows: [SelectionWindow] = []
-    private var views: [FrozenSelectionView] = []
+    var windows: [SelectionWindow] = []
+    var views: [FrozenSelectionView] = []
+    var candidateWindows: [CandidateWindow] = []
+    private var primaryScreenHeight: CGFloat = 0
     private var eventMonitor: Any?
     private var becomeActiveObserver: NSObjectProtocol?
     private var resignObserver: NSObjectProtocol?
@@ -2340,12 +2825,55 @@ final class CaptureCoordinator {
         self.environment = environment
     }
 
+    func hoveredLocalRect(in view: FrozenSelectionView, localPoint: CGPoint) -> CGRect? {
+        let globalPt = CGPoint(
+            x: view.screenTopLeft.minX + localPoint.x,
+            y: view.screenTopLeft.minY + localPoint.y
+        )
+        return pickHoveredWindowRect(
+            globalPoint: globalPt,
+            candidates: candidateWindows,
+            screenTopLeft: view.screenTopLeft
+        )
+    }
+
+    func updateHover(globalPoint: CGPoint) {
+        var matchedScreen = false
+        for view in views {
+            if !matchedScreen && screenContainsGlobalPoint(view.screenTopLeft, globalPoint, strict: true) {
+                matchedScreen = true
+                let rect = pickHoveredWindowRect(
+                    globalPoint: globalPoint,
+                    candidates: candidateWindows,
+                    screenTopLeft: view.screenTopLeft
+                )
+                view.setHoveredWindowRect(rect)
+            } else {
+                view.setHoveredWindowRect(nil)
+            }
+        }
+        if !matchedScreen {
+            for view in views {
+                if !matchedScreen && screenContainsGlobalPoint(view.screenTopLeft, globalPoint, strict: false) {
+                    matchedScreen = true
+                    let rect = pickHoveredWindowRect(
+                        globalPoint: globalPoint,
+                        candidates: candidateWindows,
+                        screenTopLeft: view.screenTopLeft
+                    )
+                    view.setHoveredWindowRect(rect)
+                }
+            }
+        }
+    }
+
     func start() -> Never {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
 
         let screens = NSScreen.screens
         let primaryHeight = screens.first(where: { $0.frame.origin == .zero })?.frame.height ?? screens.first?.frame.height ?? 0
+        self.primaryScreenHeight = primaryHeight
         var captures: [(screen: NSScreen, topLeft: CGRect, cg: CGImage)] = []
         for screen in screens {
             let topLeft = cocoaToTopLeftRect(screen.frame, primaryHeight: primaryHeight)
@@ -2357,6 +2885,9 @@ final class CaptureCoordinator {
             FileHandle.standardError.write("截不到屏幕画面（请检查屏幕录制权限）\n".data(using: .utf8)!)
             exit(2)
         }
+
+        // 在创建我们自己的全屏 SelectionWindow 之前采集桌面窗口 Z 序快照，并排除本进程与宿主 SENSE 进程
+        candidateWindows = collectOnScreenCandidateWindows(excludingPIDs: [getpid(), initialParentPid])
 
         // 后台预热 Vision，把冷启动藏进用户拖框时间里
         prewarmVisionInBackground()
@@ -2395,6 +2926,9 @@ final class CaptureCoordinator {
             windows.append(win)
             views.append(view)
         }
+
+        // 按下快捷键瞬间（无需移动鼠标）即按当前光标位置自动预选所在软件窗口
+        updateHover(globalPoint: cocoaPointToTopLeft(mouseGlobal, primaryHeight: primaryHeight))
 
         app.activate(ignoringOtherApps: true)
         if let kw = keyWindow {
@@ -2470,8 +3004,16 @@ final class CaptureCoordinator {
         verifyActiveWork = verifyWork
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.50, execute: verifyWork)
 
-        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .rightMouseDown]) { [weak self] event in
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .keyDown, .rightMouseDown]) { [weak self] event in
             guard let self = self else { return nil }
+            if event.type == .mouseMoved {
+                if !self.views.contains(where: { $0.isCurrentlyDragging }) {
+                    // 统一读取跨显示器全局鼠标坐标，避免 keyWindow 越界坐标被钳回主屏边缘
+                    let globalPt = cocoaPointToTopLeft(NSEvent.mouseLocation, primaryHeight: self.primaryScreenHeight)
+                    self.updateHover(globalPoint: globalPt)
+                }
+                return event
+            }
             if event.type == .rightMouseDown {
                 self.cancel()
                 return nil
@@ -2613,11 +3155,37 @@ func runCaptureMode(environment: [String: String]) -> Never {
         let screenW = CGFloat(cg.width) / CGFloat(scale)
         let screenH = CGFloat(cg.height) / CGFloat(scale)
         let screenTopLeft = CGRect(x: 0, y: 0, width: screenW, height: screenH)
-        let parts = (environment["SENSE_OCR_TEST_CAPTURE_RECT"] ?? "").split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
-        let (rx, ry, rw, rh): (CGFloat, CGFloat, CGFloat, CGFloat) = parts.count == 4
-            ? (CGFloat(parts[0]), CGFloat(parts[1]), CGFloat(parts[2]), CGFloat(parts[3]))
-            : (0, 0, screenW, screenH)
-        guard let sel = computeSelection(
+        let rectTuple: (CGFloat, CGFloat, CGFloat, CGFloat)?
+        if let winJson = environment["SENSE_OCR_TEST_WINDOWS_JSON"],
+           let clickRaw = environment["SENSE_OCR_TEST_CLICK_POINT"],
+           let data = winJson.data(using: .utf8),
+           let rawArr = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] {
+            let clickParts = clickRaw.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+            let cands = parseCandidateWindows(from: rawArr, excludingPIDs: [])
+            if clickParts.count == 2,
+               let pre = pickHoveredWindowRect(
+                   globalPoint: CGPoint(x: clickParts[0], y: clickParts[1]),
+                   candidates: cands,
+                   screenTopLeft: screenTopLeft
+               ),
+               case .selectPreselected(let confirmed) = resolvePointerRelease(
+                   start: CGPoint(x: clickParts[0], y: clickParts[1]),
+                   end: CGPoint(x: clickParts[0], y: clickParts[1]),
+                   exceededDragSlop: false,
+                   lockedHoverRect: pre
+               ) {
+                rectTuple = (confirmed.origin.x, confirmed.origin.y, confirmed.size.width, confirmed.size.height)
+            } else {
+                rectTuple = nil
+            }
+        } else {
+            let parts = (environment["SENSE_OCR_TEST_CAPTURE_RECT"] ?? "").split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+            rectTuple = parts.count == 4
+                ? (CGFloat(parts[0]), CGFloat(parts[1]), CGFloat(parts[2]), CGFloat(parts[3]))
+                : (0, 0, screenW, screenH)
+        }
+        guard let (rx, ry, rw, rh) = rectTuple,
+              let sel = computeSelection(
             start: CGPoint(x: rx, y: ry),
             end: CGPoint(x: rx + rw, y: ry + rh),
             screenTopLeft: screenTopLeft,
