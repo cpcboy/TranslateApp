@@ -192,7 +192,7 @@ macOS 上的 AI 翻译器。查一个词，给一张完整的义项卡——音�
 
 这个 `yes` 不是安全边界：脚本只是不让管道 / 无人值守的进程喂进去（`--publish` 不在交互式终端里直接拒绝，在构建之前）。真正的控制是：创建 Release 每次都需要负责人当次授权。
 
-脚本做的事：**开头**就核对版本号四处一致、`tauri.conf.json` 里的更新安全开关没被关（`requireSignedVersion`、不开明文 http）、私钥权限是 600 且和配置里的公钥一致、`SENSE Dev` 证书的 SHA-1 指纹对得上；`--publish` 的前提（`origin` 就是本仓库、`gh` 已登录、HEAD 已在 `origin/main`、这个版本没发过）也在构建之前查，不等构建完才发现。然后跑 `npm run typecheck`、`npm test`、`cargo test --locked`，不绿就停；两种芯片各构建一次（`--locked`），核对芯片、OCR 辅助程序的最低系统版本、主程序里带着配置里的更新公钥；用 `SENSE Dev` 签名（与 `install-app.sh` 同一种签法）；打成 `.app.tar.gz`，审一遍里面的成员（没有 `._` 附属文件、没有路径穿越）并解包回来再验一次签名；用更新私钥签名并绑定版本号；生成 `latest.json` 并核对；**用应用里写死的公钥给两个包真的验一次签**（`node tools/update-manifest.mjs verify …`，也可以单独拿来验任何一个 Release）。发布后把线上的 `latest.json` 和它指向的两个安装包下载回来，再用同一把公钥验一遍。
+脚本做的事：**开头**就核对版本号一致（五处版本声明须同步，脚本直接比对 `tauri.conf.json`、`package.json`、`Cargo.toml`、`Cargo.lock` 四处）、`tauri.conf.json` 里的更新安全开关没被关（`requireSignedVersion`、不开明文 http）、私钥权限是 600 且和配置里的公钥一致、`SENSE Dev` 证书的 SHA-1 指纹对得上；`--publish` 的前提（`origin` 就是本仓库、`gh` 已登录、HEAD 已在 `origin/main`、这个版本没发过）也在构建之前查，不等构建完才发现。然后跑 `npm run typecheck`、`npm test`、`cargo test --locked`，不绿就停；两种芯片各构建一次（`--locked`），核对芯片、OCR 辅助程序的最低系统版本、主程序里带着配置里的更新公钥；用 `SENSE Dev` 签名（与 `install-app.sh` 同一种签法）；打成 `.app.tar.gz`，审一遍里面的成员（没有 `._` 附属文件、没有路径穿越）并解包回来再验一次签名；用更新私钥签名并绑定版本号；生成 `latest.json` 并核对；**用应用里写死的公钥给两个包真的验一次签**（`node tools/update-manifest.mjs verify …`，也可以单独拿来验任何一个 Release）。发布后把线上的 `latest.json` 和它指向的两个安装包下载回来，再用同一把公钥验一遍。
 
 **首次基线（`v0.1.0`）与升级链验证**：`0.1.0` 是带更新器的首个已发布版本；**更早装在其他电脑上的 SENSE 没有更新器，不会自己更新**，每台要手动装一次带更新器的版本（见下面「在另一台电脑上第一次安装」）。以 `v0.1.0 → v0.1.1` 为例：
 

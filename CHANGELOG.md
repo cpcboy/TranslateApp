@@ -4,7 +4,11 @@
 
 ## [Unreleased]
 
-## [0.1.2] - 2026-11-14
+## [0.1.2] - 2026-11-15
+
+### 发布准备 · 2026-11-15 — 同步 `origin/main` 与 `v0.1.2` 双架构更新包构建验签
+
+- 经负责人复核验收通过并单次授权，将 `main`（`d7dd735..HEAD`，含 `0.1.2` 升级 `f449661` 及全部截屏交互/布局修复）无 `--force` 快进推送至 GitHub `origin/main`，确认本机 `/Applications/SENSE.app`（`0.1.2`）已签名运行，并经 `./tools/release.sh --notes-file dist-release/notes-v0.1.2.md`（清空旧 OCR sidecar 缓存后现编双芯片 `macos13.0`）完成 Apple 芯片（`aarch64`）与 Intel（`x86_64`）双架构更新包打包、`SENSE Dev` 代码签名、更新私钥绑定版本签名以及内嵌公钥 `latest.json` 验签（保留 `--publish` 供负责人在交互终端输入 `yes` 发布 GitHub Release `v0.1.2`）。
 
 ### 修复 · 2026-11-14 — 三次真机 QC 复核闭环：Dock 正上方矮选区下拉弹层防越窗截断、底边超 5 行文字批注零跳变
 
@@ -45,7 +49,7 @@
 
 ### 版本升级 · 2026-11-14 — 升级版本号至 `0.1.2`
 
-- 鉴于 `v0.1.1` 已发布且应用内自动更新器遵循严格递增版本号比较，统一将 `sense/src-tauri/tauri.conf.json`、`sense/package.json`、`sense/package-lock.json`、`sense/src-tauri/Cargo.toml`、`sense/src-tauri/Cargo.lock` 五处版本号由 `0.1.1` 升级至 `0.1.2`（`f449661`；尚未推送远端或发布 GitHub Release，留待负责人授权）。
+- 鉴于 `v0.1.1` 已发布且应用内自动更新器遵循严格递增版本号比较，统一将 `sense/src-tauri/tauri.conf.json`、`sense/package.json`、`sense/package-lock.json`、`sense/src-tauri/Cargo.toml`、`sense/src-tauri/Cargo.lock` 五处版本号由 `0.1.1` 升级至 `0.1.2`（`f449661`；已于 2026-11-15 经单次授权推送至 `origin/main` 并完成双架构更新包构建验签）。
 
 ### 修复 · 2026-11-14 — 外部真机 QC 复核闭环：四字语种与窄屏工具条自适应防裁切、画布右侧超长文字标注自动折行
 
@@ -63,8 +67,6 @@
 - **右侧边缘超长文字四端一致自动折行（`sense/src/features/capture/captureAnnotations.ts`、`TranslateOverlay.tsx`、`captureExport.ts`）**
   - `captureAnnotations.ts` 新增 `wrapAnnotationText`（支持显式 `\n`、保留行内连续空格、CJK 逐字折行与超长无空格英文/符号按词+字符兜底切分，兼容代理对字符与极窄画布），并在 `computeTextBoxLayout` 中按 `maxLineWidth = Math.max(1, maxWidth - TEXT_DRAFT_PAD_X * 2)` 同步产出 `wrappedLines` 与自增高 `rows`（`1..5` 行）。
   - `TranslateOverlay.tsx` 新增复用离屏 2D Canvas 的 `measureOverlayAnnotationText`（与导出画布统一使用 `` `600 ${fontSize}px ${OVERLAY_FONT}` ``）；移除 `<textarea wrap="off">`，改为 `whiteSpace: "pre-wrap"` + `overflow-x-hidden overflow-y-auto`；`flushTextDraft` 提交 `layout.wrappedLines.join("\n")` 并在超 5 行时向上钳位 `committedY` 防越底；`AnnotationShape` 与 `captureExport.ts`（优先调用 `ctx.measureText`）共享同一 `stageWidth - item.x - TEXT_DRAFT_PAD_X` 折行宽度，确保编辑框、终态 SVG 与 2x Retina 导出 PNG 所见即所得、0 字符被裁。
-- **测试桩修正**：同步更新 `scratch/qc_server.mjs` 中 `retranslate_capture` 事件名为 `sense://capture-update`（对齐生产 `capture.rs` 与 `ipc.ts`）。
-
 **验证与 QC 审查**
 
 - 独立软件产品 QC 代码审查员（`01300a53`）两轮对抗审查：首轮指出 **`P0 = 0, P1 = 1, P2 = 2, P3 = 2`**（`488..607px` 两行过渡区语言菜单仍走 `left-0` 致右溢、`<=355px` 极窄屏第二簇内部分隔线悬空、`ResizeObserver` 双行高度/`480..599` 区间/`ctx.measureText` 单测覆盖盲区、以及 Rust `win_w < 608` 与前端阈值微小缝隙）；逐条修复并补齐单测后二轮复核确认 **`P0 = 0, P1 = 0`**（前轮问题全部闭合，无新引入缺陷）。
