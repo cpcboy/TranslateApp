@@ -124,6 +124,7 @@ export function CaptureToolbar({
       data-testid="capture-toolbar"
       className="pointer-events-auto relative flex flex-col items-center gap-1.5 select-none"
       onClick={(e) => e.stopPropagation()}
+      onContextMenu={(e) => e.preventDefault()}
       onMouseDown={(e) => e.preventDefault()}
       onPointerDown={(e) => e.stopPropagation()}
     >

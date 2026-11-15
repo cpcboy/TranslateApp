@@ -58,6 +58,15 @@ function measureOverlayAnnotationText(line: string, fontSize: number): number {
   return estimateTextLineWidth(line, fontSize);
 }
 
+function isAnnotationTextInputTarget(target: unknown): boolean {
+  if (!target || typeof target !== "object") return false;
+  const el = target as { tagName?: unknown; dataset?: { testid?: unknown } };
+  return (
+    (typeof el.tagName === "string" && el.tagName.toUpperCase() === "TEXTAREA") ||
+    el.dataset?.testid === "annotation-text-input"
+  );
+}
+
 export function sanitizeBounds(raw: unknown): OverlayBounds | null {
   if (!raw || typeof raw !== "object") return null;
   const candidate = raw as { w?: unknown; h?: unknown };
@@ -148,6 +157,8 @@ export function TranslateOverlay() {
   const textDraftSeqRef = useRef<number>(0);
   const textInputRef = useRef<HTMLTextAreaElement | null>(null);
   const annotationsRef = useRef<Annotation[]>([]);
+  const draftAnnotationRef = useRef<Annotation | null>(null);
+  const activePointerIdRef = useRef<number | null>(null);
   const originalUrlRef = useRef<string | null>(null);
   const originalLoadPromiseRef = useRef<Promise<string | null> | null>(null);
   const toastTimerRef = useRef<number | undefined>(undefined);
@@ -186,6 +197,7 @@ export function TranslateOverlay() {
   openPopoverRef.current = openPopover;
   textDraftRef.current = textDraft;
   annotationsRef.current = annotations;
+  draftAnnotationRef.current = draftAnnotation;
   originalUrlRef.current = originalImageUrl;
   activeColorRef.current = activeColor;
   sizePresetRef.current = sizePreset;
@@ -256,13 +268,19 @@ export function TranslateOverlay() {
         setOpenPopover("none");
       }
     };
+    const onContextMenu = (event: Event) => {
+      if (isAnnotationTextInputTarget((event as { target?: unknown })?.target)) return;
+      event.preventDefault?.();
+    };
     window.addEventListener("resize", onResize);
     window.addEventListener("focus", onFocus);
     window.addEventListener("blur", onBlur);
+    window.addEventListener("contextmenu", onContextMenu, true);
     return () => {
       window.removeEventListener("resize", onResize);
       window.removeEventListener("focus", onFocus);
       window.removeEventListener("blur", onBlur);
+      window.removeEventListener("contextmenu", onContextMenu, true);
     };
   }, [focusTextDraftInput]);
 
@@ -309,6 +327,8 @@ export function TranslateOverlay() {
         setOriginalImageUrl(null);
         annotationsRef.current = [];
         setAnnotations([]);
+        draftAnnotationRef.current = null;
+        activePointerIdRef.current = null;
         setDraftAnnotation(null);
         textDraftRef.current = null;
         setTextDraft(null);
@@ -372,6 +392,12 @@ export function TranslateOverlay() {
     const onKey = (event: KeyboardEvent) => {
       if (event.isComposing || event.keyCode === 229) return;
       if (event.key === "Escape") {
+        if (draftAnnotationRef.current) {
+          draftAnnotationRef.current = null;
+          activePointerIdRef.current = null;
+          setDraftAnnotation(null);
+          return;
+        }
         if (textDraftRef.current) {
           textDraftRef.current = null;
           setTextDraft(null);
@@ -389,6 +415,12 @@ export function TranslateOverlay() {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z") {
         if (textDraftRef.current) return;
         event.preventDefault();
+        if (draftAnnotationRef.current) {
+          draftAnnotationRef.current = null;
+          activePointerIdRef.current = null;
+          setDraftAnnotation(null);
+          return;
+        }
         const nextList = annotationsRef.current.slice(0, -1);
         annotationsRef.current = nextList;
         setAnnotations(nextList);
@@ -572,9 +604,15 @@ export function TranslateOverlay() {
 
   const handleSelectTool = useCallback(
     (tool: AnnotationTool) => {
+      if (draftAnnotationRef.current) {
+        draftAnnotationRef.current = null;
+        activePointerIdRef.current = null;
+        setDraftAnnotation(null);
+      }
       if (tool !== "text" && textDraftRef.current) {
         flushTextDraft();
-      } else if (tool === "text") {
+      }
+      if (tool !== "none") {
         ensureOverlayWindowFocused();
       }
       setActiveTool(tool);
@@ -583,6 +621,12 @@ export function TranslateOverlay() {
   );
 
   const handleUndo = useCallback(() => {
+    if (draftAnnotationRef.current) {
+      draftAnnotationRef.current = null;
+      activePointerIdRef.current = null;
+      setDraftAnnotation(null);
+      return;
+    }
     if (textDraftRef.current) {
       textDraftRef.current = null;
       setTextDraft(null);
@@ -594,13 +638,49 @@ export function TranslateOverlay() {
     setAnnotations(nextList);
   }, []);
 
+  const isForeignPointerEvent = useCallback((event: unknown): boolean => {
+    const activeId = activePointerIdRef.current;
+    if (activeId === null || !event || typeof event !== "object") return false;
+    const pid = (event as { pointerId?: unknown }).pointerId;
+    return typeof pid === "number" && pid !== activeId;
+  }, []);
+
+  const isAcceptedToolMouseButton = useCallback(
+    (button: number, ctrlKey = false) => {
+      if (activeTool === "none") return false;
+      if (activeTool === "text") return button === 0 && !ctrlKey;
+      return button === 0 || button === 2;
+    },
+    [activeTool],
+  );
+
+  const handleStageMouseDown = useCallback(
+    (event: { button: number; ctrlKey?: boolean; preventDefault: () => void }) => {
+      if (isAcceptedToolMouseButton(event.button, Boolean(event.ctrlKey))) {
+        event.preventDefault();
+      }
+    },
+    [isAcceptedToolMouseButton],
+  );
+
   const handleStagePointerDown = useCallback(
-    (event: ReactPointerEvent<SVGSVGElement>) => {
-      if (event.button !== 0 || activeTool === "none") return;
+    (event: ReactPointerEvent<Element>) => {
+      if (activeTool === "none" || !isAcceptedToolMouseButton(event.button, Boolean(event.ctrlKey))) {
+        return;
+      }
       event.preventDefault?.();
       event.stopPropagation();
-      openPopoverRef.current = "none";
-      setOpenPopover("none");
+      if (draftAnnotationRef.current) return;
+      if (openPopoverRef.current !== "none") {
+        const isBackdrop =
+          (event.currentTarget as { dataset?: { testid?: string } } | null)?.dataset?.testid ===
+          "capture-annotation-backdrop";
+        openPopoverRef.current = "none";
+        setOpenPopover("none");
+        if (activeTool === "text" && isBackdrop) {
+          return;
+        }
+      }
 
       const pt = stageLocalPoint(event.clientX, event.clientY);
       if (activeTool === "text") {
@@ -614,59 +694,105 @@ export function TranslateOverlay() {
         return;
       }
       flushTextDraft();
+      ensureOverlayWindowFocused();
 
-      event.currentTarget.setPointerCapture?.(event.pointerId);
+      activePointerIdRef.current = typeof event.pointerId === "number" ? event.pointerId : null;
+      try {
+        event.currentTarget?.setPointerCapture?.(event.pointerId);
+      } catch {
+        // WebKit 在辅助键或合成指针下 setPointerCapture 可能抛错，由下方 window 级拖拽监听统一兜底。
+      }
       const id = `ann-${Date.now()}`;
-      if (activeTool === "pen") {
-        setDraftAnnotation({
-          id,
-          kind: "pen",
-          points: [pt],
-          color: activeColor,
-          strokeWidth: sizePreset.strokeWidth,
-        });
-      } else {
-        setDraftAnnotation({
-          id,
-          kind: activeTool,
-          x1: pt.x,
-          y1: pt.y,
-          x2: pt.x,
-          y2: pt.y,
-          color: activeColor,
-          strokeWidth: sizePreset.strokeWidth,
-        });
+      const nextDraft: Annotation =
+        activeTool === "pen"
+          ? {
+              id,
+              kind: "pen",
+              points: [pt],
+              color: activeColor,
+              strokeWidth: sizePreset.strokeWidth,
+            }
+          : {
+              id,
+              kind: activeTool,
+              x1: pt.x,
+              y1: pt.y,
+              x2: pt.x,
+              y2: pt.y,
+              color: activeColor,
+              strokeWidth: sizePreset.strokeWidth,
+            };
+      draftAnnotationRef.current = nextDraft;
+      setDraftAnnotation(nextDraft);
+    },
+    [
+      activeColor,
+      activeTool,
+      ensureOverlayWindowFocused,
+      flushTextDraft,
+      isAcceptedToolMouseButton,
+      sizePreset.strokeWidth,
+      stageLocalPoint,
+    ],
+  );
+
+  const updateDraftAtClientPoint = useCallback(
+    (clientX: number, clientY: number) => {
+      const current = draftAnnotationRef.current;
+      if (!current) return;
+      const pt = stageLocalPoint(clientX, clientY);
+      let next: Annotation = current;
+      if (current.kind === "pen") {
+        const last = current.points[current.points.length - 1];
+        if (!last || last.x !== pt.x || last.y !== pt.y) {
+          next = { ...current, points: [...current.points, pt] };
+        }
+      } else if (current.kind !== "text") {
+        if (current.x2 !== pt.x || current.y2 !== pt.y) {
+          next = { ...current, x2: pt.x, y2: pt.y };
+        }
+      }
+      if (next !== current) {
+        draftAnnotationRef.current = next;
+        setDraftAnnotation(next);
       }
     },
-    [activeColor, activeTool, ensureOverlayWindowFocused, flushTextDraft, sizePreset.strokeWidth, stageLocalPoint],
+    [stageLocalPoint],
   );
 
   const handleStagePointerMove = useCallback(
-    (event: ReactPointerEvent<SVGSVGElement>) => {
-      if (!draftAnnotation) return;
-      const pt = stageLocalPoint(event.clientX, event.clientY);
-      setDraftAnnotation((prev) => {
-        if (!prev) return null;
-        if (prev.kind === "pen") {
-          return { ...prev, points: [...prev.points, pt] };
-        }
-        if (prev.kind === "text") return prev;
-        return { ...prev, x2: pt.x, y2: pt.y };
-      });
+    (event: ReactPointerEvent<Element>) => {
+      if (!draftAnnotationRef.current || isForeignPointerEvent(event)) return;
+      updateDraftAtClientPoint(event.clientX, event.clientY);
     },
-    [draftAnnotation, stageLocalPoint],
+    [isForeignPointerEvent, updateDraftAtClientPoint],
   );
 
-  const finishDraft = useCallback(() => {
-    setDraftAnnotation((current) => {
-      if (current && isMeaningfulAnnotation(current)) {
+  const finishDraft = useCallback(
+    (event?: { clientX?: unknown; clientY?: unknown; pointerId?: unknown }) => {
+      if (!draftAnnotationRef.current || isForeignPointerEvent(event)) return;
+      if (
+        event &&
+        typeof event.clientX === "number" &&
+        Number.isFinite(event.clientX) &&
+        typeof event.clientY === "number" &&
+        Number.isFinite(event.clientY)
+      ) {
+        updateDraftAtClientPoint(event.clientX, event.clientY);
+      }
+      const current = draftAnnotationRef.current;
+      if (!current) return;
+      draftAnnotationRef.current = null;
+      activePointerIdRef.current = null;
+      if (isMeaningfulAnnotation(current)) {
         const nextList = [...annotationsRef.current, current];
         annotationsRef.current = nextList;
         setAnnotations(nextList);
       }
-      return null;
-    });
-  }, []);
+      setDraftAnnotation(null);
+    },
+    [isForeignPointerEvent, updateDraftAtClientPoint],
+  );
 
   const effectiveBarH = Math.max(40, toolbarMainHeight);
   const needToolbarSpace = effectiveBarH + 12;
@@ -762,7 +888,56 @@ export function TranslateOverlay() {
   ]);
 
   const isDraggingAnnotation = draftAnnotation !== null;
+  const isDrawingToolActive = activeTool !== "none" && activeTool !== "text";
   const isEditingText = textDraft !== null;
+
+  useEffect(() => {
+    if (
+      !isDrawingToolActive ||
+      typeof window === "undefined" ||
+      typeof window.addEventListener !== "function"
+    ) {
+      return () => {};
+    }
+    const onMove = (event: Event) => {
+      if (!draftAnnotationRef.current || isForeignPointerEvent(event)) return;
+      const e = event as { clientX?: unknown; clientY?: unknown };
+      if (
+        typeof e.clientX === "number" &&
+        Number.isFinite(e.clientX) &&
+        typeof e.clientY === "number" &&
+        Number.isFinite(e.clientY)
+      ) {
+        updateDraftAtClientPoint(e.clientX, e.clientY);
+      }
+    };
+    const onUp = (event: Event) => {
+      if (!draftAnnotationRef.current) return;
+      finishDraft(event as { clientX?: unknown; clientY?: unknown; pointerId?: unknown });
+    };
+    const onPointerCancel = (event: Event) => {
+      if (!draftAnnotationRef.current || isForeignPointerEvent(event)) return;
+      finishDraft();
+    };
+    const onBlur = () => {
+      if (!draftAnnotationRef.current) return;
+      finishDraft();
+    };
+    window.addEventListener("pointermove", onMove, true);
+    window.addEventListener("mousemove", onMove, true);
+    window.addEventListener("pointerup", onUp, true);
+    window.addEventListener("mouseup", onUp, true);
+    window.addEventListener("pointercancel", onPointerCancel, true);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("pointermove", onMove, true);
+      window.removeEventListener("mousemove", onMove, true);
+      window.removeEventListener("pointerup", onUp, true);
+      window.removeEventListener("mouseup", onUp, true);
+      window.removeEventListener("pointercancel", onPointerCancel, true);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, [finishDraft, isDrawingToolActive, isForeignPointerEvent, updateDraftAtClientPoint]);
 
   useEffect(() => {
     const rects: CaptureHitRect[] = [];
@@ -783,14 +958,18 @@ export function TranslateOverlay() {
       }
     }
     if (rects.length === 0 && stageRect.w > 0 && stageRect.h > 0) {
-      rects.push({ x: stageRect.x, y: stageRect.y, w: stageRect.w, h: stageRect.h });
-      if (showToolbar) {
-        rects.push({
-          x: toolbarLeft,
-          y: subbarAbove && activeTool !== "none" ? Math.max(0, toolbarTop - subbarNeedSpace) : toolbarTop,
-          w: measuredBarW,
-          h: effectiveBarH + (activeTool !== "none" ? 40 : 4),
-        });
+      if (activeTool !== "none" && effectiveViewW > 0 && viewH > 0) {
+        rects.push({ x: 0, y: 0, w: effectiveViewW, h: viewH });
+      } else {
+        rects.push({ x: stageRect.x, y: stageRect.y, w: stageRect.w, h: stageRect.h });
+        if (showToolbar) {
+          rects.push({
+            x: toolbarLeft,
+            y: subbarAbove && activeTool !== "none" ? Math.max(0, toolbarTop - subbarNeedSpace) : toolbarTop,
+            w: measuredBarW,
+            h: effectiveBarH + (activeTool !== "none" ? 40 : 4),
+          });
+        }
       }
     }
     if (rects.length > 0) {
@@ -802,6 +981,7 @@ export function TranslateOverlay() {
     annotations.length,
     blocks,
     effectiveBarH,
+    effectiveViewW,
     error,
     actionError,
     isDraggingAnnotation,
@@ -826,13 +1006,26 @@ export function TranslateOverlay() {
     toolbarLeft,
     toolbarTop,
     subbarAbove,
+    viewH,
   ]);
 
   return (
     <div
       ref={rootElRef}
-      className="relative h-full w-full overflow-hidden"
+      className="relative h-full w-full select-none overflow-hidden"
       style={{ fontFamily: OVERLAY_FONT }}
+      onContextMenu={(e) => {
+        if (!isAnnotationTextInputTarget(e.target)) {
+          e.preventDefault();
+        }
+      }}
+      onDragStart={(e) => {
+        if (!isAnnotationTextInputTarget(e.target)) {
+          e.preventDefault();
+        }
+      }}
+      onPointerUpCapture={(e) => finishDraft(e)}
+      onMouseUpCapture={(e) => finishDraft(e)}
       onClick={() => {
         if (openPopover !== "none") {
           openPopoverRef.current = "none";
@@ -841,6 +1034,24 @@ export function TranslateOverlay() {
       }}
     >
       <OverlayBoundary blocks={blocks}>
+        {activeTool !== "none" && (
+          <div
+            data-testid="capture-annotation-backdrop"
+            data-hit-rect="true"
+            onPointerDown={handleStagePointerDown}
+            onMouseDown={handleStageMouseDown}
+            onPointerMove={handleStagePointerMove}
+            onPointerUp={finishDraft}
+            onPointerCancel={(e) => {
+              if (!isForeignPointerEvent(e)) finishDraft();
+            }}
+            onContextMenu={(e) => e.preventDefault()}
+            className={`absolute inset-0 z-[15] ${
+              activeTool === "text" ? "cursor-text" : "cursor-crosshair"
+            }`}
+          />
+        )}
+
         {/* 选区画布：冻结原图 + 原位译文层 + 钉钉标注 SVG 层共用同一原点 */}
         <div
           ref={stageElRef}
@@ -885,14 +1096,13 @@ export function TranslateOverlay() {
               height={stageRect.h}
               viewBox={`0 0 ${stageRect.w} ${stageRect.h}`}
               onPointerDown={handleStagePointerDown}
-              onMouseDown={(e) => {
-                if (e.button === 0 && activeTool !== "none") {
-                  e.preventDefault();
-                }
-              }}
+              onMouseDown={handleStageMouseDown}
               onPointerMove={handleStagePointerMove}
               onPointerUp={finishDraft}
-              onPointerCancel={finishDraft}
+              onPointerCancel={(e) => {
+                if (!isForeignPointerEvent(e)) finishDraft();
+              }}
+              onContextMenu={(e) => e.preventDefault()}
               className={`absolute inset-0 z-20 h-full w-full ${
                 activeTool === "none"
                   ? "pointer-events-none"
@@ -993,7 +1203,7 @@ export function TranslateOverlay() {
                       setIsComposingText(false);
                     }
                   }}
-                  className="absolute z-30 box-border resize-none overflow-x-hidden overflow-y-auto rounded border border-white/75 bg-black/55 font-semibold outline-none"
+                  className="absolute z-30 box-border select-text resize-none overflow-x-hidden overflow-y-auto rounded border border-white/75 bg-black/55 font-semibold outline-none"
                   style={{
                     left: box.left,
                     top: box.top,

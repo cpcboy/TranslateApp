@@ -2009,4 +2009,377 @@ describe("TranslateOverlay 运行时状态机与工具条回归测试", () => {
     expect(tspans.length).toBe(taTyping.props.rows);
     expect(tspans[0]!.props.y).toBe(typingTextTop);
   });
+
+  it("[FIX-RECT-RELOAD-CONTEXTMENU-AND-EDGE-DRAG] 拦截覆盖层原生 Reload 右键菜单、兼容触控板/Magic Mouse 副键拖框、消除窄选区留白起笔死区并防多事件重复提交", async () => {
+    windowState.innerWidth = 640;
+    windowState.innerHeight = 914;
+    ipcMock.captureBlocks.mockResolvedValue({
+      blocks: [sampleBlock()],
+      error: null,
+      notice: null,
+      stage: "done",
+      generation: 91,
+      revision: 1,
+      has_image: true,
+      scale: 2,
+      target_lang: "zh",
+      bounds: { w: 640, h: 914 },
+      image_rect: { x: 113, y: 0, w: 498, h: 810 },
+    });
+
+    let root = renderOverlay();
+    await flush();
+    root = renderOverlay();
+
+    // 挂载真实画布几何偏移（窄选区左留白 113px，复刻真实日志 gen=7）
+    const stageDiv = findElement(root, (el) => el.props["data-testid"] === "capture-stage")!;
+    const stageRefObj = (stageDiv.props.ref ?? (stageDiv as unknown as { ref?: unknown }).ref) as {
+      current: unknown;
+    };
+    stageRefObj.current = {
+      getBoundingClientRect: () => ({ left: 113, top: 0, width: 498, height: 810 }),
+    };
+
+    // 1) 默认未激活工具时：不挂载全窗标注底衬，保留窄选区透明留白穿透
+    expect(findElement(root, (el) => el.props["data-testid"] === "capture-annotation-backdrop")).toBeNull();
+    const initCalls = ipcMock.setCaptureHitRects.mock.calls;
+    const initialHitRects = initCalls[initCalls.length - 1]?.[0] as Array<{
+      x: number;
+      y: number;
+      w: number;
+      h: number;
+    }>;
+    expect(initialHitRects[0]).toMatchObject({ x: 113, y: 0, w: 498, h: 810 });
+
+    // 2) 全局 contextmenu 捕获与根容器/工具条拦截：在画布/译文/工具条上 preventDefault 阻断 [↻ Reload]，但在 <textarea> 内放行原生粘贴菜单
+    const ctxListeners = Array.from(windowState.listeners.get("contextmenu") ?? []);
+    expect(ctxListeners.length).toBeGreaterThanOrEqual(1);
+    const preventSvgCtx = vi.fn();
+    for (const fn of ctxListeners) {
+      fn({ target: { tagName: "svg" }, preventDefault: preventSvgCtx });
+    }
+    expect(preventSvgCtx).toHaveBeenCalledTimes(1);
+
+    const preventTextareaCtx = vi.fn();
+    for (const fn of ctxListeners) {
+      fn({
+        target: { tagName: "TEXTAREA", dataset: { testid: "annotation-text-input" } },
+        preventDefault: preventTextareaCtx,
+      });
+    }
+    expect(preventTextareaCtx).not.toHaveBeenCalled();
+
+    expect(String(root.props.className).split(/\s+/)).toContain("select-none");
+    const preventDrag = vi.fn();
+    (root.props.onDragStart as (e: { target?: unknown; preventDefault: () => void }) => void)({
+      target: { tagName: "DIV" },
+      preventDefault: preventDrag,
+    });
+    expect(preventDrag).toHaveBeenCalledTimes(1);
+    const preventTaDrag = vi.fn();
+    (root.props.onDragStart as (e: { target?: unknown; preventDefault: () => void }) => void)({
+      target: { tagName: "TEXTAREA", dataset: { testid: "annotation-text-input" } },
+      preventDefault: preventTaDrag,
+    });
+    expect(preventTaDrag).not.toHaveBeenCalled();
+
+    const tbRendered = CaptureToolbar(findToolbarProps(root) as Parameters<typeof CaptureToolbar>[0]) as El;
+    const preventTbCtx = vi.fn();
+    (tbRendered.props.onContextMenu as (e: { preventDefault: () => void }) => void)({ preventDefault: preventTbCtx });
+    expect(preventTbCtx).toHaveBeenCalledTimes(1);
+
+    // 3) 文字工具忽略右键 (button=2) 与 Ctrl+Click，且弹层展开时点击画布外留白底衬仅收起弹层、不误生成贴边空白输入框
+    (findToolbarProps(root)!.onSelectTool as (tool: "text") => void)("text");
+    (findToolbarProps(root)!.onTogglePopover as (next: "save") => void)("save");
+    root = renderOverlay();
+    const textBackdropDismiss = findElement(
+      root,
+      (el) => el.props["data-testid"] === "capture-annotation-backdrop",
+    )!;
+    (textBackdropDismiss.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 0,
+      clientX: 40,
+      clientY: 100,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+      currentTarget: { dataset: { testid: "capture-annotation-backdrop" } },
+    });
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.openPopover).toBe("none");
+    expect(findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")).toBeNull();
+
+    const textSvg = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (textSvg.props.onPointerDown as (e: unknown) => void)({
+      button: 2,
+      pointerId: 1,
+      clientX: 200,
+      clientY: 100,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    (textSvg.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      ctrlKey: true,
+      pointerId: 2,
+      clientX: 200,
+      clientY: 100,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+    expect(findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")).toBeNull();
+
+    // 4) 选中「矩形」：立即聚焦覆盖窗、挂载全窗底衬并将 hit_rects 扩至整窗 640×914，消除留白边缘穿透竞态
+    ipcMock.focusOverlay.mockClear();
+    (findToolbarProps(root)!.onSelectTool as (tool: "rect") => void)("rect");
+    root = renderOverlay();
+    expect(ipcMock.focusOverlay).toHaveBeenCalledWith(91);
+    const backdrop = findElement(root, (el) => el.props["data-testid"] === "capture-annotation-backdrop")!;
+    expect(backdrop).not.toBeNull();
+    expect(backdrop.props["data-hit-rect"]).toBe("true");
+    const activeCalls = ipcMock.setCaptureHitRects.mock.calls;
+    const toolActiveHitRects = activeCalls[activeCalls.length - 1]?.[0] as Array<{
+      x: number;
+      y: number;
+      w: number;
+      h: number;
+    }>;
+    expect(toolActiveHitRects).toEqual([{ x: 0, y: 0, w: 640, h: 914 }]);
+
+    // 5) 原地误触右键单击（<4px 抖动）不留残影矩形
+    const rectSvg0 = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (rectSvg0.props.onPointerDown as (e: unknown) => void)({
+      button: 2,
+      pointerId: 10,
+      clientX: 200,
+      clientY: 80,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+    for (const fn of windowState.listeners.get("mouseup") ?? []) {
+      fn({ clientX: 202, clientY: 81 });
+    }
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.annotationsCount).toBe(0);
+
+    // 6) Magic Mouse / 触控板双指副键拖框（button=2 -> window mousemove -> pointerup + mouseup + svg.onPointerUp 同帧连发）：
+    //    精准落盘 1 个矩形，绝不因多路收尾重复入队
+    const rectSvg1 = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    const preventRightMouseDown = vi.fn();
+    (rectSvg1.props.onMouseDown as (e: unknown) => void)({
+      button: 2,
+      preventDefault: preventRightMouseDown,
+    });
+    expect(preventRightMouseDown).toHaveBeenCalledTimes(1);
+
+    (rectSvg1.props.onPointerDown as (e: unknown) => void)({
+      button: 2,
+      pointerId: 11,
+      clientX: 140, // stageLocal x = 140 - 113 = 27
+      clientY: 40,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+
+    // 拖拽途中第二根手指误触 pointerdown / pointermove / pointerup (pointerId=12 != 11) 不得重置起点或提前截断拖拽
+    const rectSvgMid = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (rectSvgMid.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 12,
+      clientX: 200,
+      clientY: 90,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    for (const fn of windowState.listeners.get("pointermove") ?? []) {
+      fn({ pointerId: 12, clientX: 500, clientY: 500 });
+    }
+    for (const fn of windowState.listeners.get("pointerup") ?? []) {
+      fn({ pointerId: 12, clientX: 500, clientY: 500 });
+    }
+    for (const fn of windowState.listeners.get("mousemove") ?? []) {
+      fn({ clientX: 260, clientY: 130 }); // stageLocal x = 147, y = 130 -> w=120, h=90
+    }
+    const svgBeforeUp = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svgBeforeUp.props.onPointerUp as (e: unknown) => void)({ clientX: 260, clientY: 130 });
+    for (const fn of windowState.listeners.get("pointerup") ?? []) {
+      fn({ clientX: 260, clientY: 130 });
+    }
+    for (const fn of windowState.listeners.get("mouseup") ?? []) {
+      fn({ clientX: 260, clientY: 130 });
+    }
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.annotationsCount).toBe(1);
+
+    // 7) 在窄选区左侧留白边缘 (clientX=95 < image_rect.x=113) 起笔框向右侧窗外 (clientX=680 > 113+498=611) 松手：
+    //    自动钳位至 [0, 498] 完整框住贴边文字
+    const activeBackdrop = findElement(root, (el) => el.props["data-testid"] === "capture-annotation-backdrop")!;
+    (activeBackdrop.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 13,
+      clientX: 95, // < 113 -> clamp to x=0
+      clientY: 120,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+    for (const fn of windowState.listeners.get("pointermove") ?? []) {
+      fn({ clientX: 400, clientY: 200 });
+    }
+    for (const fn of windowState.listeners.get("mouseup") ?? []) {
+      fn({ clientX: 680, clientY: 240 }); // > 611 -> clamp to x=498, y=240
+    }
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.annotationsCount).toBe(2);
+
+    const svgAfterTwo = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    const shapeHosts = findAllElements(
+      svgAfterTwo,
+      (el) => typeof el.type === "function" && "item" in el.props,
+    );
+    expect(shapeHosts).toHaveLength(2);
+    const rect1El = (shapeHosts[0]!.type as (props: unknown) => El)(shapeHosts[0]!.props);
+    expect(rect1El.props).toMatchObject({ x: 27, y: 40, width: 120, height: 90 });
+    const rect2El = (shapeHosts[1]!.type as (props: unknown) => El)(shapeHosts[1]!.props);
+    expect(rect2El.props).toMatchObject({ x: 0, y: 120, width: 498, height: 120 });
+
+    // 8) pointercancel 携带 (0, 0) 坐标时不得把终点篡改为 (0, 0)；拖拽中途按 Escape 仅取消当前草稿而不关窗
+    const svgForCancel = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svgForCancel.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 14,
+      clientX: 213, // x=100
+      clientY: 300,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+    for (const fn of windowState.listeners.get("pointermove") ?? []) {
+      fn({ clientX: 313, clientY: 380 }); // x=200, y=380 -> w=100, h=80
+    }
+    const svgCancelNow = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svgCancelNow.props.onPointerCancel as (e: unknown) => void)({ clientX: 0, clientY: 0 });
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.annotationsCount).toBe(3);
+    const shapesAfterCancel = findAllElements(
+      findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!,
+      (el) => typeof el.type === "function" && "item" in el.props,
+    );
+    const rect3El = (shapesAfterCancel[2]!.type as (props: unknown) => El)(shapesAfterCancel[2]!.props);
+    expect(rect3El.props).toMatchObject({ x: 100, y: 300, width: 100, height: 80 });
+
+    // 拖拽中途按 Escape：只取消草稿，不调用 closeOverlay
+    ipcMock.closeOverlay.mockClear();
+    const svgForEsc = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svgForEsc.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 15,
+      clientX: 213,
+      clientY: 420,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+    for (const fn of windowState.listeners.get("pointermove") ?? []) {
+      fn({ clientX: 350, clientY: 500 });
+    }
+    for (const fn of windowState.listeners.get("keydown") ?? []) {
+      fn({ key: "Escape" });
+    }
+    root = renderOverlay();
+    expect(ipcMock.closeOverlay).not.toHaveBeenCalled();
+    expect(findToolbarProps(root)!.annotationsCount).toBe(3);
+
+    // 9) [P2 回归] < 1 帧极速扫笔（onPointerDown 后尚未经过新一次 renderOverlay 被动 effect，同帧直接触发 window mouseup）：
+    //    因激活绘图工具时已提前挂好 window 监听，且 Ctrl+Click (button=0, ctrlKey=true) 允许起笔，同帧即可收尾落盘且不滞留草稿
+    const svgSameFrame = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svgSameFrame.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      ctrlKey: true,
+      pointerId: 16,
+      clientX: 163, // x=50
+      clientY: 450,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+      currentTarget: {
+        setPointerCapture: () => {
+          throw new Error("NotFoundError");
+        },
+      },
+    });
+    // 不调 renderOverlay()，直接在同帧触发 window mouseup
+    for (const fn of windowState.listeners.get("mouseup") ?? []) {
+      fn({ clientX: 243, clientY: 510 }); // x=130, y=510 -> w=80, h=60
+    }
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.annotationsCount).toBe(4);
+    const unlockAfterSameFrame = ipcMock.setCaptureHitRects.mock.calls;
+    expect(unlockAfterSameFrame[unlockAfterSameFrame.length - 1]?.[1]).toBe(false);
+
+    // 10) 拖拽中途按 Cmd+Z：仅取消当前未完成草稿，不误删已落盘的 4 条标注；window blur 中断时自动收尾当前有效草稿
+    const svgCmdZ = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svgCmdZ.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 17,
+      clientX: 163,
+      clientY: 520,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+    for (const fn of windowState.listeners.get("pointermove") ?? []) {
+      fn({ clientX: 280, clientY: 590 });
+    }
+    for (const fn of windowState.listeners.get("keydown") ?? []) {
+      fn({ key: "z", metaKey: true, preventDefault: () => {} });
+    }
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.annotationsCount).toBe(4);
+
+    // window blur 收尾 + 画笔 (pen) 副键拖拽 + querySelectorAll("[data-hit-rect='true']") 真实 DOM 分支校验
+    const rootRefObj = (root.props.ref ?? (root as unknown as { ref?: unknown }).ref) as {
+      current: unknown;
+    };
+    rootRefObj.current = {
+      querySelectorAll: () => [
+        { getBoundingClientRect: () => ({ left: 0, top: 0, width: 640, height: 914 }) },
+        { getBoundingClientRect: () => ({ left: 113, top: 0, width: 498, height: 810 }) },
+      ],
+    };
+    (findToolbarProps(root)!.onSelectTool as (tool: "pen") => void)("pen");
+    root = renderOverlay();
+    const domHitCalls = ipcMock.setCaptureHitRects.mock.calls;
+    expect(domHitCalls[domHitCalls.length - 1]?.[0]).toEqual([
+      { x: 0, y: 0, w: 640, h: 914 },
+      { x: 113, y: 0, w: 498, h: 810 },
+    ]);
+
+    const penSvg = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (penSvg.props.onPointerDown as (e: unknown) => void)({
+      button: 2,
+      pointerId: 18,
+      clientX: 163,
+      clientY: 600,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+    for (const fn of windowState.listeners.get("mousemove") ?? []) {
+      fn({ clientX: 213, clientY: 630 });
+    }
+    for (const fn of windowState.listeners.get("blur") ?? []) {
+      fn({});
+    }
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.annotationsCount).toBe(5);
+
+    // 取消激活工具后：底衬卸载，恢复窄选区桌面穿透
+    rootRefObj.current = null;
+    (findToolbarProps(root)!.onSelectTool as (tool: "none") => void)("none");
+    root = renderOverlay();
+    expect(findElement(root, (el) => el.props["data-testid"] === "capture-annotation-backdrop")).toBeNull();
+  });
 });

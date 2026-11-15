@@ -1324,6 +1324,7 @@ fn open_overlay_window(app: &AppHandle, x: f64, y: f64, w: f64, h: f64) -> Resul
         .resizable(false)
         .shadow(false)
         .visible_on_all_workspaces(true)
+        .accept_first_mouse(true)
         .focused(true)
         .build()
         .map_err(|err| format!("打不开译文窗口：{err}"))?;
