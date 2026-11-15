@@ -6,6 +6,25 @@
 
 ## [0.1.2] - 2026-11-15
 
+### 修复 · 2026-11-15 — 截屏矩形等标注框选弹出原生 Reload 菜单中断与留白边缘起笔死区修复
+
+**问题解决**
+
+1. **`[P1]` 选中矩形等标注工具框选时频繁弹出 macOS `WKWebView` 原生暗色胶囊 `[ ↻ Reload ]` 右键菜单，打断框选甚至重载覆盖层**：
+   - **真机日志与实操根因**：核查本机 `capture.log`（`gen=7` 在无重译操作下出现两次 `overlay fetched gen=7 rev=1 stage=Done`）并用原生 `NSWindow + WKWebView` 复现确认——此前覆盖层未拦截 `contextmenu` 事件。当用户在 Magic Mouse 右半侧搭放手指按下拖动、MacBook 触控板双指按压拖拽（触发 `button = 2` 副键按下）或误触 `Control` 点击，以及右键点到译文文字或工具条时，`WKWebView` 原生弹出 `[ ↻ Reload ]`（`WKMenuItemIdentifierReload`）与 `Look Up` 菜单，立刻切入 AppKit `NSEventTrackingRunLoopMode` 模态循环中断拖拽；若松手落在该胶囊上更会直接重载 WebView 页面，清空已画标注。
+   - **修复**：在 `TranslateOverlay.tsx`（`window` 捕获阶段、`rootElRef`、`<svg>`、`capture-annotation-backdrop`）与 `CaptureToolbar.tsx` 全链路拦截非文字输入框的 `contextmenu` 默认行为（仅对 `<textarea data-testid="annotation-text-input">` 放行原生剪切/复制/粘贴菜单），根节点同步加 `select-none` 与非输入框 `onDragStart` 拦截；同时对图形拖拽工具（`矩形`、`椭圆`、`箭头`、`画笔`）兼容主键与副键（`button === 0 || button === 2` 及 `ctrlKey`）起笔并保持 `文字` 工具仅响应纯左键（`button === 0 && !ctrlKey`）。
+2. **`[P1]` 窄截图四周透明留白起笔死区、穿透竞态与未激活窗口首击吞事件**：
+   - **根因**：标准覆盖窗最小宽 `640pt`，而日常窄截图（如 `capture.log` 中 `284..512px` 选区）居中后左右存在 `64..178px` 透明留白。此前仅 `image_rect` 内的 `<svg>` 接收指针事件并计入 `hit_rects`；用户习惯从截图边缘外侧几像素起笔拉框包住贴边文字时，既落在 `<svg>` 外无响应，又被 Rust `25ms` 轮询 `set_ignore_cursor_events(true)` 判定为穿透区直点底层桌面导致覆盖窗失焦。
+   - **修复**：当 `activeTool !== "none"` 时挂载全窗口捕获层 `<div data-testid="capture-annotation-backdrop" data-hit-rect="true">`（并在 DOM 首帧尚未量出节点时将 `setCaptureHitRects` 兜底扩至整窗 `{ x: 0, y: 0, w: effectiveViewW, h: viewH }`），从任意透明留白处按下即可顺滑向画面内钳位拉框（`clamp(0..stageW, 0..stageH)`）；取消选中工具回到 `activeTool === "none"` 后立即卸载该层，100% 恢复透明留白桌面穿透；在 `text` 工具且下拉弹层打开时点击留白仅收起弹层而不误生贴边空输入框。同时 `sense/src-tauri/src/capture.rs` `open_overlay_window` 启用 `.accept_first_mouse(true)`，并在切换任意标注工具时主动调用 `ensureOverlayWindowFocused()`，消除首击激活吞事件。
+3. **`[P2]` 越出画布/窗口松手、`setPointerCapture` 抛错 `< 1` 帧间隙、多指误触与拖拽中途 `Esc`/`⌘Z` 收尾加固**：
+   - 新增同步 `draftAnnotationRef` 与 `activePointerIdRef`，并在图形工具激活期间常驻 `window` 捕获期监听（`pointermove`、`mousemove`、`pointerup`、`mouseup`、`pointercancel`、`blur`）及根节点冒泡兜底：即使 `setPointerCapture` 抛错且同帧 `< 1 frame` 内松手、拖出 `NSWindow` 外松手或中途切窗 `blur`，均零丢失精确落盘且幂等只提交一次；过滤非活跃 `pointerId` 防触控板多指跳框；`pointercancel` 安全丢弃半成品而不被 `(0, 0)` 默认坐标污染；拖拽中途按 `Esc`、点「撤销」或按 `⌘Z` 仅取消当前正在拉的半成品框，不误关覆盖窗也不误删历史标注。
+
+**验证与 QC 审查**
+
+- 独立软件产品 QC 代码审查员（`01300a53`）两轮对抗审查：首轮回报 **`P0 = 0, P1 = 0, P2 = 1, P3 = 2`**（指出 `setPointerCapture` 抛错后被动 `useEffect` 存在 `< 1` 帧监听空窗、`<textarea>` 选区拖拽豁免与 `text` 模式弹层留白点击收起、以及 `< 1` 帧松手/`⌘Z`/真 DOM `data-hit-rect` 单测加固）；全部修复后二轮复核确认 **`P0 = 0, P1 = 0, P2 = 0`**。
+- 全量自动化套件通过：`npm run typecheck`、Vitest **32 文件 / 663 用例**、`npm run build`、`cargo test --locked` **434 用例**；真机 `NSWindow + WKWebView`（右键/`Ctrl+左键`/译文块右键/工具条右键零弹出 `[ ↻ Reload ]`、Magic Mouse/触控板 `button=2` 副键拖框、窄截图留白 `x=90 < 113` 跨边拉框钳位落盘、`<textarea>` 右键保留原生编辑菜单及 Retina PNG 导出）实操画面验收全通过。
+- **回滚方式**：`git revert eea4330` 并重装备份 `~/cpcsoft/SENSE-app-backups/SENSE-before-rect-reload-fix.app`（无数据迁移）。
+
 ### 发布准备 · 2026-11-15 — 同步 `origin/main` 与 `v0.1.2` 双架构更新包构建验签
 
 - 经负责人复核验收通过并单次授权，将 `main`（`d7dd735..HEAD`，含 `0.1.2` 升级 `f449661` 及全部截屏交互/布局修复）无 `--force` 快进推送至 GitHub `origin/main`，确认本机 `/Applications/SENSE.app`（`0.1.2`）已签名运行，并经 `./tools/release.sh --notes-file dist-release/notes-v0.1.2.md`（清空旧 OCR sidecar 缓存后现编双芯片 `macos13.0`）完成 Apple 芯片（`aarch64`）与 Intel（`x86_64`）双架构更新包打包、`SENSE Dev` 代码签名、更新私钥绑定版本签名以及内嵌公钥 `latest.json` 验签（保留 `--publish` 供负责人在交互终端输入 `yes` 发布 GitHub Release `v0.1.2`）。
