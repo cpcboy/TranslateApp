@@ -337,4 +337,37 @@ describe("captureExport 导出画布合成", () => {
     // 若误走 estimateTextLineWidth(18px/字) 则只会折成 2 行（5+2）；走 ctx.measureText(26px/字) 必折成 3 行（3+3+1）
     expect(textOps.map((o) => String(o.args[0]))).toEqual(["一二三", "四五六", "七"]);
   });
+
+  it("[FEAT-ANNOTATION-TRANSFORM-EXPORT] 导出 PNG 准确绘制缩放后的矩形/椭圆及平移并调大字号（34px）的文字，不含选中虚线或控制柄", async () => {
+    const { ops } = createFakeEnvironment("ok", 720, 380);
+    await renderCapturePngBase64({
+      originalImageUrl: "data:image/png;base64,VALID",
+      stageWidth: 360,
+      stageHeight: 190,
+      scale: 2,
+      includeTranslation: false,
+      blocks: [],
+      plans: [],
+      annotations: [
+        { id: "r-resized", kind: "rect", x1: 24, y1: 18, x2: 210, y2: 142, color: "#ff3b30", strokeWidth: 6 },
+        { id: "e-resized", kind: "ellipse", x1: 220, y1: 30, x2: 340, y2: 130, color: "#34c759", strokeWidth: 2 },
+        { id: "t-scaled", kind: "text", x: 42, y: 56, text: "放大移动文字", color: "#ffcc00", fontSize: 34 },
+      ],
+    });
+
+    const strokeRects = ops.filter((o) => o.op === "strokeRect");
+    expect(strokeRects).toHaveLength(1);
+    expect(strokeRects[0]!.args).toEqual([24, 18, 186, 124, "#ff3b30", 6]);
+
+    const ellipses = ops.filter((o) => o.op === "ellipse");
+    expect(ellipses).toHaveLength(1);
+    expect(ellipses[0]!.args.slice(0, 4)).toEqual([280, 80, 60, 50]);
+
+    const textOps = ops.filter((o) => o.op === "fillText");
+    expect(textOps).toHaveLength(1);
+    expect(textOps[0]!.args[0]).toBe("放大移动文字");
+    expect(textOps[0]!.args[1]).toBe(42);
+    expect(textOps[0]!.args[2]).toBe(56);
+    expect(String(textOps[0]!.args[6])).toContain("600 34px");
+  });
 });

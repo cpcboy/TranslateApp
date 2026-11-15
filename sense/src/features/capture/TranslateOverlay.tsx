@@ -15,22 +15,89 @@ import {
   ANNOTATION_SIZES,
   TEXT_DRAFT_PAD_X,
   TEXT_DRAFT_PAD_Y,
+  applyTextAnnotationFontSize,
   clampPoint,
+  clampTextFontSize,
   computeArrowHeadPoints,
+  computeTextAnnotationBounds,
   computeTextBoxLayout,
   estimateTextLineWidth,
+  getShapeResizeHandles,
+  getTextResizeHandles,
+  getTextSelectionFrame,
   isMeaningfulAnnotation,
+  moveAnnotationInStage,
   normalizeRect,
+  resizeShapeAnnotationInStage,
+  resizeTextAnnotationFontSize,
   wrapAnnotationText,
   type Annotation,
+  type AnnotationPoint,
   type AnnotationSize,
   type AnnotationTool,
+  type EditableAnnotation,
+  type ResizeHandle,
+  type TextResizeHandle,
 } from "./captureAnnotations";
 import { renderCapturePngBase64 } from "./captureExport";
 import { CaptureToolbar, type ToolbarPopover } from "./CaptureToolbar";
 import { OVERLAY_FONT, createCanvasMeasure, plainPlan, planOverlay, sanitizeBlocks, type BlockPlan } from "./overlayLayout";
 
 const STAGE_ORDER: Record<CaptureStage, number> = { ocr: 0, translating: 1, done: 2 };
+const MAX_UNDO_HISTORY = 60;
+
+type ActiveTransform =
+  | {
+      mode: "move";
+      id: string;
+      startRaw: AnnotationPoint;
+      startAnnotation: EditableAnnotation;
+      beforeList: Annotation[];
+    }
+  | {
+      mode: "resize-shape";
+      id: string;
+      handle: ResizeHandle;
+      startRaw: AnnotationPoint;
+      startAnnotation: Extract<Annotation, { kind: "rect" | "ellipse" }>;
+      beforeList: Annotation[];
+    }
+  | {
+      mode: "resize-text";
+      id: string;
+      handle: TextResizeHandle;
+      startRaw: AnnotationPoint;
+      startAnnotation: Extract<Annotation, { kind: "text" }>;
+      beforeList: Annotation[];
+      beforeTextFontSize: number;
+    };
+
+function isEditableAnnotation(item: Annotation | undefined | null): item is EditableAnnotation {
+  return Boolean(
+    item && (item.kind === "rect" || item.kind === "ellipse" || item.kind === "text"),
+  );
+}
+
+function areAnnotationsEqual(a: Annotation, b: Annotation): boolean {
+  if (a === b) return true;
+  if (a.id !== b.id || a.kind !== b.kind || a.color !== b.color) return false;
+  if (a.kind === "text" && b.kind === "text") {
+    return a.x === b.x && a.y === b.y && a.text === b.text && a.fontSize === b.fontSize;
+  }
+  if (
+    (a.kind === "rect" || a.kind === "ellipse" || a.kind === "arrow") &&
+    (b.kind === "rect" || b.kind === "ellipse" || b.kind === "arrow")
+  ) {
+    return (
+      a.x1 === b.x1 &&
+      a.y1 === b.y1 &&
+      a.x2 === b.x2 &&
+      a.y2 === b.y2 &&
+      a.strokeWidth === b.strokeWidth
+    );
+  }
+  return false;
+}
 
 let cachedMeasureDoc: unknown;
 let cachedMeasureCtx: CanvasRenderingContext2D | null = null;
@@ -133,6 +200,10 @@ export function TranslateOverlay() {
   const [activeTool, setActiveTool] = useState<AnnotationTool>("none");
   const [activeColor, setActiveColor] = useState<string>(ANNOTATION_COLORS[0].hex);
   const [activeSize, setActiveSize] = useState<AnnotationSize["id"]>("md");
+  const [textFontSize, setTextFontSize] = useState<number>(ANNOTATION_SIZES[1].fontSize);
+  const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null);
+  const [isTransforming, setIsTransforming] = useState(false);
+  const [transformRevision, setTransformRevision] = useState(0);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [draftAnnotation, setDraftAnnotation] = useState<Annotation | null>(null);
   const [textDraft, setTextDraft] = useState<{ id: number; x: number; y: number; value: string } | null>(null);
@@ -144,6 +215,7 @@ export function TranslateOverlay() {
   }));
   const [toolbarWidth, setToolbarWidth] = useState(560);
   const [toolbarMainHeight, setToolbarMainHeight] = useState(40);
+  const [toolbarSubbarHeight, setToolbarSubbarHeight] = useState(31);
 
   const generationRef = useRef<number | undefined>(undefined);
   const revisionRef = useRef<number>(0);
@@ -155,10 +227,15 @@ export function TranslateOverlay() {
   const openPopoverRef = useRef<ToolbarPopover>("none");
   const textDraftRef = useRef<{ id: number; x: number; y: number; value: string } | null>(null);
   const textDraftSeqRef = useRef<number>(0);
+  const annotationSeqRef = useRef<number>(0);
   const textInputRef = useRef<HTMLTextAreaElement | null>(null);
   const annotationsRef = useRef<Annotation[]>([]);
+  const undoStackRef = useRef<Annotation[][]>([]);
+  const selectedAnnotationIdRef = useRef<string | null>(null);
+  const activeTransformRef = useRef<ActiveTransform | null>(null);
   const draftAnnotationRef = useRef<Annotation | null>(null);
   const activePointerIdRef = useRef<number | null>(null);
+  const performUndoRef = useRef<() => void>(() => {});
   const originalUrlRef = useRef<string | null>(null);
   const originalLoadPromiseRef = useRef<Promise<string | null> | null>(null);
   const toastTimerRef = useRef<number | undefined>(undefined);
@@ -191,16 +268,44 @@ export function TranslateOverlay() {
     () => ANNOTATION_SIZES.find((item) => item.id === activeSize) ?? ANNOTATION_SIZES[1],
     [activeSize],
   );
+  const activeToolRef = useRef<AnnotationTool>(activeTool);
   const activeColorRef = useRef<string>(activeColor);
   const sizePresetRef = useRef<AnnotationSize>(sizePreset);
+  const textFontSizeRef = useRef<number>(textFontSize);
 
   openPopoverRef.current = openPopover;
   textDraftRef.current = textDraft;
   annotationsRef.current = annotations;
+  selectedAnnotationIdRef.current = selectedAnnotationId;
   draftAnnotationRef.current = draftAnnotation;
   originalUrlRef.current = originalImageUrl;
+  activeToolRef.current = activeTool;
   activeColorRef.current = activeColor;
   sizePresetRef.current = sizePreset;
+  textFontSizeRef.current = textFontSize;
+
+  const pushUndoSnapshot = useCallback((snapshot: Annotation[]) => {
+    const stack = undoStackRef.current;
+    stack.push(snapshot);
+    if (stack.length > MAX_UNDO_HISTORY) {
+      stack.shift();
+    }
+  }, []);
+
+  const cancelActiveTransform = useCallback(() => {
+    const tf = activeTransformRef.current;
+    if (!tf) return false;
+    activeTransformRef.current = null;
+    activePointerIdRef.current = null;
+    annotationsRef.current = tf.beforeList;
+    setAnnotations(tf.beforeList);
+    if (tf.mode === "resize-text") {
+      textFontSizeRef.current = tf.beforeTextFontSize;
+      setTextFontSize(tf.beforeTextFontSize);
+    }
+    setIsTransforming(false);
+    return true;
+  }, []);
 
   const fetchOriginalForGen = useCallback(
     async (gen?: number, isDisposed?: () => boolean): Promise<string | null> => {
@@ -326,7 +431,14 @@ export function TranslateOverlay() {
         originalUrlRef.current = null;
         setOriginalImageUrl(null);
         annotationsRef.current = [];
+        undoStackRef.current = [];
         setAnnotations([]);
+        selectedAnnotationIdRef.current = null;
+        setSelectedAnnotationId(null);
+        activeTransformRef.current = null;
+        setIsTransforming(false);
+        setTransformRevision(0);
+        setToolbarSubbarHeight(31);
         draftAnnotationRef.current = null;
         activePointerIdRef.current = null;
         setDraftAnnotation(null);
@@ -392,6 +504,10 @@ export function TranslateOverlay() {
     const onKey = (event: KeyboardEvent) => {
       if (event.isComposing || event.keyCode === 229) return;
       if (event.key === "Escape") {
+        if (activeTransformRef.current) {
+          cancelActiveTransform();
+          return;
+        }
         if (draftAnnotationRef.current) {
           draftAnnotationRef.current = null;
           activePointerIdRef.current = null;
@@ -409,21 +525,18 @@ export function TranslateOverlay() {
           setOpenPopover("none");
           return;
         }
+        if (selectedAnnotationIdRef.current !== null) {
+          selectedAnnotationIdRef.current = null;
+          setSelectedAnnotationId(null);
+          return;
+        }
         void api.closeOverlay(generationRef.current);
         return;
       }
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z") {
         if (textDraftRef.current) return;
         event.preventDefault();
-        if (draftAnnotationRef.current) {
-          draftAnnotationRef.current = null;
-          activePointerIdRef.current = null;
-          setDraftAnnotation(null);
-          return;
-        }
-        const nextList = annotationsRef.current.slice(0, -1);
-        annotationsRef.current = nextList;
-        setAnnotations(nextList);
+        performUndoRef.current();
       }
     };
     window.addEventListener("keydown", onKey);
@@ -438,7 +551,7 @@ export function TranslateOverlay() {
       }
       unlistenUpdate?.();
     };
-  }, [fetchOriginalForGen]);
+  }, [cancelActiveTransform, fetchOriginalForGen]);
 
   const viewW = bounds?.w ?? (typeof window !== "undefined" ? window.innerWidth : viewport.w);
   const viewH = bounds?.h ?? (typeof window !== "undefined" ? window.innerHeight : viewport.h);
@@ -470,68 +583,80 @@ export function TranslateOverlay() {
     toastTimerRef.current = window.setTimeout(() => setSaveToast(null), 2600);
   }, []);
 
+  const rawStagePoint = useCallback((clientX: number, clientY: number): AnnotationPoint => {
+    const rect = stageElRef.current?.getBoundingClientRect();
+    if (!rect) return { x: clientX, y: clientY };
+    return { x: clientX - rect.left, y: clientY - rect.top };
+  }, []);
+
   const stageLocalPoint = useCallback(
     (clientX: number, clientY: number) => {
-      const rect = stageElRef.current?.getBoundingClientRect();
-      if (!rect) return clampPoint({ x: clientX, y: clientY }, stageRect.w, stageRect.h);
-      return clampPoint({ x: clientX - rect.left, y: clientY - rect.top }, stageRect.w, stageRect.h);
+      const raw = rawStagePoint(clientX, clientY);
+      return clampPoint(raw, stageRect.w, stageRect.h);
     },
-    [stageRect.h, stageRect.w],
+    [rawStagePoint, stageRect.h, stageRect.w],
   );
 
-  const flushTextDraft = useCallback((expectedId?: number): Annotation[] => {
-    const current = textDraftRef.current;
-    if (!current) return annotationsRef.current;
-    const targetId = typeof expectedId === "number" ? expectedId : undefined;
-    if (targetId !== undefined && current.id !== targetId) {
-      return annotationsRef.current;
-    }
-    textDraftRef.current = null;
-    setTextDraft(null);
-    setIsComposingText(false);
-    const domTa = textInputRef.current;
-    const rawValue =
-      domTa && domTa.dataset?.draftId === String(current.id) && typeof domTa.value === "string"
-        ? domTa.value
-        : current.value;
-    const trimmed = rawValue.trim();
-    if (!trimmed) return annotationsRef.current;
-    const layout = computeTextBoxLayout({
-      x: current.x,
-      y: current.y,
-      value: trimmed,
-      fontSize: sizePresetRef.current.fontSize,
-      stageWidth: stageRect.w,
-      stageHeight: stageRect.h,
-      measureFn: measureOverlayAnnotationText,
-    });
-    const committedLines = layout.wrappedLines;
-    const committedText = committedLines.join("\n");
-    const totalTextH = committedLines.length * layout.lineHeight;
-    const committedY =
-      stageRect.h > 0 && committedLines.length > layout.rows
-        ? Math.max(
-            TEXT_DRAFT_PAD_Y,
-            Math.min(
-              layout.textY,
-              Math.max(TEXT_DRAFT_PAD_Y, stageRect.h - totalTextH - TEXT_DRAFT_PAD_Y),
-            ),
-          )
-        : layout.textY;
-    const nextItem: Annotation = {
-      id: `ann-${Date.now()}-${annotationsRef.current.length}`,
-      kind: "text",
-      x: layout.textX,
-      y: committedY,
-      text: committedText,
-      color: activeColorRef.current,
-      fontSize: sizePresetRef.current.fontSize,
-    };
-    const nextList = [...annotationsRef.current, nextItem];
-    annotationsRef.current = nextList;
-    setAnnotations(nextList);
-    return nextList;
-  }, [stageRect.h, stageRect.w]);
+  const flushTextDraft = useCallback(
+    (expectedId?: number): Annotation[] => {
+      const current = textDraftRef.current;
+      if (!current) return annotationsRef.current;
+      const targetId = typeof expectedId === "number" ? expectedId : undefined;
+      if (targetId !== undefined && current.id !== targetId) {
+        return annotationsRef.current;
+      }
+      textDraftRef.current = null;
+      setTextDraft(null);
+      setIsComposingText(false);
+      const domTa = textInputRef.current;
+      const rawValue =
+        domTa && domTa.dataset?.draftId === String(current.id) && typeof domTa.value === "string"
+          ? domTa.value
+          : current.value;
+      const trimmed = rawValue.trim();
+      if (!trimmed) return annotationsRef.current;
+      const draftFontSize = clampTextFontSize(textFontSizeRef.current);
+      const layout = computeTextBoxLayout({
+        x: current.x,
+        y: current.y,
+        value: trimmed,
+        fontSize: draftFontSize,
+        stageWidth: stageRect.w,
+        stageHeight: stageRect.h,
+        measureFn: measureOverlayAnnotationText,
+      });
+      const committedLines = layout.wrappedLines;
+      const totalTextH = committedLines.length * layout.lineHeight;
+      const committedY =
+        stageRect.h > 0 && committedLines.length > layout.rows
+          ? Math.max(
+              TEXT_DRAFT_PAD_Y,
+              Math.min(
+                layout.textY,
+                Math.max(TEXT_DRAFT_PAD_Y, stageRect.h - totalTextH - TEXT_DRAFT_PAD_Y),
+              ),
+            )
+          : layout.textY;
+      const nextItem: Annotation = {
+        id: `ann-${Date.now()}-${++annotationSeqRef.current}`,
+        kind: "text",
+        x: layout.textX,
+        y: committedY,
+        text: trimmed,
+        color: activeColorRef.current,
+        fontSize: draftFontSize,
+      };
+      pushUndoSnapshot(annotationsRef.current);
+      const nextList = [...annotationsRef.current, nextItem];
+      annotationsRef.current = nextList;
+      setAnnotations(nextList);
+      selectedAnnotationIdRef.current = nextItem.id;
+      setSelectedAnnotationId(nextItem.id);
+      setTransformRevision((r) => r + 1);
+      return nextList;
+    },
+    [pushUndoSnapshot, stageRect.h, stageRect.w],
+  );
 
   const handleSelectLang = useCallback(
     (code: string) => {
@@ -604,6 +729,9 @@ export function TranslateOverlay() {
 
   const handleSelectTool = useCallback(
     (tool: AnnotationTool) => {
+      if (activeTransformRef.current) {
+        cancelActiveTransform();
+      }
       if (draftAnnotationRef.current) {
         draftAnnotationRef.current = null;
         activePointerIdRef.current = null;
@@ -612,15 +740,121 @@ export function TranslateOverlay() {
       if (tool !== "text" && textDraftRef.current) {
         flushTextDraft();
       }
+      if ((tool !== "none" && tool !== activeTool) || tool === "arrow" || tool === "pen") {
+        selectedAnnotationIdRef.current = null;
+        setSelectedAnnotationId(null);
+      }
       if (tool !== "none") {
         ensureOverlayWindowFocused();
       }
       setActiveTool(tool);
     },
-    [ensureOverlayWindowFocused, flushTextDraft],
+    [activeTool, cancelActiveTransform, ensureOverlayWindowFocused, flushTextDraft],
+  );
+
+  const handleSelectColor = useCallback(
+    (hex: string) => {
+      activeColorRef.current = hex;
+      setActiveColor(hex);
+      const selId = selectedAnnotationIdRef.current;
+      if (selId && !textDraftRef.current) {
+        const prev = annotationsRef.current;
+        const idx = prev.findIndex((item) => item.id === selId && isEditableAnnotation(item));
+        if (idx >= 0 && prev[idx]!.color !== hex) {
+          pushUndoSnapshot(prev);
+          const next = prev.map((item, i) => (i === idx ? { ...item, color: hex } : item));
+          annotationsRef.current = next;
+          setAnnotations(next);
+        }
+      }
+    },
+    [pushUndoSnapshot],
+  );
+
+  const handleSelectSize = useCallback(
+    (sizeId: AnnotationSize["id"]) => {
+      const preset = ANNOTATION_SIZES.find((item) => item.id === sizeId) ?? ANNOTATION_SIZES[1];
+      const selId = selectedAnnotationIdRef.current;
+      const prev = annotationsRef.current;
+      const idx =
+        selId && !textDraftRef.current
+          ? prev.findIndex((item) => item.id === selId && isEditableAnnotation(item))
+          : -1;
+      const target = idx >= 0 ? (prev[idx] as EditableAnnotation) : null;
+      const inTextContext =
+        target?.kind === "text" || (!target && activeToolRef.current === "text");
+
+      if (inTextContext) {
+        textFontSizeRef.current = preset.fontSize;
+        setTextFontSize(preset.fontSize);
+      } else {
+        sizePresetRef.current = preset;
+        setActiveSize(sizeId);
+      }
+
+      if (target) {
+        const updated: EditableAnnotation =
+          target.kind === "text"
+            ? applyTextAnnotationFontSize(
+                target,
+                preset.fontSize,
+                stageRect.w,
+                stageRect.h,
+                measureOverlayAnnotationText,
+              )
+            : { ...target, strokeWidth: preset.strokeWidth };
+        if (!areAnnotationsEqual(target, updated)) {
+          pushUndoSnapshot(prev);
+          const next = prev.map((item, i) => (i === idx ? updated : item));
+          annotationsRef.current = next;
+          setAnnotations(next);
+          setTransformRevision((r) => r + 1);
+        }
+      }
+    },
+    [pushUndoSnapshot, stageRect.h, stageRect.w],
+  );
+
+  const handleAdjustFontSize = useCallback(
+    (delta: number) => {
+      const selId = selectedAnnotationIdRef.current;
+      const prev = annotationsRef.current;
+      const selIdx =
+        selId && !textDraftRef.current
+          ? prev.findIndex((item) => item.id === selId && item.kind === "text")
+          : -1;
+      const selText = selIdx >= 0 ? (prev[selIdx] as Extract<Annotation, { kind: "text" }>) : null;
+      const baseFs = selText ? selText.fontSize : textFontSizeRef.current;
+      const nextFs = clampTextFontSize(baseFs + delta);
+
+      textFontSizeRef.current = nextFs;
+      setTextFontSize(nextFs);
+
+      if (selText) {
+        const updated = applyTextAnnotationFontSize(
+          selText,
+          nextFs,
+          stageRect.w,
+          stageRect.h,
+          measureOverlayAnnotationText,
+        );
+        if (!areAnnotationsEqual(selText, updated)) {
+          pushUndoSnapshot(prev);
+          const next = prev.map((item, i) => (i === selIdx ? updated : item));
+          annotationsRef.current = next;
+          setAnnotations(next);
+          setTransformRevision((r) => r + 1);
+        }
+      }
+    },
+    [pushUndoSnapshot, stageRect.h, stageRect.w],
   );
 
   const handleUndo = useCallback(() => {
+    if (activeTransformRef.current) {
+      cancelActiveTransform();
+      return;
+    }
     if (draftAnnotationRef.current) {
       draftAnnotationRef.current = null;
       activePointerIdRef.current = null;
@@ -633,10 +867,22 @@ export function TranslateOverlay() {
       setIsComposingText(false);
       return;
     }
-    const nextList = annotationsRef.current.slice(0, -1);
+    const popped = undoStackRef.current.pop();
+    const nextList = popped ?? annotationsRef.current.slice(0, -1);
     annotationsRef.current = nextList;
     setAnnotations(nextList);
-  }, []);
+    const selId = selectedAnnotationIdRef.current;
+    if (selId) {
+      const stillSelected = nextList.find((item) => item.id === selId);
+      if (!stillSelected || !isEditableAnnotation(stillSelected)) {
+        selectedAnnotationIdRef.current = null;
+        setSelectedAnnotationId(null);
+      }
+    }
+    setTransformRevision((r) => r + 1);
+  }, [cancelActiveTransform]);
+
+  performUndoRef.current = handleUndo;
 
   const isForeignPointerEvent = useCallback((event: unknown): boolean => {
     const activeId = activePointerIdRef.current;
@@ -644,6 +890,188 @@ export function TranslateOverlay() {
     const pid = (event as { pointerId?: unknown }).pointerId;
     return typeof pid === "number" && pid !== activeId;
   }, []);
+
+  const handleTransformMouseDown = useCallback(
+    (event: { button: number; ctrlKey?: boolean; preventDefault: () => void; stopPropagation?: () => void }) => {
+      if (event.button === 0 && !event.ctrlKey) {
+        event.preventDefault();
+        event.stopPropagation?.();
+      }
+    },
+    [],
+  );
+
+  const beginAnnotationTransform = useCallback(
+    (
+      event: ReactPointerEvent<Element>,
+      buildTransform: (baseList: Annotation[], startRaw: AnnotationPoint) => ActiveTransform | null,
+    ) => {
+      if (event.button !== 0 || event.ctrlKey || draftAnnotationRef.current) return;
+      event.preventDefault?.();
+      event.stopPropagation();
+      if (openPopoverRef.current !== "none") {
+        openPopoverRef.current = "none";
+        setOpenPopover("none");
+      }
+      const baseList = textDraftRef.current ? flushTextDraft() : annotationsRef.current;
+      const startRaw = rawStagePoint(event.clientX, event.clientY);
+      const tf = buildTransform(baseList, startRaw);
+      if (!tf) return;
+
+      selectedAnnotationIdRef.current = tf.id;
+      setSelectedAnnotationId(tf.id);
+      ensureOverlayWindowFocused();
+      activePointerIdRef.current = typeof event.pointerId === "number" ? event.pointerId : null;
+      try {
+        event.currentTarget?.setPointerCapture?.(event.pointerId);
+      } catch {
+        // WebKit 合成指针或无捕获支持时由下方 window 捕获监听兜底。
+      }
+      activeTransformRef.current = tf;
+      setIsTransforming(true);
+    },
+    [ensureOverlayWindowFocused, flushTextDraft, rawStagePoint],
+  );
+
+  const startMoveAnnotation = useCallback(
+    (id: string, event: ReactPointerEvent<Element>) => {
+      beginAnnotationTransform(event, (baseList, startRaw) => {
+        const target = baseList.find((item) => item.id === id && isEditableAnnotation(item));
+        if (!target || !isEditableAnnotation(target)) return null;
+        return {
+          mode: "move",
+          id: target.id,
+          startRaw,
+          startAnnotation: target,
+          beforeList: baseList,
+        };
+      });
+    },
+    [beginAnnotationTransform],
+  );
+
+  const startResizeShapeAnnotation = useCallback(
+    (id: string, handle: ResizeHandle, event: ReactPointerEvent<Element>) => {
+      beginAnnotationTransform(event, (baseList, startRaw) => {
+        const target = baseList.find(
+          (item): item is Extract<Annotation, { kind: "rect" | "ellipse" }> =>
+            item.id === id && (item.kind === "rect" || item.kind === "ellipse"),
+        );
+        if (!target) return null;
+        return {
+          mode: "resize-shape",
+          id: target.id,
+          handle,
+          startRaw,
+          startAnnotation: target,
+          beforeList: baseList,
+        };
+      });
+    },
+    [beginAnnotationTransform],
+  );
+
+  const startResizeTextAnnotation = useCallback(
+    (id: string, handle: TextResizeHandle, event: ReactPointerEvent<Element>) => {
+      beginAnnotationTransform(event, (baseList, startRaw) => {
+        const target = baseList.find(
+          (item): item is Extract<Annotation, { kind: "text" }> =>
+            item.id === id && item.kind === "text",
+        );
+        if (!target) return null;
+        return {
+          mode: "resize-text",
+          id: target.id,
+          handle,
+          startRaw,
+          startAnnotation: target,
+          beforeList: baseList,
+          beforeTextFontSize: textFontSizeRef.current,
+        };
+      });
+    },
+    [beginAnnotationTransform],
+  );
+
+  const updateTransformAtClientPoint = useCallback(
+    (clientX: number, clientY: number) => {
+      const tf = activeTransformRef.current;
+      if (!tf) return;
+      const curRaw = rawStagePoint(clientX, clientY);
+      const dx = curRaw.x - tf.startRaw.x;
+      const dy = curRaw.y - tf.startRaw.y;
+
+      let updated: EditableAnnotation;
+      if (tf.mode === "move") {
+        updated = moveAnnotationInStage(
+          tf.startAnnotation,
+          dx,
+          dy,
+          stageRect.w,
+          stageRect.h,
+          measureOverlayAnnotationText,
+        );
+      } else if (tf.mode === "resize-shape") {
+        updated = resizeShapeAnnotationInStage(
+          tf.startAnnotation,
+          tf.handle,
+          dx,
+          dy,
+          stageRect.w,
+          stageRect.h,
+        );
+      } else {
+        updated = resizeTextAnnotationFontSize(
+          tf.startAnnotation,
+          tf.handle,
+          dx,
+          dy,
+          stageRect.w,
+          stageRect.h,
+          measureOverlayAnnotationText,
+        );
+      }
+
+      const currentList = annotationsRef.current;
+      const idx = currentList.findIndex((item) => item.id === tf.id);
+      if (idx < 0) return;
+      if (!areAnnotationsEqual(currentList[idx]!, updated)) {
+        const nextList = currentList.map((item, i) => (i === idx ? updated : item));
+        annotationsRef.current = nextList;
+        setAnnotations(nextList);
+        if (tf.mode === "resize-text" && updated.kind === "text") {
+          textFontSizeRef.current = updated.fontSize;
+          setTextFontSize(updated.fontSize);
+        }
+      }
+    },
+    [rawStagePoint, stageRect.h, stageRect.w],
+  );
+
+  const finishTransform = useCallback(
+    (event?: { clientX?: unknown; clientY?: unknown; pointerId?: unknown }) => {
+      const tf = activeTransformRef.current;
+      if (!tf || isForeignPointerEvent(event)) return;
+      if (
+        event &&
+        typeof event.clientX === "number" &&
+        Number.isFinite(event.clientX) &&
+        typeof event.clientY === "number" &&
+        Number.isFinite(event.clientY)
+      ) {
+        updateTransformAtClientPoint(event.clientX, event.clientY);
+      }
+      const finalItem = annotationsRef.current.find((item) => item.id === tf.id);
+      activeTransformRef.current = null;
+      activePointerIdRef.current = null;
+      setIsTransforming(false);
+      if (finalItem && !areAnnotationsEqual(tf.startAnnotation, finalItem)) {
+        pushUndoSnapshot(tf.beforeList);
+        setTransformRevision((r) => r + 1);
+      }
+    },
+    [isForeignPointerEvent, pushUndoSnapshot, updateTransformAtClientPoint],
+  );
 
   const isAcceptedToolMouseButton = useCallback(
     (button: number, ctrlKey = false) => {
@@ -665,12 +1093,19 @@ export function TranslateOverlay() {
 
   const handleStagePointerDown = useCallback(
     (event: ReactPointerEvent<Element>) => {
-      if (activeTool === "none" || !isAcceptedToolMouseButton(event.button, Boolean(event.ctrlKey))) {
+      if (activeTool === "none") {
+        if (event.button === 0 && !event.ctrlKey && selectedAnnotationIdRef.current !== null) {
+          selectedAnnotationIdRef.current = null;
+          setSelectedAnnotationId(null);
+        }
+        return;
+      }
+      if (!isAcceptedToolMouseButton(event.button, Boolean(event.ctrlKey))) {
         return;
       }
       event.preventDefault?.();
       event.stopPropagation();
-      if (draftAnnotationRef.current) return;
+      if (draftAnnotationRef.current || activeTransformRef.current) return;
       if (openPopoverRef.current !== "none") {
         const isBackdrop =
           (event.currentTarget as { dataset?: { testid?: string } } | null)?.dataset?.testid ===
@@ -685,6 +1120,8 @@ export function TranslateOverlay() {
       const pt = stageLocalPoint(event.clientX, event.clientY);
       if (activeTool === "text") {
         flushTextDraft();
+        selectedAnnotationIdRef.current = null;
+        setSelectedAnnotationId(null);
         const nextId = ++textDraftSeqRef.current;
         const fresh = { id: nextId, x: pt.x, y: pt.y, value: "" };
         textDraftRef.current = fresh;
@@ -694,6 +1131,8 @@ export function TranslateOverlay() {
         return;
       }
       flushTextDraft();
+      selectedAnnotationIdRef.current = null;
+      setSelectedAnnotationId(null);
       ensureOverlayWindowFocused();
 
       activePointerIdRef.current = typeof event.pointerId === "number" ? event.pointerId : null;
@@ -702,7 +1141,7 @@ export function TranslateOverlay() {
       } catch {
         // WebKit 在辅助键或合成指针下 setPointerCapture 可能抛错，由下方 window 级拖拽监听统一兜底。
       }
-      const id = `ann-${Date.now()}`;
+      const id = `ann-${Date.now()}-${++annotationSeqRef.current}`;
       const nextDraft: Annotation =
         activeTool === "pen"
           ? {
@@ -762,10 +1201,15 @@ export function TranslateOverlay() {
 
   const handleStagePointerMove = useCallback(
     (event: ReactPointerEvent<Element>) => {
-      if (!draftAnnotationRef.current || isForeignPointerEvent(event)) return;
+      if (isForeignPointerEvent(event)) return;
+      if (activeTransformRef.current) {
+        updateTransformAtClientPoint(event.clientX, event.clientY);
+        return;
+      }
+      if (!draftAnnotationRef.current) return;
       updateDraftAtClientPoint(event.clientX, event.clientY);
     },
-    [isForeignPointerEvent, updateDraftAtClientPoint],
+    [isForeignPointerEvent, updateDraftAtClientPoint, updateTransformAtClientPoint],
   );
 
   const finishDraft = useCallback(
@@ -785,14 +1229,61 @@ export function TranslateOverlay() {
       draftAnnotationRef.current = null;
       activePointerIdRef.current = null;
       if (isMeaningfulAnnotation(current)) {
+        pushUndoSnapshot(annotationsRef.current);
         const nextList = [...annotationsRef.current, current];
         annotationsRef.current = nextList;
         setAnnotations(nextList);
+        if (current.kind === "rect" || current.kind === "ellipse") {
+          selectedAnnotationIdRef.current = current.id;
+          setSelectedAnnotationId(current.id);
+          setTransformRevision((r) => r + 1);
+        }
       }
       setDraftAnnotation(null);
     },
-    [isForeignPointerEvent, updateDraftAtClientPoint],
+    [isForeignPointerEvent, pushUndoSnapshot, updateDraftAtClientPoint],
   );
+
+  const finishPointerInteraction = useCallback(
+    (event?: { clientX?: unknown; clientY?: unknown; pointerId?: unknown }) => {
+      if (activeTransformRef.current) {
+        finishTransform(event);
+      }
+      if (draftAnnotationRef.current) {
+        finishDraft(event);
+      }
+    },
+    [finishDraft, finishTransform],
+  );
+
+  const selectedAnnotation = useMemo<EditableAnnotation | null>(() => {
+    if (!selectedAnnotationId || textDraft) return null;
+    const found = annotations.find((item) => item.id === selectedAnnotationId);
+    return isEditableAnnotation(found) ? found : null;
+  }, [annotations, selectedAnnotationId, textDraft]);
+
+  const selectedAnnotationKind = selectedAnnotation?.kind ?? null;
+  const displayedColor = selectedAnnotation ? selectedAnnotation.color : activeColor;
+  const displayedSize: AnnotationSize["id"] = useMemo(() => {
+    if (selectedAnnotation && selectedAnnotation.kind !== "text") {
+      return (
+        ANNOTATION_SIZES.find((item) => item.strokeWidth === selectedAnnotation.strokeWidth)?.id ??
+        activeSize
+      );
+    }
+    return activeSize;
+  }, [activeSize, selectedAnnotation]);
+  const displayedFontSize =
+    selectedAnnotation?.kind === "text" ? selectedAnnotation.fontSize : textFontSize;
+  const hasSubbarVisible = activeTool !== "none" || selectedAnnotationKind !== null;
+
+  const effectiveViewW = viewW > 0 ? viewW : stageRect.x + stageRect.w;
+  const toolbarMaxWidth = effectiveViewW > 0 ? Math.max(200, effectiveViewW - 8) : undefined;
+  const isTextSubbarContext =
+    selectedAnnotationKind === "text" || (!selectedAnnotationKind && activeTool === "text");
+  const estimatedSubbarH =
+    isTextSubbarContext && toolbarMaxWidth !== undefined && toolbarMaxWidth < 368 ? 64 : 31;
+  const effectiveSubbarH = Math.max(estimatedSubbarH, toolbarSubbarHeight);
 
   const effectiveBarH = Math.max(40, toolbarMainHeight);
   const needToolbarSpace = effectiveBarH + 12;
@@ -811,7 +1302,7 @@ export function TranslateOverlay() {
   const popoverUp =
     toolbarDock === "inside-bottom" ||
     (spaceBelowBar < 190 && spaceAboveBar >= spaceBelowBar);
-  const subbarNeedSpace = 37;
+  const subbarNeedSpace = effectiveSubbarH + 6;
   const subbarAbove =
     toolbarDock === "inside-bottom"
       ? spaceAboveBar >= subbarNeedSpace || spaceAboveBar >= spaceBelowBar
@@ -838,8 +1329,6 @@ export function TranslateOverlay() {
   const showToolbar = stage === "done" || retranslating;
   const hasPendingText = Boolean(textDraft && textDraft.value.trim().length > 0);
   const effectiveAnnotationsCount = annotations.length + (hasPendingText ? 1 : 0);
-  const effectiveViewW = viewW > 0 ? viewW : stageRect.x + stageRect.w;
-  const toolbarMaxWidth = effectiveViewW > 0 ? Math.max(200, effectiveViewW - 8) : undefined;
   const measuredBarW = Math.min(effectiveViewW, Math.max(200, toolbarWidth));
   const maxToolbarLeft = Math.max(0, effectiveViewW - measuredBarW - 4);
   const toolbarLeft = Math.max(
@@ -853,6 +1342,10 @@ export function TranslateOverlay() {
     const mainEl =
       typeof el.querySelector === "function"
         ? (el.querySelector("[data-testid='capture-toolbar-main']") as HTMLElement | null)
+        : null;
+    const subbarEl =
+      typeof el.querySelector === "function"
+        ? (el.querySelector("[data-testid='capture-subbar']") as HTMLElement | null)
         : null;
     const measure = () => {
       const target = mainEl ?? el;
@@ -868,6 +1361,22 @@ export function TranslateOverlay() {
           Math.abs(prev - normalizedH) > 0.5 ? normalizedH : prev,
         );
       }
+      const curSubbar =
+        typeof el.querySelector === "function"
+          ? (el.querySelector("[data-testid='capture-subbar']") as HTMLElement | null)
+          : subbarEl;
+      if (curSubbar) {
+        const sRect = curSubbar.getBoundingClientRect?.();
+        const sh = sRect?.height || curSubbar.offsetHeight;
+        if (sh > 0 && Number.isFinite(sh)) {
+          const normalizedSh = Math.max(31, Math.round(sh));
+          setToolbarSubbarHeight((prev) =>
+            Math.abs(prev - normalizedSh) > 0.5 ? normalizedSh : prev,
+          );
+        }
+      } else {
+        setToolbarSubbarHeight((prev) => (prev !== 31 ? 31 : prev));
+      }
     };
     measure();
     if (typeof ResizeObserver === "undefined") return () => {};
@@ -876,31 +1385,37 @@ export function TranslateOverlay() {
     if (mainEl && mainEl !== el) {
       observer.observe(mainEl);
     }
+    if (subbarEl && subbarEl !== el) {
+      observer.observe(subbarEl);
+    }
     return () => observer.disconnect();
   }, [
     showToolbar,
     targetLang,
     activeTool,
+    selectedAnnotationKind,
     effectiveAnnotationsCount,
     saving,
     retranslating,
     toolbarMaxWidth,
   ]);
 
-  const isDraggingAnnotation = draftAnnotation !== null;
-  const isDrawingToolActive = activeTool !== "none" && activeTool !== "text";
+  const isDraggingAnnotation = draftAnnotation !== null || isTransforming;
   const isEditingText = textDraft !== null;
+  const canInteractAnnotations =
+    draftAnnotation === null &&
+    (activeTool === "none" ||
+      activeTool === "rect" ||
+      activeTool === "ellipse" ||
+      activeTool === "text");
 
   useEffect(() => {
-    if (
-      !isDrawingToolActive ||
-      typeof window === "undefined" ||
-      typeof window.addEventListener !== "function"
-    ) {
+    if (typeof window === "undefined" || typeof window.addEventListener !== "function") {
       return () => {};
     }
     const onMove = (event: Event) => {
-      if (!draftAnnotationRef.current || isForeignPointerEvent(event)) return;
+      if (!draftAnnotationRef.current && !activeTransformRef.current) return;
+      if (isForeignPointerEvent(event)) return;
       const e = event as { clientX?: unknown; clientY?: unknown };
       if (
         typeof e.clientX === "number" &&
@@ -908,20 +1423,27 @@ export function TranslateOverlay() {
         typeof e.clientY === "number" &&
         Number.isFinite(e.clientY)
       ) {
-        updateDraftAtClientPoint(e.clientX, e.clientY);
+        if (activeTransformRef.current) {
+          updateTransformAtClientPoint(e.clientX, e.clientY);
+        } else {
+          updateDraftAtClientPoint(e.clientX, e.clientY);
+        }
       }
     };
     const onUp = (event: Event) => {
-      if (!draftAnnotationRef.current) return;
-      finishDraft(event as { clientX?: unknown; clientY?: unknown; pointerId?: unknown });
+      if (!draftAnnotationRef.current && !activeTransformRef.current) return;
+      finishPointerInteraction(
+        event as { clientX?: unknown; clientY?: unknown; pointerId?: unknown },
+      );
     };
     const onPointerCancel = (event: Event) => {
-      if (!draftAnnotationRef.current || isForeignPointerEvent(event)) return;
-      finishDraft();
+      if (!draftAnnotationRef.current && !activeTransformRef.current) return;
+      if (isForeignPointerEvent(event)) return;
+      finishPointerInteraction();
     };
     const onBlur = () => {
-      if (!draftAnnotationRef.current) return;
-      finishDraft();
+      if (!draftAnnotationRef.current && !activeTransformRef.current) return;
+      finishPointerInteraction();
     };
     window.addEventListener("pointermove", onMove, true);
     window.addEventListener("mousemove", onMove, true);
@@ -937,7 +1459,12 @@ export function TranslateOverlay() {
       window.removeEventListener("pointercancel", onPointerCancel, true);
       window.removeEventListener("blur", onBlur);
     };
-  }, [finishDraft, isDrawingToolActive, isForeignPointerEvent, updateDraftAtClientPoint]);
+  }, [
+    finishPointerInteraction,
+    isForeignPointerEvent,
+    updateDraftAtClientPoint,
+    updateTransformAtClientPoint,
+  ]);
 
   useEffect(() => {
     const rects: CaptureHitRect[] = [];
@@ -965,9 +1492,12 @@ export function TranslateOverlay() {
         if (showToolbar) {
           rects.push({
             x: toolbarLeft,
-            y: subbarAbove && activeTool !== "none" ? Math.max(0, toolbarTop - subbarNeedSpace) : toolbarTop,
+            y:
+              subbarAbove && hasSubbarVisible
+                ? Math.max(0, toolbarTop - subbarNeedSpace)
+                : toolbarTop,
             w: measuredBarW,
-            h: effectiveBarH + (activeTool !== "none" ? 40 : 4),
+            h: effectiveBarH + (hasSubbarVisible ? subbarNeedSpace + 3 : 4),
           });
         }
       }
@@ -984,6 +1514,7 @@ export function TranslateOverlay() {
     effectiveViewW,
     error,
     actionError,
+    hasSubbarVisible,
     isDraggingAnnotation,
     isEditingText,
     measuredBarW,
@@ -991,6 +1522,7 @@ export function TranslateOverlay() {
     saveToast,
     openPopover,
     retranslating,
+    selectedAnnotationId,
     showToolbar,
     activeSize,
     stage,
@@ -1005,7 +1537,9 @@ export function TranslateOverlay() {
     textDraft?.y ?? null,
     toolbarLeft,
     toolbarTop,
+    transformRevision,
     subbarAbove,
+    subbarNeedSpace,
     viewH,
   ]);
 
@@ -1024,8 +1558,8 @@ export function TranslateOverlay() {
           e.preventDefault();
         }
       }}
-      onPointerUpCapture={(e) => finishDraft(e)}
-      onMouseUpCapture={(e) => finishDraft(e)}
+      onPointerUpCapture={(e) => finishPointerInteraction(e)}
+      onMouseUpCapture={(e) => finishPointerInteraction(e)}
       onClick={() => {
         if (openPopover !== "none") {
           openPopoverRef.current = "none";
@@ -1041,9 +1575,9 @@ export function TranslateOverlay() {
             onPointerDown={handleStagePointerDown}
             onMouseDown={handleStageMouseDown}
             onPointerMove={handleStagePointerMove}
-            onPointerUp={finishDraft}
+            onPointerUp={finishPointerInteraction}
             onPointerCancel={(e) => {
-              if (!isForeignPointerEvent(e)) finishDraft();
+              if (!isForeignPointerEvent(e)) finishPointerInteraction();
             }}
             onContextMenu={(e) => e.preventDefault()}
             className={`absolute inset-0 z-[15] ${
@@ -1057,6 +1591,17 @@ export function TranslateOverlay() {
           ref={stageElRef}
           data-testid="capture-stage"
           data-hit-rect="true"
+          onPointerDown={(e) => {
+            if (
+              activeTool === "none" &&
+              e.button === 0 &&
+              !e.ctrlKey &&
+              selectedAnnotationIdRef.current !== null
+            ) {
+              selectedAnnotationIdRef.current = null;
+              setSelectedAnnotationId(null);
+            }
+          }}
           className="absolute"
           style={{
             left: stageRect.x,
@@ -1095,12 +1640,13 @@ export function TranslateOverlay() {
               width={stageRect.w}
               height={stageRect.h}
               viewBox={`0 0 ${stageRect.w} ${stageRect.h}`}
+              style={{ overflow: "visible" }}
               onPointerDown={handleStagePointerDown}
               onMouseDown={handleStageMouseDown}
               onPointerMove={handleStagePointerMove}
-              onPointerUp={finishDraft}
+              onPointerUp={finishPointerInteraction}
               onPointerCancel={(e) => {
-                if (!isForeignPointerEvent(e)) finishDraft();
+                if (!isForeignPointerEvent(e)) finishPointerInteraction();
               }}
               onContextMenu={(e) => e.preventDefault()}
               className={`absolute inset-0 z-20 h-full w-full ${
@@ -1115,6 +1661,180 @@ export function TranslateOverlay() {
                 <AnnotationShape key={item.id} item={item} stageWidth={stageRect.w} />
               ))}
               {draftAnnotation && <AnnotationShape item={draftAnnotation} stageWidth={stageRect.w} />}
+
+              {canInteractAnnotations &&
+                annotations.map((ann) => {
+                  if (ann.kind === "rect") {
+                    const r = normalizeRect(ann.x1, ann.y1, ann.x2, ann.y2);
+                    const hitStroke = Math.max(12, ann.strokeWidth + 8);
+                    return (
+                      <rect
+                        key={`hit-${ann.id}`}
+                        data-testid={`annotation-hit-${ann.id}`}
+                        x={r.x}
+                        y={r.y}
+                        width={r.w}
+                        height={r.h}
+                        fill="none"
+                        stroke="transparent"
+                        strokeWidth={hitStroke}
+                        pointerEvents="stroke"
+                        style={{ pointerEvents: "stroke", cursor: "move" }}
+                        onMouseDown={handleTransformMouseDown}
+                        onPointerDown={(e) => startMoveAnnotation(ann.id, e)}
+                      />
+                    );
+                  }
+                  if (ann.kind === "ellipse") {
+                    const r = normalizeRect(ann.x1, ann.y1, ann.x2, ann.y2);
+                    const hitStroke = Math.max(12, ann.strokeWidth + 8);
+                    return (
+                      <ellipse
+                        key={`hit-${ann.id}`}
+                        data-testid={`annotation-hit-${ann.id}`}
+                        cx={r.x + r.w / 2}
+                        cy={r.y + r.h / 2}
+                        rx={r.w / 2}
+                        ry={r.h / 2}
+                        fill="none"
+                        stroke="transparent"
+                        strokeWidth={hitStroke}
+                        pointerEvents="stroke"
+                        style={{ pointerEvents: "stroke", cursor: "move" }}
+                        onMouseDown={handleTransformMouseDown}
+                        onPointerDown={(e) => startMoveAnnotation(ann.id, e)}
+                      />
+                    );
+                  }
+                  if (ann.kind === "text") {
+                    const bounds = computeTextAnnotationBounds(
+                      ann,
+                      stageRect.w,
+                      measureOverlayAnnotationText,
+                    );
+                    const frame = getTextSelectionFrame(bounds);
+                    return (
+                      <rect
+                        key={`hit-${ann.id}`}
+                        data-testid={`annotation-hit-${ann.id}`}
+                        x={frame.x}
+                        y={frame.y}
+                        width={frame.w}
+                        height={frame.h}
+                        rx={3}
+                        fill="transparent"
+                        pointerEvents="all"
+                        style={{ pointerEvents: "all", cursor: "move" }}
+                        onMouseDown={handleTransformMouseDown}
+                        onPointerDown={(e) => startMoveAnnotation(ann.id, e)}
+                      />
+                    );
+                  }
+                  return null;
+                })}
+
+              {canInteractAnnotations &&
+                selectedAnnotation &&
+                (() => {
+                  if (selectedAnnotation.kind !== "text") {
+                    const r = normalizeRect(
+                      selectedAnnotation.x1,
+                      selectedAnnotation.y1,
+                      selectedAnnotation.x2,
+                      selectedAnnotation.y2,
+                    );
+                    const allHandles = getShapeResizeHandles(r);
+                    const orderedHandles = [
+                      ...allHandles.filter((h) => h.handle.length === 1),
+                      ...allHandles.filter((h) => h.handle.length === 2),
+                    ];
+                    return (
+                      <g data-testid="annotation-selection-gizmo">
+                        <rect
+                          data-testid="annotation-selection-frame"
+                          x={r.x}
+                          y={r.y}
+                          width={r.w}
+                          height={r.h}
+                          fill="none"
+                          stroke="#2f7cf6"
+                          strokeWidth={1}
+                          strokeDasharray="4 3"
+                          pointerEvents="none"
+                          style={{ pointerEvents: "none" }}
+                        />
+                        {orderedHandles.map((h) => (
+                          <rect
+                            key={h.handle}
+                            data-testid={`annotation-handle-${h.handle}`}
+                            data-hit-rect="true"
+                            x={h.x - 4}
+                            y={h.y - 4}
+                            width={8}
+                            height={8}
+                            rx={1.5}
+                            fill="#ffffff"
+                            stroke="#2f7cf6"
+                            strokeWidth={1.5}
+                            pointerEvents="all"
+                            style={{ pointerEvents: "all", cursor: h.cursor }}
+                            onMouseDown={handleTransformMouseDown}
+                            onPointerDown={(e) =>
+                              startResizeShapeAnnotation(selectedAnnotation.id, h.handle, e)
+                            }
+                          />
+                        ))}
+                      </g>
+                    );
+                  }
+
+                  const bounds = computeTextAnnotationBounds(
+                    selectedAnnotation,
+                    stageRect.w,
+                    measureOverlayAnnotationText,
+                  );
+                  const frame = getTextSelectionFrame(bounds);
+                  const handles = getTextResizeHandles(bounds);
+                  return (
+                    <g data-testid="annotation-selection-gizmo">
+                      <rect
+                        data-testid="annotation-selection-frame"
+                        x={frame.x}
+                        y={frame.y}
+                        width={frame.w}
+                        height={frame.h}
+                        rx={3}
+                        fill="none"
+                        stroke="#2f7cf6"
+                        strokeWidth={1.2}
+                        strokeDasharray="4 3"
+                        pointerEvents="none"
+                        style={{ pointerEvents: "none" }}
+                      />
+                      {handles.map((h) => (
+                        <rect
+                          key={h.handle}
+                          data-testid={`annotation-handle-${h.handle}`}
+                          data-hit-rect="true"
+                          x={h.x - 4}
+                          y={h.y - 4}
+                          width={8}
+                          height={8}
+                          rx={1.5}
+                          fill="#ffffff"
+                          stroke="#2f7cf6"
+                          strokeWidth={1.5}
+                          pointerEvents="all"
+                          style={{ pointerEvents: "all", cursor: h.cursor }}
+                          onMouseDown={handleTransformMouseDown}
+                          onPointerDown={(e) =>
+                            startResizeTextAnnotation(selectedAnnotation.id, h.handle, e)
+                          }
+                        />
+                      ))}
+                    </g>
+                  );
+                })()}
             </svg>
           )}
 
@@ -1124,7 +1844,7 @@ export function TranslateOverlay() {
               x: textDraft.x,
               y: textDraft.y,
               value: textDraft.value,
-              fontSize: sizePreset.fontSize,
+              fontSize: textFontSize,
               stageWidth: stageRect.w,
               stageHeight: stageRect.h,
               measureFn: measureOverlayAnnotationText,
@@ -1214,7 +1934,7 @@ export function TranslateOverlay() {
                     padding: `${TEXT_DRAFT_PAD_Y - 1}px ${TEXT_DRAFT_PAD_X - 1}px`,
                     lineHeight: `${box.lineHeight}px`,
                     color: activeColor,
-                    fontSize: sizePreset.fontSize,
+                    fontSize: textFontSize,
                     whiteSpace: "pre-wrap",
                     overflowWrap: "break-word",
                     wordBreak: "break-word",
@@ -1230,7 +1950,7 @@ export function TranslateOverlay() {
                       top: box.textY,
                       maxWidth: Math.max(0, box.width - TEXT_DRAFT_PAD_X * 2),
                       lineHeight: `${box.lineHeight}px`,
-                      fontSize: sizePreset.fontSize,
+                      fontSize: textFontSize,
                     }}
                   >
                     输入文字
@@ -1278,10 +1998,13 @@ export function TranslateOverlay() {
             onSelectLang={handleSelectLang}
             activeTool={activeTool}
             onSelectTool={handleSelectTool}
-            activeColor={activeColor}
-            onSelectColor={setActiveColor}
-            activeSize={activeSize}
-            onSelectSize={setActiveSize}
+            activeColor={displayedColor}
+            onSelectColor={handleSelectColor}
+            activeSize={displayedSize}
+            onSelectSize={handleSelectSize}
+            selectedAnnotationKind={selectedAnnotationKind}
+            currentFontSize={displayedFontSize}
+            onAdjustFontSize={handleAdjustFontSize}
             annotationsCount={effectiveAnnotationsCount}
             onUndo={handleUndo}
             onSave={handleSave}

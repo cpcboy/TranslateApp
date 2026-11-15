@@ -134,6 +134,30 @@ export function isMeaningfulAnnotation(item: Annotation): boolean {
 
 export const TEXT_DRAFT_PAD_X = 6;
 export const TEXT_DRAFT_PAD_Y = 3;
+export const MIN_TEXT_FONT_SIZE = 12;
+export const MAX_TEXT_FONT_SIZE = 72;
+export const TEXT_FONT_SIZE_STEP = 2;
+export const MIN_RESIZE_SHAPE_SIZE = 8;
+
+export type ResizeHandle = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w";
+export type TextResizeHandle = "nw" | "ne" | "se" | "sw";
+export type EditableAnnotation = Extract<Annotation, { kind: "rect" | "ellipse" | "text" }>;
+
+export interface HandleDescriptor<H extends string = ResizeHandle> {
+  handle: H;
+  x: number;
+  y: number;
+  cursor: string;
+}
+
+export interface TextAnnotationBounds {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  lines: string[];
+  lineHeight: number;
+}
 
 export interface TextBoxLayout {
   left: number;
@@ -346,4 +370,318 @@ export function computeTextBoxLayout(options: {
     textY: top + TEXT_DRAFT_PAD_Y,
     wrappedLines,
   };
+}
+
+function roundCoord(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+/** 将文字标注字号钳制在安全可读区间 `[12, 72]` 整数像素内。 */
+export function clampTextFontSize(fontSize: number): number {
+  if (!Number.isFinite(fontSize)) return 18;
+  return Math.min(MAX_TEXT_FONT_SIZE, Math.max(MIN_TEXT_FONT_SIZE, Math.round(fontSize)));
+}
+
+/** 计算已提交文字标注在当前画布宽度下的折行与外包围盒，供命中框、四角缩放柄及移动边界共用。 */
+export function computeTextAnnotationBounds(
+  item: Extract<Annotation, { kind: "text" }>,
+  stageWidth: number,
+  measureFn: MeasureAnnotationTextFn = estimateTextLineWidth,
+): TextAnnotationBounds {
+  const fontSize = clampTextFontSize(item.fontSize);
+  const lineHeight = Math.round(fontSize * 1.25);
+  const maxLineW = stageWidth > 0 ? Math.max(1, stageWidth - item.x - TEXT_DRAFT_PAD_X) : Infinity;
+  const lines = Number.isFinite(maxLineW)
+    ? wrapAnnotationText(item.text, fontSize, maxLineW, measureFn)
+    : item.text.split("\n");
+  const measuredMax = lines.reduce((acc, line) => Math.max(acc, measureFn(line, fontSize)), 0);
+  const w = Math.max(Math.ceil(fontSize * 0.8), Math.ceil(measuredMax));
+  const h = Math.max(lineHeight, lines.length * lineHeight);
+  return { x: item.x, y: item.y, w, h, lines, lineHeight };
+}
+
+/** 文字标注选中态虚线外框（外扩微量内边距避免压住笔画边缘）。 */
+export function getTextSelectionFrame(bounds: { x: number; y: number; w: number; h: number }): {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+} {
+  return {
+    x: bounds.x - 4,
+    y: bounds.y - 2,
+    w: bounds.w + 8,
+    h: bounds.h + 4,
+  };
+}
+
+/** 返回矩形 / 椭圆外框的 8 个缩放控制柄坐标与对应鼠标光标。 */
+export function getShapeResizeHandles(rect: {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}): HandleDescriptor<ResizeHandle>[] {
+  const { x, y, w, h } = rect;
+  const midX = x + w / 2;
+  const midY = y + h / 2;
+  const right = x + w;
+  const bottom = y + h;
+  return [
+    { handle: "nw", x, y, cursor: "nwse-resize" },
+    { handle: "n", x: midX, y, cursor: "ns-resize" },
+    { handle: "ne", x: right, y, cursor: "nesw-resize" },
+    { handle: "e", x: right, y: midY, cursor: "ew-resize" },
+    { handle: "se", x: right, y: bottom, cursor: "nwse-resize" },
+    { handle: "s", x: midX, y: bottom, cursor: "ns-resize" },
+    { handle: "sw", x, y: bottom, cursor: "nesw-resize" },
+    { handle: "w", x, y: midY, cursor: "ew-resize" },
+  ];
+}
+
+/** 返回已提交文字标注虚线选中框四角的缩放控制柄（拖拽可连续缩放字号）。 */
+export function getTextResizeHandles(bounds: {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}): HandleDescriptor<TextResizeHandle>[] {
+  const f = getTextSelectionFrame(bounds);
+  const right = f.x + f.w;
+  const bottom = f.y + f.h;
+  return [
+    { handle: "nw", x: f.x, y: f.y, cursor: "nwse-resize" },
+    { handle: "ne", x: right, y: f.y, cursor: "nesw-resize" },
+    { handle: "se", x: right, y: bottom, cursor: "nwse-resize" },
+    { handle: "sw", x: f.x, y: bottom, cursor: "nesw-resize" },
+  ];
+}
+
+/**
+ * 在画布 `[0..stageW] × [0..stageH]` 内平移矩形、椭圆或文字标注。
+ * 文字标注向右拖动时以当前行宽贴靠右边缘，避免把短标签挤成单字竖排；向左拖动时允许原有的右缘折行自然展开。
+ */
+export function moveAnnotationInStage<T extends EditableAnnotation>(
+  item: T,
+  dx: number,
+  dy: number,
+  stageWidth: number,
+  stageHeight: number,
+  measureFn: MeasureAnnotationTextFn = estimateTextLineWidth,
+): T {
+  const safeW = Math.max(0, stageWidth);
+  const safeH = Math.max(0, stageHeight);
+
+  if (item.kind !== "text") {
+    const r = normalizeRect(item.x1, item.y1, item.x2, item.y2);
+    const w = safeW > 0 ? Math.min(r.w, safeW) : r.w;
+    const h = safeH > 0 ? Math.min(r.h, safeH) : r.h;
+    const nextX = safeW > 0 ? Math.min(Math.max(0, r.x + dx), Math.max(0, safeW - w)) : r.x + dx;
+    const nextY = safeH > 0 ? Math.min(Math.max(0, r.y + dy), Math.max(0, safeH - h)) : r.y + dy;
+    return {
+      ...item,
+      x1: roundCoord(nextX),
+      y1: roundCoord(nextY),
+      x2: roundCoord(nextX + w),
+      y2: roundCoord(nextY + h),
+    };
+  }
+
+  const textItem: Extract<Annotation, { kind: "text" }> = item;
+  const startBounds = computeTextAnnotationBounds(textItem, safeW, measureFn);
+  let nextX = textItem.x + dx;
+  if (safeW > 0) {
+    const rigidW = Math.min(startBounds.w, Math.max(0, safeW - TEXT_DRAFT_PAD_X * 2));
+    const minX = Math.min(TEXT_DRAFT_PAD_X, Math.max(0, safeW - rigidW));
+    const maxX = Math.max(minX, safeW - rigidW - TEXT_DRAFT_PAD_X);
+    nextX = Math.min(Math.max(minX, nextX), maxX);
+  }
+  const movedXItem: Extract<Annotation, { kind: "text" }> = {
+    ...textItem,
+    x: roundCoord(nextX),
+  };
+  const nextBounds = computeTextAnnotationBounds(movedXItem, safeW, measureFn);
+  let nextY = textItem.y + dy;
+  if (safeH > 0) {
+    const minY = Math.min(TEXT_DRAFT_PAD_Y, Math.max(0, safeH - nextBounds.h));
+    const maxY = Math.max(minY, safeH - nextBounds.h - TEXT_DRAFT_PAD_Y);
+    nextY = Math.min(Math.max(minY, nextY), maxY);
+  }
+  return { ...movedXItem, y: roundCoord(nextY) } as T;
+}
+
+/**
+ * 按 8 个方向控制柄缩放矩形或椭圆边框尺寸，保证最小宽高不坍缩且始终落在画布内。
+ */
+export function resizeShapeAnnotationInStage<
+  T extends Extract<Annotation, { kind: "rect" | "ellipse" }>,
+>(
+  item: T,
+  handle: ResizeHandle,
+  dx: number,
+  dy: number,
+  stageWidth: number,
+  stageHeight: number,
+): T {
+  const r = normalizeRect(item.x1, item.y1, item.x2, item.y2);
+  const safeW = Math.max(0, stageWidth);
+  const safeH = Math.max(0, stageHeight);
+  const minW = safeW > 0 ? Math.min(MIN_RESIZE_SHAPE_SIZE, safeW) : MIN_RESIZE_SHAPE_SIZE;
+  const minH = safeH > 0 ? Math.min(MIN_RESIZE_SHAPE_SIZE, safeH) : MIN_RESIZE_SHAPE_SIZE;
+
+  let nextLeft = r.x;
+  let nextRight = r.x + r.w;
+  let nextTop = r.y;
+  let nextBottom = r.y + r.h;
+
+  if (handle === "nw" || handle === "w" || handle === "sw") {
+    const maxLeft = Math.max(0, nextRight - minW);
+    nextLeft = Math.min(Math.max(0, nextLeft + dx), maxLeft);
+  } else if (handle === "ne" || handle === "e" || handle === "se") {
+    const upperRight = safeW > 0 ? safeW : Infinity;
+    const minRight = Math.min(upperRight, nextLeft + minW);
+    nextRight = Math.min(upperRight, Math.max(minRight, nextRight + dx));
+  }
+
+  if (handle === "nw" || handle === "n" || handle === "ne") {
+    const maxTop = Math.max(0, nextBottom - minH);
+    nextTop = Math.min(Math.max(0, nextTop + dy), maxTop);
+  } else if (handle === "sw" || handle === "s" || handle === "se") {
+    const upperBottom = safeH > 0 ? safeH : Infinity;
+    const minBottom = Math.min(upperBottom, nextTop + minH);
+    nextBottom = Math.min(upperBottom, Math.max(minBottom, nextBottom + dy));
+  }
+
+  return {
+    ...item,
+    x1: roundCoord(nextLeft),
+    y1: roundCoord(nextTop),
+    x2: roundCoord(nextRight),
+    y2: roundCoord(nextBottom),
+  };
+}
+
+/**
+ * 为已提交文字标注设置新字号，并在贴近右缘或底边放大时自动微调坐标，防止放大后越界裁剪或无谓断字。
+ */
+export function applyTextAnnotationFontSize(
+  item: Extract<Annotation, { kind: "text" }>,
+  rawFontSize: number,
+  stageWidth: number,
+  stageHeight: number,
+  measureFn: MeasureAnnotationTextFn = estimateTextLineWidth,
+): Extract<Annotation, { kind: "text" }> {
+  const nextFontSize = clampTextFontSize(rawFontSize);
+  const safeW = Math.max(0, stageWidth);
+  const safeH = Math.max(0, stageHeight);
+
+  const rawLines = item.text.split("\n");
+  const prevBounds = computeTextAnnotationBounds(item, safeW, measureFn);
+  const wasSoftWrapped = prevBounds.lines.length > rawLines.length;
+
+  let nextX = item.x;
+  if (safeW > 0) {
+    const minCharW = Math.min(
+      Math.ceil(nextFontSize * 1.05),
+      Math.max(0, safeW - TEXT_DRAFT_PAD_X * 2),
+    );
+    const desiredW = wasSoftWrapped
+      ? minCharW
+      : Math.min(
+          Math.ceil(rawLines.reduce((acc, line) => Math.max(acc, measureFn(line, nextFontSize)), 0)),
+          Math.max(0, safeW - TEXT_DRAFT_PAD_X * 2),
+        );
+    const minX = Math.min(TEXT_DRAFT_PAD_X, Math.max(0, safeW - desiredW));
+    const maxAllowedX = Math.max(minX, safeW - desiredW - TEXT_DRAFT_PAD_X);
+    if (nextX > maxAllowedX) {
+      nextX = maxAllowedX;
+    }
+  }
+
+  const candidate = {
+    ...item,
+    x: roundCoord(nextX),
+    fontSize: nextFontSize,
+  };
+  const nextBounds = computeTextAnnotationBounds(candidate, safeW, measureFn);
+  let nextY = candidate.y;
+  if (safeH > 0) {
+    const minY = Math.min(TEXT_DRAFT_PAD_Y, Math.max(0, safeH - nextBounds.h));
+    const maxY = Math.max(minY, safeH - nextBounds.h - TEXT_DRAFT_PAD_Y);
+    if (nextY > maxY) {
+      nextY = maxY;
+    } else if (nextY < minY) {
+      nextY = minY;
+    }
+  }
+  return { ...candidate, y: roundCoord(nextY) };
+}
+
+/**
+ * 拖拽文字标注四角控制柄连续调节字号，保持对角锚点稳定且不越出画布边界。
+ */
+export function resizeTextAnnotationFontSize(
+  item: Extract<Annotation, { kind: "text" }>,
+  handle: TextResizeHandle,
+  dx: number,
+  dy: number,
+  stageWidth: number,
+  stageHeight: number,
+  measureFn: MeasureAnnotationTextFn = estimateTextLineWidth,
+): Extract<Annotation, { kind: "text" }> {
+  const safeW = Math.max(0, stageWidth);
+  const safeH = Math.max(0, stageHeight);
+  const startBounds = computeTextAnnotationBounds(item, safeW, measureFn);
+  const signX = handle === "ne" || handle === "se" ? 1 : -1;
+  const signY = handle === "sw" || handle === "se" ? 1 : -1;
+  const outX = dx * signX;
+  const outY = dy * signY;
+  const effW = Math.max(40, startBounds.w);
+  const effH = Math.max(24, startBounds.h);
+  const scale = Math.max(0.2, 1 + (outX / effW + outY / effH) * 0.55);
+  const nextFontSize = clampTextFontSize(item.fontSize * scale);
+
+  if (handle === "se") {
+    return applyTextAnnotationFontSize(item, nextFontSize, safeW, safeH, measureFn);
+  }
+
+  const unanchored = applyTextAnnotationFontSize(
+    { ...item, x: TEXT_DRAFT_PAD_X, y: TEXT_DRAFT_PAD_Y },
+    nextFontSize,
+    safeW,
+    safeH,
+    measureFn,
+  );
+  const rawLines = item.text.split("\n");
+  const unanchoredW =
+    startBounds.lines.length > rawLines.length
+      ? Math.round(startBounds.w * (nextFontSize / Math.max(1, item.fontSize)))
+      : unanchored.fontSize > 0
+        ? computeTextAnnotationBounds(unanchored, safeW, measureFn).w
+        : startBounds.w;
+
+  const anchorRight = startBounds.x + startBounds.w;
+  const anchorBottom = startBounds.y + startBounds.h;
+
+  let targetX = handle === "nw" || handle === "sw" ? anchorRight - unanchoredW : item.x;
+  if (safeW > 0) {
+    const rigidW = Math.min(unanchoredW, Math.max(0, safeW - TEXT_DRAFT_PAD_X * 2));
+    const minX = Math.min(TEXT_DRAFT_PAD_X, Math.max(0, safeW - rigidW));
+    const maxX = Math.max(minX, safeW - rigidW - TEXT_DRAFT_PAD_X);
+    targetX = Math.min(Math.max(minX, targetX), maxX);
+  }
+
+  const withX = {
+    ...item,
+    x: roundCoord(targetX),
+    fontSize: nextFontSize,
+  };
+  const nextBounds = computeTextAnnotationBounds(withX, safeW, measureFn);
+  let targetY = handle === "nw" || handle === "ne" ? anchorBottom - nextBounds.h : item.y;
+  if (safeH > 0) {
+    const minY = Math.min(TEXT_DRAFT_PAD_Y, Math.max(0, safeH - nextBounds.h));
+    const maxY = Math.max(minY, safeH - nextBounds.h - TEXT_DRAFT_PAD_Y);
+    targetY = Math.min(Math.max(minY, targetY), maxY);
+  }
+  return { ...withX, y: roundCoord(targetY) };
 }

@@ -2382,4 +2382,413 @@ describe("TranslateOverlay 运行时状态机与工具条回归测试", () => {
     root = renderOverlay();
     expect(findElement(root, (el) => el.props["data-testid"] === "capture-annotation-backdrop")).toBeNull();
   });
+
+  it("[FEAT-ANNOTATION-MOVE-AND-RESIZE] 已输入文字支持拖拽移动与字号缩放（四角柄+A-/A++粗细档），矩形与椭圆框定后支持 8 柄调大小、描边平移与多步撤销", async () => {
+    windowState.innerWidth = 640;
+    windowState.innerHeight = 420;
+    ipcMock.captureBlocks.mockResolvedValue({
+      blocks: [sampleBlock()],
+      error: null,
+      notice: null,
+      stage: "done",
+      generation: 108,
+      revision: 1,
+      has_image: true,
+      scale: 2,
+      target_lang: "zh",
+      bounds: { w: 640, h: 420 },
+      image_rect: { x: 100, y: 20, w: 440, h: 260 },
+    });
+
+    let root = renderOverlay();
+    await flush();
+    root = renderOverlay();
+
+    const stageDiv = findElement(root, (el) => el.props["data-testid"] === "capture-stage")!;
+    const stageRefObj = (stageDiv.props.ref ?? (stageDiv as unknown as { ref?: unknown }).ref) as {
+      current: unknown;
+    };
+    stageRefObj.current = {
+      getBoundingClientRect: () => ({ left: 100, top: 20, width: 440, height: 260 }),
+    };
+
+    // 1) 画一个矩形 (40, 30) -> (160, 110)，松手后自动进入选中态并渲染 8 个缩放控制柄
+    (findToolbarProps(root)!.onSelectTool as (tool: "rect") => void)("rect");
+    root = renderOverlay();
+
+    const svg1 = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svg1.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 21,
+      clientX: 140, // stage x=40
+      clientY: 50, // stage y=30
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+    for (const fn of windowState.listeners.get("pointermove") ?? []) {
+      fn({ pointerId: 21, clientX: 260, clientY: 130 }); // stage (160, 110)
+    }
+    for (const fn of windowState.listeners.get("pointerup") ?? []) {
+      fn({ pointerId: 21, clientX: 260, clientY: 130 });
+    }
+    root = renderOverlay();
+
+    const gizmoAfterRect = findElement(root, (el) => el.props["data-testid"] === "annotation-selection-gizmo")!;
+    expect(gizmoAfterRect).not.toBeNull();
+    for (const dir of ["nw", "n", "ne", "e", "se", "s", "sw", "w"]) {
+      const hEl = findElement(gizmoAfterRect, (el) => el.props["data-testid"] === `annotation-handle-${dir}`);
+      expect(hEl).not.toBeNull();
+      expect(hEl!.props["data-hit-rect"]).toBe("true");
+    }
+
+    // 2) 拖拽矩形右下角 se 柄将边框放大到 (40, 30) -> (230, 160)，且 pointermove 期间不重复发 setCaptureHitRects IPC
+    const seRectHandle = findElement(gizmoAfterRect, (el) => el.props["data-testid"] === "annotation-handle-se")!;
+    (seRectHandle.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 22,
+      clientX: 260,
+      clientY: 130,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+    const hitCallsDuringDragStart = ipcMock.setCaptureHitRects.mock.calls.length;
+    for (const fn of windowState.listeners.get("pointermove") ?? []) {
+      fn({ pointerId: 22, clientX: 300, clientY: 155 });
+      fn({ pointerId: 22, clientX: 330, clientY: 180 }); // dx=+70, dy=+50 -> (230, 160)
+    }
+    root = renderOverlay();
+    expect(ipcMock.setCaptureHitRects.mock.calls.length).toBe(hitCallsDuringDragStart);
+    for (const fn of windowState.listeners.get("pointerup") ?? []) {
+      fn({ pointerId: 22, clientX: 330, clientY: 180 });
+    }
+    root = renderOverlay();
+
+    const getRenderedShapes = (tree: El) => {
+      const svg = findElement(tree, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+      return findAllElements(svg, (el) => typeof el.type === "function" && "item" in el.props);
+    };
+    let shapes = getRenderedShapes(root);
+    expect(shapes).toHaveLength(1);
+    const rectItemAfterResize = shapes[0]!.props.item as { id: string; x1: number; y1: number; x2: number; y2: number };
+    expect(rectItemAfterResize).toMatchObject({ x1: 40, y1: 30, x2: 230, y2: 160 });
+
+    // 3) 拖拽矩形描边命中区平移 (+20, +15) -> (60, 45)..(250, 175)
+    const rectHit = findElement(
+      root,
+      (el) => el.props["data-testid"] === `annotation-hit-${rectItemAfterResize.id}`,
+    )!;
+    expect(rectHit.props.pointerEvents).toBe("stroke");
+    (rectHit.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 23,
+      clientX: 140,
+      clientY: 80,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+    for (const fn of windowState.listeners.get("pointermove") ?? []) {
+      fn({ pointerId: 23, clientX: 160, clientY: 95 });
+    }
+    for (const fn of windowState.listeners.get("pointerup") ?? []) {
+      fn({ pointerId: 23, clientX: 160, clientY: 95 });
+    }
+    root = renderOverlay();
+    shapes = getRenderedShapes(root);
+    expect(shapes[0]!.props.item).toMatchObject({ x1: 60, y1: 45, x2: 250, y2: 175 });
+
+    // 4) 画一个椭圆并用右中边 e 控制柄调宽边框
+    (findToolbarProps(root)!.onSelectTool as (tool: "ellipse") => void)("ellipse");
+    root = renderOverlay();
+    const svgEllipse = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svgEllipse.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 24,
+      clientX: 370, // x=270
+      clientY: 60, // y=40
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+    for (const fn of windowState.listeners.get("pointerup") ?? []) {
+      fn({ pointerId: 24, clientX: 450, clientY: 130 }); // x=350, y=110
+    }
+    root = renderOverlay();
+    const eHandle = findElement(root, (el) => el.props["data-testid"] === "annotation-handle-e")!;
+    (eHandle.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 25,
+      clientX: 450,
+      clientY: 95,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+    for (const fn of windowState.listeners.get("pointerup") ?? []) {
+      fn({ pointerId: 25, clientX: 500, clientY: 95 }); // dx=+50 -> x2=400
+    }
+    root = renderOverlay();
+    shapes = getRenderedShapes(root);
+    expect(shapes).toHaveLength(2);
+    expect(shapes[1]!.props.item).toMatchObject({ kind: "ellipse", x1: 270, y1: 40, x2: 400, y2: 110 });
+
+    // 5) 切换到「文字」，在矩形镂空内部 (120, 90) 点击输入文字，先用工具条「增大字号」调至 20px 再回车提交
+    (findToolbarProps(root)!.onSelectTool as (tool: "text") => void)("text");
+    root = renderOverlay();
+    const toolbarTreeInText = (() => {
+      const anchor = findElement(root, (el) => el.props["data-testid"] === "capture-toolbar-anchor")!;
+      const comp = findElement(anchor, (el) => typeof el.type === "function")!;
+      return (comp.type as (props: unknown) => El)(comp.props);
+    })();
+    const incFontBtnBeforeType = findElement(toolbarTreeInText, (el) => el.props["aria-label"] === "增大字号")!;
+    (incFontBtnBeforeType.props.onClick as () => void)();
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.currentFontSize).toBe(20);
+
+    const svgTextClick = findElement(root, (el) => el.props["data-testid"] === "capture-annotations-svg")!;
+    (svgTextClick.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 26,
+      clientX: 220, // stage x=120（位于矩形 60..250 镂空内部）
+      clientY: 110, // stage y=90
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+    const ta = findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!;
+    expect((ta.props.style as { fontSize: number }).fontSize).toBe(20);
+    (ta.props.onChange as (e: unknown) => void)({ target: { value: "可移动缩放文字" } });
+    root = renderOverlay();
+    (findElement(root, (el) => el.props["data-testid"] === "annotation-text-input")!.props.onKeyDown as (
+      e: unknown,
+    ) => void)({
+      key: "Enter",
+      shiftKey: false,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+
+    shapes = getRenderedShapes(root);
+    expect(shapes).toHaveLength(3);
+    const committedText0 = shapes[2]!.props.item as {
+      id: string;
+      kind: "text";
+      x: number;
+      y: number;
+      fontSize: number;
+    };
+    expect(committedText0).toMatchObject({ kind: "text", x: 126, y: 93, fontSize: 20 });
+    expect(findToolbarProps(root)!.selectedAnnotationKind).toBe("text");
+
+    // 6) 拖拽已提交文字平移 (+40, +30) -> (166, 123)
+    const textHit = findElement(
+      root,
+      (el) => el.props["data-testid"] === `annotation-hit-${committedText0.id}`,
+    )!;
+    (textHit.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 27,
+      clientX: 240,
+      clientY: 120,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+    for (const fn of windowState.listeners.get("pointermove") ?? []) {
+      fn({ pointerId: 27, clientX: 280, clientY: 150 });
+    }
+    for (const fn of windowState.listeners.get("pointerup") ?? []) {
+      fn({ pointerId: 27, clientX: 280, clientY: 150 });
+    }
+    root = renderOverlay();
+    shapes = getRenderedShapes(root);
+    expect(shapes[2]!.props.item).toMatchObject({ x: 166, y: 123, fontSize: 20 });
+
+    // 7) 拖拽文字右下角 se 控制柄放大字号，再点工具条「增大字号」微调 +2px
+    const textSeHandle = findElement(root, (el) => el.props["data-testid"] === "annotation-handle-se")!;
+    (textSeHandle.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 28,
+      clientX: 310,
+      clientY: 150,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+    for (const fn of windowState.listeners.get("pointermove") ?? []) {
+      fn({ pointerId: 28, clientX: 380, clientY: 190 });
+    }
+    for (const fn of windowState.listeners.get("pointerup") ?? []) {
+      fn({ pointerId: 28, clientX: 380, clientY: 190 });
+    }
+    root = renderOverlay();
+    const scaledFs = (getRenderedShapes(root)[2]!.props.item as { fontSize: number }).fontSize;
+    expect(scaledFs).toBeGreaterThan(24);
+    expect(findToolbarProps(root)!.currentFontSize).toBe(scaledFs);
+
+    (findToolbarProps(root)!.onAdjustFontSize as (delta: number) => void)(2);
+    root = renderOverlay();
+    expect((getRenderedShapes(root)[2]!.props.item as { fontSize: number }).fontSize).toBe(scaledFs + 2);
+
+    // 8) 缩放中途按 Escape：仅回滚当前拖拽，不关窗也不破坏此前状态
+    ipcMock.closeOverlay.mockClear();
+    const textSeForEsc = findElement(root, (el) => el.props["data-testid"] === "annotation-handle-se")!;
+    (textSeForEsc.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 29,
+      clientX: 380,
+      clientY: 190,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    root = renderOverlay();
+    for (const fn of windowState.listeners.get("pointermove") ?? []) {
+      fn({ pointerId: 29, clientX: 430, clientY: 230 });
+    }
+    root = renderOverlay();
+    for (const fn of windowState.listeners.get("keydown") ?? []) {
+      fn({ key: "Escape" });
+    }
+    root = renderOverlay();
+    expect(ipcMock.closeOverlay).not.toHaveBeenCalled();
+    expect((getRenderedShapes(root)[2]!.props.item as { fontSize: number }).fontSize).toBe(scaledFs + 2);
+
+    // 9) 多步撤销：第 1 次撤销回退 +2px，第 2 次撤销回退手柄字号缩放到 20px，第 3 次撤销回退文字平移到 (126, 93)
+    (findToolbarProps(root)!.onUndo as () => void)();
+    root = renderOverlay();
+    expect((getRenderedShapes(root)[2]!.props.item as { fontSize: number }).fontSize).toBe(scaledFs);
+
+    (findToolbarProps(root)!.onUndo as () => void)();
+    root = renderOverlay();
+    expect(getRenderedShapes(root)[2]!.props.item).toMatchObject({ x: 166, y: 123, fontSize: 20 });
+
+    for (const fn of windowState.listeners.get("keydown") ?? []) {
+      fn({ key: "z", metaKey: true, preventDefault: () => {} });
+    }
+    root = renderOverlay();
+    expect(getRenderedShapes(root)[2]!.props.item).toMatchObject({ x: 126, y: 93, fontSize: 20 });
+
+    // 10) 关闭激活工具 (none) 后仍可点选已有标注调样式，点空白画布取消选中且收起二级属性条
+    (findToolbarProps(root)!.onSelectTool as (tool: "none") => void)("none");
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.selectedAnnotationKind).toBe("text");
+
+    const stageForClear = findElement(root, (el) => el.props["data-testid"] === "capture-stage")!;
+    (stageForClear.props.onPointerDown as (e: unknown) => void)({ button: 0, ctrlKey: false });
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.selectedAnnotationKind).toBeNull();
+    expect(findElement(root, (el) => el.props["data-testid"] === "annotation-selection-gizmo")).toBeNull();
+
+    // 11) [QC-P2 回归] 形状线宽 (activeSize) 与新建文字默认字号 (textFontSize) 互不串扰；点选/平移旧文字不污染全局默认字号
+    (findToolbarProps(root)!.onSelectTool as (tool: "text") => void)("text");
+    root = renderOverlay();
+    // 将新建文字默认字号设为 36px
+    const currentDefaultFs = Number(findToolbarProps(root)!.currentFontSize ?? 18);
+    (findToolbarProps(root)!.onAdjustFontSize as (delta: number) => void)(36 - currentDefaultFs);
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.currentFontSize).toBe(36);
+
+    // 点选并改粗已有矩形 (lg -> strokeWidth=6)，不得把全局新建文字默认字号 36px 重置成 24px
+    const rectHitSelect = findElement(
+      root,
+      (el) => el.props["data-testid"] === `annotation-hit-${rectItemAfterResize.id}`,
+    )!;
+    (rectHitSelect.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 30,
+      clientX: 160,
+      clientY: 65,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    for (const fn of windowState.listeners.get("pointerup") ?? []) {
+      fn({ pointerId: 30, clientX: 160, clientY: 65 });
+    }
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.selectedAnnotationKind).toBe("rect");
+    (findToolbarProps(root)!.onSelectSize as (s: "lg") => void)("lg");
+    root = renderOverlay();
+    expect((getRenderedShapes(root)[0]!.props.item as { strokeWidth: number }).strokeWidth).toBe(6);
+
+    // [QC-P3-1 回归] 选中态按第 1 次 Escape 仅取消选中，不关闭覆盖窗；取消选中后新建文字字号仍保持 36px！
+    ipcMock.closeOverlay.mockClear();
+    for (const fn of windowState.listeners.get("keydown") ?? []) {
+      fn({ key: "Escape" });
+    }
+    root = renderOverlay();
+    expect(ipcMock.closeOverlay).not.toHaveBeenCalled();
+    expect(findToolbarProps(root)!.selectedAnnotationKind).toBeNull();
+    expect(findToolbarProps(root)!.currentFontSize).toBe(36);
+
+    // 单击/平移已有的 20px 文字：回显 20px，但按 Escape 取消选中后全局新建文字字号仍为 36px；且文字点 A- 降到 14px 不会把形状线宽 lg 篡改成 sm
+    const textHitSelect = findElement(
+      root,
+      (el) => el.props["data-testid"] === `annotation-hit-${committedText0.id}`,
+    )!;
+    (textHitSelect.props.onPointerDown as (e: unknown) => void)({
+      button: 0,
+      pointerId: 31,
+      clientX: 230,
+      clientY: 120,
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    for (const fn of windowState.listeners.get("pointerup") ?? []) {
+      fn({ pointerId: 31, clientX: 235, clientY: 122 });
+    }
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.selectedAnnotationKind).toBe("text");
+    expect(findToolbarProps(root)!.currentFontSize).toBe(20);
+    for (const fn of windowState.listeners.get("keydown") ?? []) {
+      fn({ key: "Escape" });
+    }
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.currentFontSize).toBe(36);
+
+    // 将新建文字字号点到 14px，切回矩形工具时 activeSize 仍为 "lg"（不被篡改为 "sm"）
+    (findToolbarProps(root)!.onAdjustFontSize as (delta: number) => void)(-22);
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.currentFontSize).toBe(14);
+    (findToolbarProps(root)!.onSelectTool as (tool: "rect") => void)("rect");
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.activeSize).toBe("lg");
+
+    // 12) [QC-P3-2 回归] 极窄视口 (viewW=340 -> toolbarMaxWidth=332 < 368) 文字上下文下，subbar 折成双行 (~64px)，
+    //     下方仅剩 44px (< 70px) 时自动设 subbarAbove=true 向上展开防越窗，且隐藏第二条悬空竖线
+    windowState.innerWidth = 340;
+    windowState.innerHeight = 200;
+    for (const h of ipcMock.updateHandlers) {
+      h({
+        blocks: [sampleBlock()],
+        error: null,
+        notice: null,
+        stage: "done",
+        generation: 109,
+        revision: 1,
+        has_image: true,
+        scale: 2,
+        target_lang: "zh",
+        bounds: { w: 340, h: 200 },
+        image_rect: { x: 20, y: 0, w: 300, h: 108 },
+      });
+    }
+    root = renderOverlay();
+    (findToolbarProps(root)!.onSelectTool as (tool: "text") => void)("text");
+    root = renderOverlay();
+    expect(findToolbarProps(root)!.subbarAbove).toBe(true);
+    const narrowBarEl = (() => {
+      const anchor = findElement(root, (el) => el.props["data-testid"] === "capture-toolbar-anchor")!;
+      const comp = findElement(anchor, (el) => typeof el.type === "function")!;
+      return (comp.type as (props: unknown) => El)(comp.props);
+    })();
+    const narrowSubbar = findElement(narrowBarEl, (el) => el.props["data-testid"] === "capture-subbar")!;
+    const subbarDividers = findAllElements(
+      narrowSubbar,
+      (el) => el.type === "div" && String(el.props.className ?? "").includes("w-px"),
+    );
+    expect(subbarDividers).toHaveLength(1);
+  });
 });

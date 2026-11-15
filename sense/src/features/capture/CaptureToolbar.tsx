@@ -3,8 +3,13 @@ import { CAPTURE_LANGUAGES } from "../../lib/languages";
 import {
   ANNOTATION_COLORS,
   ANNOTATION_SIZES,
+  MAX_TEXT_FONT_SIZE,
+  MIN_TEXT_FONT_SIZE,
+  TEXT_FONT_SIZE_STEP,
+  clampTextFontSize,
   type AnnotationSize,
   type AnnotationTool,
+  type EditableAnnotation,
 } from "./captureAnnotations";
 
 export type ToolbarDock = "bottom" | "top" | "inside-bottom";
@@ -63,6 +68,9 @@ export function CaptureToolbar({
   onSelectColor,
   activeSize,
   onSelectSize,
+  selectedAnnotationKind = null,
+  currentFontSize,
+  onAdjustFontSize,
   annotationsCount,
   onUndo,
   onSave,
@@ -87,6 +95,9 @@ export function CaptureToolbar({
   onSelectColor: (hex: string) => void;
   activeSize: AnnotationSize["id"];
   onSelectSize: (size: AnnotationSize["id"]) => void;
+  selectedAnnotationKind?: EditableAnnotation["kind"] | null;
+  currentFontSize?: number;
+  onAdjustFontSize?: (delta: number) => void;
   annotationsCount: number;
   onUndo: () => void;
   onSave: (kind: SaveImageKind) => void;
@@ -118,6 +129,13 @@ export function CaptureToolbar({
   const subbarPosClass = subbarAbove
     ? "absolute bottom-full left-1/2 z-10 mb-1.5 -translate-x-1/2"
     : "relative z-10";
+  const showSubbar = activeTool !== "none" || Boolean(selectedAnnotationKind);
+  const isTextContext =
+    selectedAnnotationKind === "text" || (!selectedAnnotationKind && activeTool === "text");
+  const isSubbarCompact = isTextContext && maxWidth !== undefined && maxWidth < 368;
+  const effectiveFontSize = clampTextFontSize(
+    currentFontSize ?? ANNOTATION_SIZES.find((s) => s.id === activeSize)?.fontSize ?? 18,
+  );
 
   return (
     <div
@@ -364,12 +382,13 @@ export function CaptureToolbar({
         </div>
       </div>
 
-      {/* 钉钉风格二级属性条（颜色 + 粗细） */}
-      {activeTool !== "none" && (
+      {/* 钉钉风格二级属性条（颜色 + 粗细 + 文字字号微调） */}
+      {showSubbar && (
         <div
           data-testid="capture-subbar"
           data-hit-rect="true"
-          className={`${subbarPosClass} flex items-center gap-2 rounded-xl border border-white/15 bg-[rgba(22,23,28,0.92)] px-2.5 py-1 text-[11px] text-[#dcd8cf] shadow-[0_6px_18px_rgba(0,0,0,0.4)] backdrop-blur-md`}
+          style={maxWidth ? { maxWidth } : undefined}
+          className={`${subbarPosClass} flex w-max max-w-[calc(100vw-8px)] flex-wrap items-center justify-center gap-2 rounded-xl border border-white/15 bg-[rgba(22,23,28,0.92)] px-2.5 py-1 text-[11px] text-[#dcd8cf] shadow-[0_6px_18px_rgba(0,0,0,0.4)] backdrop-blur-md`}
         >
           <div role="group" aria-label="标注颜色" className="flex shrink-0 items-center gap-1.5">
             {ANNOTATION_COLORS.map((c) => {
@@ -394,7 +413,7 @@ export function CaptureToolbar({
           <div className="h-3.5 w-px shrink-0 bg-white/15" />
           <div role="group" aria-label="线条粗细" className="flex shrink-0 items-center gap-1">
             {ANNOTATION_SIZES.map((s) => {
-              const selected = activeSize === s.id;
+              const selected = isTextContext ? effectiveFontSize === s.fontSize : activeSize === s.id;
               return (
                 <button
                   key={s.id}
@@ -412,6 +431,41 @@ export function CaptureToolbar({
               );
             })}
           </div>
+          {isTextContext && (
+            <>
+              {!isSubbarCompact && <div className="h-3.5 w-px shrink-0 bg-white/15" />}
+              <div role="group" aria-label="文字字号" className="flex shrink-0 items-center gap-1">
+                <button
+                  type="button"
+                  title="减小字号"
+                  aria-label="减小字号"
+                  disabled={effectiveFontSize <= MIN_TEXT_FONT_SIZE}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => onAdjustFontSize?.(-TEXT_FONT_SIZE_STEP)}
+                  className="shrink-0 whitespace-nowrap rounded-md px-1.5 py-0.5 text-[#dcd8cf] transition-colors hover:bg-white/12 hover:text-white disabled:cursor-not-allowed disabled:opacity-35"
+                >
+                  A-
+                </button>
+                <span
+                  data-testid="capture-font-size-value"
+                  className="min-w-[30px] shrink-0 whitespace-nowrap text-center font-medium tabular-nums text-[#f4f2ec]"
+                >
+                  {effectiveFontSize}px
+                </span>
+                <button
+                  type="button"
+                  title="增大字号"
+                  aria-label="增大字号"
+                  disabled={effectiveFontSize >= MAX_TEXT_FONT_SIZE}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => onAdjustFontSize?.(TEXT_FONT_SIZE_STEP)}
+                  className="shrink-0 whitespace-nowrap rounded-md px-1.5 py-0.5 text-[#dcd8cf] transition-colors hover:bg-white/12 hover:text-white disabled:cursor-not-allowed disabled:opacity-35"
+                >
+                  A+
+                </button>
+              </div>
+            </>
+          )}
         </div>
       )}
     </div>

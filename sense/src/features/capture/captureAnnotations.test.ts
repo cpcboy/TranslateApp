@@ -2,14 +2,25 @@ import { describe, expect, it } from "vitest";
 import {
   ANNOTATION_COLORS,
   ANNOTATION_SIZES,
+  MAX_TEXT_FONT_SIZE,
+  MIN_RESIZE_SHAPE_SIZE,
+  MIN_TEXT_FONT_SIZE,
   TEXT_DRAFT_PAD_X,
   TEXT_DRAFT_PAD_Y,
+  applyTextAnnotationFontSize,
   clampPoint,
+  clampTextFontSize,
   computeArrowHeadPoints,
+  computeTextAnnotationBounds,
   computeTextBoxLayout,
   estimateTextLineWidth,
+  getShapeResizeHandles,
+  getTextResizeHandles,
   isMeaningfulAnnotation,
+  moveAnnotationInStage,
   normalizeRect,
+  resizeShapeAnnotationInStage,
+  resizeTextAnnotationFontSize,
   wrapAnnotationText,
   type Annotation,
 } from "./captureAnnotations";
@@ -296,5 +307,160 @@ describe("captureAnnotations 工具函数", () => {
 
     const tinyWrap = wrapAnnotationText("测A😊", 18, 4);
     expect(tinyWrap).toEqual(["测", "A", "😊"]);
+  });
+
+  it("[FEAT-SHAPE-MOVE-RESIZE] 矩形与椭圆支持 8 控制柄缩放与画布内平移，保持最小尺寸不翻转不越界", () => {
+    const invertedRect: Extract<Annotation, { kind: "rect" | "ellipse" }> = {
+      id: "r-inv",
+      kind: "rect",
+      x1: 160,
+      y1: 120,
+      x2: 60,
+      y2: 40,
+      color: "#ff3b30",
+      strokeWidth: 4,
+    };
+    const norm = normalizeRect(invertedRect.x1, invertedRect.y1, invertedRect.x2, invertedRect.y2);
+    const handles = getShapeResizeHandles(norm);
+    expect(handles.map((h) => h.handle)).toEqual(["nw", "n", "ne", "e", "se", "s", "sw", "w"]);
+    expect(handles.find((h) => h.handle === "n")).toMatchObject({ x: 110, y: 40, cursor: "ns-resize" });
+    expect(handles.find((h) => h.handle === "e")).toMatchObject({ x: 160, y: 80, cursor: "ew-resize" });
+
+    // 右下角扩大并越过画布右/下边界时，自动夹紧到 300×200
+    const grownSe = resizeShapeAnnotationInStage(invertedRect, "se", 200, 150, 300, 200);
+    expect(grownSe).toMatchObject({ x1: 60, y1: 40, x2: 300, y2: 200 });
+
+    // 左上角向内过度推挤时，保持最小尺寸 MIN_RESIZE_SHAPE_SIZE (8px)，绝不翻转或塌缩为 0
+    const shrunkNw = resizeShapeAnnotationInStage(invertedRect, "nw", 500, 500, 300, 200);
+    expect(shrunkNw).toMatchObject({
+      x1: 160 - MIN_RESIZE_SHAPE_SIZE,
+      y1: 120 - MIN_RESIZE_SHAPE_SIZE,
+      x2: 160,
+      y2: 120,
+    });
+
+    // 单边控制柄（n/s/e/w）只改对应边，对边与正交方向不变
+    const ellipse: Extract<Annotation, { kind: "rect" | "ellipse" }> = {
+      id: "e1",
+      kind: "ellipse",
+      x1: 50,
+      y1: 40,
+      x2: 150,
+      y2: 100,
+      color: "#34c759",
+      strokeWidth: 4,
+    };
+    expect(resizeShapeAnnotationInStage(ellipse, "w", -30, 25, 300, 200)).toMatchObject({
+      x1: 20,
+      y1: 40,
+      x2: 150,
+      y2: 100,
+    });
+    expect(resizeShapeAnnotationInStage(ellipse, "n", 40, -25, 300, 200)).toMatchObject({
+      x1: 50,
+      y1: 15,
+      x2: 150,
+      y2: 100,
+    });
+    expect(resizeShapeAnnotationInStage(ellipse, "ne", 40, -100, 300, 200)).toMatchObject({
+      x1: 50,
+      y1: 0,
+      x2: 190,
+      y2: 100,
+    });
+    expect(resizeShapeAnnotationInStage(ellipse, "sw", -100, 45, 300, 200)).toMatchObject({
+      x1: 0,
+      y1: 40,
+      x2: 150,
+      y2: 145,
+    });
+
+    // 平移矩形/椭圆在四壁处保持原宽高夹紧
+    expect(moveAnnotationInStage(ellipse, 400, 300, 300, 200)).toMatchObject({
+      x1: 200,
+      y1: 140,
+      x2: 300,
+      y2: 200,
+    });
+    expect(moveAnnotationInStage(ellipse, -200, -200, 300, 200)).toMatchObject({
+      x1: 0,
+      y1: 0,
+      x2: 100,
+      y2: 60,
+    });
+  });
+
+  it("[FEAT-TEXT-MOVE-AND-FONTSIZE] 已提交文字支持画布内平移（右壁防挤竖排、左移自动展开）与四角/步进字号缩放", () => {
+    expect(clampTextFontSize(4)).toBe(MIN_TEXT_FONT_SIZE);
+    expect(clampTextFontSize(120)).toBe(MAX_TEXT_FONT_SIZE);
+    expect(clampTextFontSize(23.6)).toBe(24);
+    expect(clampTextFontSize(Number.NaN)).toBe(18);
+
+    const shortLabel: Extract<Annotation, { kind: "text" }> = {
+      id: "t-short",
+      kind: "text",
+      x: 40,
+      y: 30,
+      text: "重点核对",
+      color: "#ffcc00",
+      fontSize: 18,
+    };
+    const initialBounds = computeTextAnnotationBounds(shortLabel, 360);
+    expect(initialBounds.lines).toEqual(["重点核对"]);
+    expect(getTextResizeHandles(initialBounds).map((h) => h.handle)).toEqual(["nw", "ne", "se", "sw"]);
+
+    // 向右拖到底：保持单行宽度贴靠右壁，不会把 4 个字挤成单字竖排
+    const movedRight = moveAnnotationInStage(shortLabel, 500, 400, 360, 190);
+    const movedRightBounds = computeTextAnnotationBounds(movedRight, 360);
+    expect(movedRightBounds.lines).toEqual(["重点核对"]);
+    expect(movedRight.x + movedRightBounds.w).toBeLessThanOrEqual(360 - TEXT_DRAFT_PAD_X + 1);
+    expect(movedRight.y + movedRightBounds.h).toBeLessThanOrEqual(190 - TEXT_DRAFT_PAD_Y + 1);
+
+    // 原先在右缘自动折成多行的长文本，向左拖到宽敞区域后自然展开为单行
+    const rightWrapped: Extract<Annotation, { kind: "text" }> = {
+      id: "t-wrap",
+      kind: "text",
+      x: 260,
+      y: 25,
+      text: "右缘折行左移展开",
+      color: "#ffffff",
+      fontSize: 18,
+    };
+    expect(computeTextAnnotationBounds(rightWrapped, 360).lines.length).toBeGreaterThanOrEqual(2);
+    const movedLeft = moveAnnotationInStage(rightWrapped, -230, 10, 360, 190);
+    expect(movedLeft.x).toBe(30);
+    expect(computeTextAnnotationBounds(movedLeft, 360).lines).toEqual(["右缘折行左移展开"]);
+
+    // 贴近右下角放大字号时自动左移/上移防越界裁剪
+    const enlargedEdge = applyTextAnnotationFontSize(movedRight, 36, 360, 190);
+    const enlargedBounds = computeTextAnnotationBounds(enlargedEdge, 360);
+    expect(enlargedEdge.fontSize).toBe(36);
+    expect(enlargedBounds.lines).toEqual(["重点核对"]);
+    expect(enlargedEdge.x + enlargedBounds.w).toBeLessThanOrEqual(360);
+    expect(enlargedEdge.y + enlargedBounds.h).toBeLessThanOrEqual(190);
+
+    // 拖拽右下角（se）向外放大、向内缩小；拖拽左上角（nw）向外放大时右底锚点保持稳定
+    const midText: Extract<Annotation, { kind: "text" }> = {
+      id: "t-mid",
+      kind: "text",
+      x: 120,
+      y: 80,
+      text: "字号缩放",
+      color: "#ff3b30",
+      fontSize: 20,
+    };
+    const grownSe = resizeTextAnnotationFontSize(midText, "se", 60, 30, 360, 220);
+    expect(grownSe.fontSize).toBeGreaterThan(20);
+    expect(grownSe.x).toBe(120);
+    expect(grownSe.y).toBe(80);
+
+    const shrunkSe = resizeTextAnnotationFontSize(midText, "se", -80, -40, 360, 220);
+    expect(shrunkSe.fontSize).toBeLessThan(20);
+    expect(shrunkSe.fontSize).toBeGreaterThanOrEqual(MIN_TEXT_FONT_SIZE);
+
+    const grownNw = resizeTextAnnotationFontSize(midText, "nw", -50, -25, 360, 220);
+    expect(grownNw.fontSize).toBeGreaterThan(20);
+    expect(grownNw.x).toBeLessThan(midText.x);
+    expect(grownNw.y).toBeLessThan(midText.y);
   });
 });
