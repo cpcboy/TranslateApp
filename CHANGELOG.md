@@ -6,6 +6,29 @@
 
 ## [0.1.2] - 2026-11-15
 
+### 修复 · 2026-11-15 — 截屏批注 QC 复核问题闭环（连续多色批注防误改、关工具清残留、副键拖控制点防冒泡、多行大字所见即所得与贴边手柄防削半）
+
+**问题解决**
+
+1. **`[P1-1]` 同工具连续换色/换粗细/换字号不再篡改上一条已落笔批注，关闭当前工具立即清除残留控制点与属性条**（`sense/src/features/capture/TranslateOverlay.tsx`）：
+   - 按负责人选定的**方案 A**（与钉钉/微信截图一致）：`finishDraft`（画完矩形/椭圆）与 `flushTextDraft`（回车或点击别处提交文字）落笔后不再自动将刚完成的批注置为 `selectedAnnotationId`，方便在同一工具下直接点选新颜色、新粗细或新字号连续绘制下一处对比批注；需要调整某一处已有批注的尺寸、位置或样式时，点一下或直接按住其边框/文字热区即一步选中。
+   - `handleSelectTool` 在再次点击已高亮的工具按钮主动退出工具态（`tool === "none"`）或切换工具时同步清空 `selectedAnnotationId`，使 8/4 缩放控制点与二级属性条立即收起，不再滞留屏幕。
+2. **`[P1-2]` Magic Mouse / 触控板副键（`button === 2`）拖拽缩放控制点或描边热区正常生效且绝不衍生重叠新框**（`TranslateOverlay.tsx`）：
+   - 将 `handleTransformMouseDown` 与 `beginAnnotationTransform` 的按键准入统一为 `(button === 0 && !ctrlKey) || button === 2`（与绘图起笔手势一致），并在函数入口无条件调用 `event.stopPropagation()`（含 `ctrl+click` / 中键等拒绝分支），根治副键拖拽控制点无响应且冒泡至底层 `<svg>` 重叠拉出第 2 个矩形的问题。
+3. **`[P1-3]` 多行文字放大预览与 Retina PNG 导出 100% 所见即所得**（`TranslateOverlay.tsx`、`captureAnnotations.ts`）：
+   - `<svg>` 新增 `<defs><clipPath id="capture-stage-clip"><rect x={0} y={0} width={stageRect.w} height={stageRect.h} /></clipPath></defs>` 包裹全部批注与草稿渲染层 `<g data-testid="capture-annotations-clipped">`，仅让命中热区与 `<g data-testid="annotation-selection-gizmo">` 置于裁剪组之外，彻底消除文字突破截图底边压在悬浮工具条上而导出图片被静默腰斩的视觉落差。
+   - `applyTextAnnotationFontSize` 与 `resizeTextAnnotationFontSize`（四角 `nw`/`ne`/`se`/`sw`）在放大多行文字时按 `stageHeight` 动态封顶最大可容纳字号（顶底同时触边时停止继续放大，缩小字号始终放行，初始已超高文本点 `A+` 不反常缩小）。
+4. **`[P2-1]`、`[P2-2]` 与 `[P2-3]` 边界体验与本地更新包刷新**（`captureAnnotations.ts`、`TranslateOverlay.tsx`、`sense/dist-release/`）：
+   - 修改已选中的单个批注（四角缩放文字字号、`A-`/`A+`、`细/中/粗`、换色）仅作用于该选中对象本身，不再覆写后续新建工具的全局默认字号 `textFontSize`、线宽 `activeSize` 与颜色 `activeColor`；`computeTextBoxLayout` 在 `fontSize > 24` 时按 `measureFn("输入文字", fontSize)` 自适应向左借宽，消除 `62px` 大字在画布右侧 `110px` 内起笔被挤成单字竖列及回车跳变。
+   - `clampGizmoHandleCenter` 将选中态 `8×8` 控制点钳在窗口可视内侧 `[4 - stageRect.x, effectiveViewW - 4 - stageRect.x] × [4 - stageRect.y, viewH - 4 - stageRect.y]`，修复 `image_rect.y === 0` 贴顶边时 `nw`/`n`/`ne` 控制点被根容器 `overflow-hidden` 削掉一半的问题。
+   - 同步更新 `sense/dist-release/notes-v0.1.2.md` 并重跑本地 `./tools/release.sh`（不带 `--publish`），替换 `sense/dist-release/` 下旧归档产物。
+
+**验证与 QC 审查**
+
+- 独立软件产品 QC 代码审查员（`01300a53`）逐行对抗审查确认：**`P0 = 0, P1 = 0, P2 = 0, P3 = 0`**。
+- 全量自动化套件通过：`npm run typecheck`、Vitest **32 文件 / 669 用例**、`npm run build`、`cargo test --locked` **434 用例**；本机 `/Applications/SENSE.app` 重装、本地双架构更新包重签验签及真机 `NSWindow + WKWebView` 对抗场景画面验收全通过。
+- **回滚方式**：`git revert f8fa0b0` 并重装备份 `~/cpcsoft/SENSE-app-backups/SENSE-before-annotation-qc-fix.app`（无数据迁移）。
+
 ### 新增 · 2026-11-15 — 已输入文字拖拽移动与字号调节、矩形与椭圆框定区域边框尺寸缩放及平移
 
 **新增功能与交互优化**
