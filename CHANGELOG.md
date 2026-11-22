@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-22
+
+### 发布准备 · 2026-11-22 — 升级版本号至 `0.1.3`、合并推送 `origin/main` 与双架构更新包构建验签
+
+- 鉴于 GitHub Releases 已发布 `v0.1.2`（Latest）且应用内自动更新器要求版本号严格递增，统一将 `sense/src-tauri/tauri.conf.json`、`sense/package.json`、`sense/package-lock.json`、`sense/src-tauri/Cargo.toml`、`sense/src-tauri/Cargo.lock` 五处版本号由 `0.1.2` 升级至 `0.1.3`（`e807906`）。
+- 经负责人单次授权（「合并到 main、推送至 GitHub 或准备新版本更新包」），将 `redesign_app_icon`（含新图标资产 `252107b`、图标文档 `e23cdb7`、版本升级 `e807906` 及本次发布文档）无 `--force` 快进合入本地 `main` 并快进推送至 GitHub `origin/main`；备份旧版至 `~/cpcsoft/SENSE-app-backups/SENSE-before-v0.1.3.app` 后通过 `./tools/install-app.sh` 重装本机 `/Applications/SENSE.app`（`0.1.3`，`SENSE Dev` 签名）；在干净 worktree 清空 `src-tauri/binaries/` 后运行 `./tools/release.sh --notes-file dist-release/notes-v0.1.3.md` 完成 Apple 芯片（`aarch64`）与 Intel（`x86_64`）双架构打包、`SENSE Dev` 代码签名、更新私钥绑定版本签名以及内嵌公钥 `latest.json` 验签（保留 `--publish` 供负责人在交互终端输入 `yes` 发布 GitHub Release `v0.1.3`）。
+
 ### 变更 · 2026-11-22 — 重设计 SENSE 应用图标为「折光之 S」并补全全分辨率资源
 
 **背景与改动**
