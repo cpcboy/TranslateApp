@@ -1,0 +1,131 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <filter id="tileShadow" x="-35%" y="-35%" width="170%" height="175%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="16" result="blur"/>
+      <feOffset in="blur" dx="0" dy="14" result="off"/>
+      <feFlood flood-color="#000000" flood-opacity="0.44" result="flood"/>
+      <feComposite in="flood" in2="off" operator="in" result="shadow"/>
+      <feMerge>
+        <feMergeNode in="shadow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="glyphShadow" x="-35%" y="-35%" width="170%" height="175%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="16" result="blur"/>
+      <feOffset in="blur" dx="0" dy="16" result="off"/>
+      <feFlood flood-color="#000000" flood-opacity="0.64" result="flood"/>
+      <feComposite in="flood" in2="off" operator="in" result="shadow"/>
+      <feMerge>
+        <feMergeNode in="shadow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <clipPath id="squircleClip"><path d="M 396.64 100.00 L 627.36 100.00 C 731.19 100.00, 783.11 100.00, 822.77 120.21 A 185.40 185.40 0 0 1 903.79 201.23 C 924.00 240.89, 924.00 292.81, 924.00 396.64 L 924.00 627.36 C 924.00 731.19, 924.00 783.11, 903.79 822.77 A 185.40 185.40 0 0 1 822.77 903.79 C 783.11 924.00, 731.19 924.00, 627.36 924.00 L 396.64 924.00 C 292.81 924.00, 240.89 924.00, 201.23 903.79 A 185.40 185.40 0 0 1 120.21 822.77 C 100.00 783.11, 100.00 731.19, 100.00 627.36 L 100.00 396.64 C 100.00 292.81, 100.00 240.89, 120.21 201.23 A 185.40 185.40 0 0 1 201.23 120.21 C 240.89 100.00, 292.81 100.00, 396.64 100.00 Z"/></clipPath>
+    <clipPath id="upperArcClip"><path d="M 637.29 296.11 A 159.00 159.00 0 1 0 586.65 534.39 A 41.00 41.00 0 0 0 548.15 461.99 A 77.00 77.00 0 1 1 572.68 346.59 A 41.00 41.00 0 0 0 637.29 296.11 Z"/></clipPath>
+    <clipPath id="lowerArcClip"><path d="M 386.71 727.89 A 159.00 159.00 0 1 0 437.35 489.61 A 41.00 41.00 0 0 0 475.85 562.01 A 77.00 77.00 0 1 1 451.32 677.41 A 41.00 41.00 0 0 0 386.71 727.89 Z"/></clipPath>
+
+    <mask id="upperHalfMask">
+      <rect x="0" y="0" width="1024" height="1024" fill="white"/>
+      <g transform="translate(512, 512) rotate(24)">
+        <rect x="-10.00" y="-96" width="220.00" height="192" fill="black"/>
+      </g>
+    </mask>
+    <mask id="lowerHalfMask">
+      <rect x="0" y="0" width="1024" height="1024" fill="white"/>
+      <g transform="translate(512, 512) rotate(24)">
+        <rect x="-210.00" y="-96" width="220.00" height="192" fill="black"/>
+      </g>
+    </mask>
+
+    <linearGradient id="bgGrad" x1="0" y1="100" x2="0" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1B1B24"/>
+      <stop offset="46%" stop-color="#101016"/>
+      <stop offset="100%" stop-color="#07070B"/>
+    </linearGradient>
+
+    <radialGradient id="topSheen" cx="512" cy="115" r="540" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.10"/>
+      <stop offset="55%" stop-color="#FFFFFF" stop-opacity="0.02"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+
+    <radialGradient id="coralAmbient" cx="560" cy="645" r="355" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FF5530" stop-opacity="0.38"/>
+      <stop offset="48%" stop-color="#FF4B26" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#FF4B26" stop-opacity="0"/>
+    </radialGradient>
+
+    <radialGradient id="pearlAmbient" cx="460" cy="375" r="310" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#EEF2FF" stop-opacity="0.17"/>
+      <stop offset="55%" stop-color="#C8D6F5" stop-opacity="0.04"/>
+      <stop offset="100%" stop-color="#C8D6F5" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="rimGrad" x1="0" y1="100" x2="0" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.32"/>
+      <stop offset="22%" stop-color="#FFFFFF" stop-opacity="0.10"/>
+      <stop offset="78%" stop-color="#FFFFFF" stop-opacity="0.04"/>
+      <stop offset="100%" stop-color="#FF8C6B" stop-opacity="0.18"/>
+    </linearGradient>
+
+    <linearGradient id="upperBladeGrad" x1="360" y1="235" x2="635" y2="545" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="52%" stop-color="#F5F3EE"/>
+      <stop offset="100%" stop-color="#CFCBC3"/>
+    </linearGradient>
+
+    <linearGradient id="lowerBladeGrad" x1="425" y1="485" x2="655" y2="790" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FF9C7B"/>
+      <stop offset="40%" stop-color="#FF613E"/>
+      <stop offset="100%" stop-color="#DF3110"/>
+    </linearGradient>
+
+    <!-- Wide filter regions prevent objectBoundingBox clipping in strict SVG 1.1 renderers (CoreSVG / WebKit) -->
+    <filter id="coralBloom" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="26"/>
+    </filter>
+    <filter id="pearlBloom" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="18"/>
+    </filter>
+    <filter id="softSpec" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="11"/>
+    </filter>
+  </defs>
+
+  <path d="M 396.64 100.00 L 627.36 100.00 C 731.19 100.00, 783.11 100.00, 822.77 120.21 A 185.40 185.40 0 0 1 903.79 201.23 C 924.00 240.89, 924.00 292.81, 924.00 396.64 L 924.00 627.36 C 924.00 731.19, 924.00 783.11, 903.79 822.77 A 185.40 185.40 0 0 1 822.77 903.79 C 783.11 924.00, 731.19 924.00, 627.36 924.00 L 396.64 924.00 C 292.81 924.00, 240.89 924.00, 201.23 903.79 A 185.40 185.40 0 0 1 120.21 822.77 C 100.00 783.11, 100.00 731.19, 100.00 627.36 L 100.00 396.64 C 100.00 292.81, 100.00 240.89, 120.21 201.23 A 185.40 185.40 0 0 1 201.23 120.21 C 240.89 100.00, 292.81 100.00, 396.64 100.00 Z" fill="#09090D" filter="url(#tileShadow)"/>
+
+  <g clip-path="url(#squircleClip)">
+    <rect x="100" y="100" width="824" height="824" fill="url(#bgGrad)"/>
+    <rect x="100" y="100" width="824" height="824" fill="url(#topSheen)"/>
+    <rect x="100" y="100" width="824" height="824" fill="url(#pearlAmbient)"/>
+    <rect x="100" y="100" width="824" height="824" fill="url(#coralAmbient)"/>
+
+    <circle cx="512" cy="512" r="326" fill="none" stroke="#FFFFFF" stroke-opacity="0.035" stroke-width="2"/>
+
+    <g transform="translate(512, 512) scale(1.09, 1.0) translate(-512, -512)">
+      <path d="M 604.99 321.35 A 118.00 118.00 0 1 0 512.00 512.00" fill="none" stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="76" stroke-linecap="round" filter="url(#pearlBloom)"/>
+      <path d="M 419.01 702.65 A 118.00 118.00 0 1 0 512.00 512.00" fill="none" stroke="#FF5230" stroke-opacity="0.48" stroke-width="82" stroke-linecap="round" filter="url(#coralBloom)"/>
+
+      <g filter="url(#glyphShadow)">
+        <g mask="url(#upperHalfMask)">
+          <path d="M 637.29 296.11 A 159.00 159.00 0 1 0 586.65 534.39 A 41.00 41.00 0 0 0 548.15 461.99 A 77.00 77.00 0 1 1 572.68 346.59 A 41.00 41.00 0 0 0 637.29 296.11 Z" fill="url(#upperBladeGrad)"/>
+          <g clip-path="url(#upperArcClip)">
+            <path d="M 604.99 321.35 A 118.00 118.00 0 1 0 512.00 512.00" fill="none" stroke="#FFFFFF" stroke-opacity="0.62" stroke-width="26" stroke-linecap="round" transform="translate(0, -18)" filter="url(#softSpec)"/>
+            <path d="M 637.29 296.11 A 159.00 159.00 0 1 0 586.65 534.39 A 41.00 41.00 0 0 0 548.15 461.99 A 77.00 77.00 0 1 1 572.68 346.59 A 41.00 41.00 0 0 0 637.29 296.11 Z" fill="none" stroke="#FFFFFF" stroke-opacity="0.72" stroke-width="4" transform="translate(0, 2)"/>
+          </g>
+        </g>
+
+        <g mask="url(#lowerHalfMask)">
+          <path d="M 386.71 727.89 A 159.00 159.00 0 1 0 437.35 489.61 A 41.00 41.00 0 0 0 475.85 562.01 A 77.00 77.00 0 1 1 451.32 677.41 A 41.00 41.00 0 0 0 386.71 727.89 Z" fill="url(#lowerBladeGrad)"/>
+          <g clip-path="url(#lowerArcClip)">
+            <path d="M 419.01 702.65 A 118.00 118.00 0 1 0 512.00 512.00" fill="none" stroke="#FFD6C2" stroke-opacity="0.58" stroke-width="26" stroke-linecap="round" transform="translate(0, -16)" filter="url(#softSpec)"/>
+            <path d="M 386.71 727.89 A 159.00 159.00 0 1 0 437.35 489.61 A 41.00 41.00 0 0 0 475.85 562.01 A 77.00 77.00 0 1 1 451.32 677.41 A 41.00 41.00 0 0 0 386.71 727.89 Z" fill="none" stroke="#FFD8C8" stroke-opacity="0.60" stroke-width="4" transform="translate(0, 2)"/>
+          </g>
+        </g>
+      </g>
+    </g>
+
+    <path d="M 395.59 101.75 L 628.41 101.75 C 731.26 101.75, 782.69 101.75, 821.98 121.77 A 183.65 183.65 0 0 1 902.23 202.02 C 922.25 241.31, 922.25 292.74, 922.25 395.59 L 922.25 628.41 C 922.25 731.26, 922.25 782.69, 902.23 821.98 A 183.65 183.65 0 0 1 821.98 902.23 C 782.69 922.25, 731.26 922.25, 628.41 922.25 L 395.59 922.25 C 292.74 922.25, 241.31 922.25, 202.02 902.23 A 183.65 183.65 0 0 1 121.77 821.98 C 101.75 782.69, 101.75 731.26, 101.75 628.41 L 101.75 395.59 C 101.75 292.74, 101.75 241.31, 121.77 202.02 A 183.65 183.65 0 0 1 202.02 121.77 C 241.31 101.75, 292.74 101.75, 395.59 101.75 Z" fill="none" stroke="url(#rimGrad)" stroke-width="3.5"/>
+  </g>
+</svg>

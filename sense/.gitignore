@@ -33,3 +33,7 @@ dist-release/
 # tools/release.sh 还会拒绝放在仓库目录里的私钥路径
 *.key
 sense-updater*
+
+# Python 字节码缓存（tools/generate-icons.py 等工具脚本）
+__pycache__/
+*.py[cod]
