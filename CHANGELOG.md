@@ -4,6 +4,22 @@
 
 ## [Unreleased]
 
+### 变更 · 2026-11-22 — 重设计 SENSE 应用图标为「折光之 S」并补全全分辨率资源
+
+**背景与改动**
+
+- 原图标沿用 Tauri 2 默认双环模板，且 `sense/src-tauri/icons/icon.icns` 仅内嵌单张 `512×512`，缺少 Retina 多档与小尺寸清晰度优化。经负责人从三套未来极简方案中选定**方案 A · 折光之 S（Obsidian Prism）**后，完成全套图标重构与替换（代码提交 `252107b`）：
+  1. **源码与可复现脚本**（`sense/tools/generate-icons.py`、`sense/src-tauri/icons/icon.svg`）：以 `generate-icons.py` 为唯一几何与配色真相源（`icon.svg` 为其生成的 1024×1024 矢量副本），按 macOS 连续曲率圆角规范（`824×824 / 1024×1024`，`r=185.4, smoothing=0.6`）绘制深曜石玻璃基底（`#1B1B24 → #07070B`）与珍珠白/品牌朱砂橙（`#FF9C7B → #DF3110`）欧几里得双弧折光 S 徽标；全部产物先于临时目录生成校验再原子替换落盘。
+  2. **全分辨率资产补齐**（`sense/src-tauri/icons/`）：重建 `icon.icns`（16px–512px@2x 共 10 档，由系统 `iconutil` 封装）、`icon.ico`（16/24/32/48/64/128/256 共 7 档 PNG-in-ICO RGBA）及全部 14 份 8-bit RGBA PNG（消除旧索引色 `P` 格式）；其中 `<= 32px` 尺寸采用专属光学微调 SVG（略宽折光缝 `slit_half=21` 与加粗笔画）由 Inkscape 原生矢量导出，确保 1x 屏幕、Finder 列表与 Spotlight 边缘锐利且无 Lanczos 负旁瓣残值。
+  3. **工作区卫生**（`sense/.gitignore`）：补充 `__pycache__/` 与 `*.py[cod]`，避免运行工具脚本产生 Python 字节码污染工作区或触发 `release.sh` 干净树检查失败。
+- **影响面**：仅变更应用图标资源、图标生成脚本与 `.gitignore`；不涉及 Rust/前端业务逻辑、`tauri.conf.json`、`SENSE-v1.0/spec/` 或用户数据。`icon.svg` 不在 `tauri.conf.json` 的 `bundle.icon` 中，不会打入 `SENSE.app`；完整 10 档 Retina `icon.icns` 体积为 ~1.09 MiB（旧单层为 98 KB），应用包净增约 ~1 MiB。
+
+**验证与对抗 Review**
+
+- 独立对抗 QC 审查员（`cc97c90d`）两轮只读复核：首轮回报 `P0 = 0 / P1 = 1 / P2 = 2 / P3 = 6`（工作区遗留 `sense/tools/__pycache__/`、`render_svg_png` 吞掉 Inkscape `stderr`、非原子覆盖写盘与 docstring 口径、CoreSVG 滤镜区微裁及小尺寸 Lanczos 负旁瓣）；逐条修复并复核后，二轮确认 **`P0 = 0 / P1 = 0 / P2 = 0`** 放行。
+- 自动化与实测校验：`npm run typecheck`、Vitest **32 文件 / 669 用例**、`npm run build`、`cargo test --locked` **434 用例**全绿；`iconutil` 10 档解包、Pillow 7 档 ICO 像素对拍、WebKit/CoreSVG `qlmanage` 滤镜零裁切对照、AppKit `NSImage` 实测渲染及本机 `/Applications/SENSE.app` 重装验收均通过。
+- **回滚方式**：代码回滚可执行 `git revert 252107b`（及对应文档提交）；本机已安装应用退出 SENSE 后执行 `rm -rf /Applications/SENSE.app && cp -R ~/cpcsoft/SENSE-app-backups/SENSE-before-icon-redesign.app /Applications/SENSE.app && open /Applications/SENSE.app`（无数据迁移）。
+
 ## [0.1.2] - 2026-11-15
 
 ### 发布准备 · 2026-11-15 — 二次同步 `origin/main` 与 `v0.1.2` 终版双架构更新包构建验签

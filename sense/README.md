@@ -330,6 +330,7 @@ SENSE_SHOW_ON_START=1 SENSE_NO_AUTOHIDE=1 npm run tauri dev
 ```
 sense/
 ├─ src-tauri/
+│  ├─ icons/              应用图标资源（`icon.icns` 全 10 档、`icon.ico`、`icon.png` 及生成的矢量副本 `icon.svg`，源码真相见 `tools/generate-icons.py`）
 │  ├─ src/lib.rs          应用装配：菜单、插件、快捷键、启动行为
 │  ├─ src/lang.rs         语言表、原文语言识别、目标语言取舍（含单测）；偏好读写在 commands/language.rs
 │  ├─ src/window.rs       窗口显隐、失焦宽限期（含单测）
@@ -347,6 +348,7 @@ sense/
 │  ├─ lib/store.ts        查询状态机（序号隔离、重试、缓存旁路）与提交路由
 │  ├─ lib/languages.ts    目标语言偏好 store、两栏标题（语言表在 Rust 里，只有一份）
 │  └─ styles/index.css    Tailwind 4 + 设计 token
+├─ tools/generate-icons.py 生成全套应用图标（`icon.svg`、`icon.icns`、`icon.ico` 与全部 RGBA PNG，唯一几何/配色源码真相）
 ├─ tools/release.sh       构建两种芯片的更新包、签名、生成 latest.json，可选发布到 GitHub Release
 ├─ tools/update-manifest.mjs  生成 / 核对 latest.json，并用应用里的公钥给安装包验签（`build` / `check` / `verify`，有单测）
 └─ ../SENSE-v1.0/spec/    契约与 prompt（随仓库版本化，D3 拷进 resources/）
